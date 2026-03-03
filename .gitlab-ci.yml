@@ -1,0 +1,165 @@
+stages:
+  - lint
+  - test
+  - build
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+# 全局缓存
+cache: &cargo_cache
+  key: ${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}
+  paths:
+    - .cargo/registry
+    - .cargo/git
+    - target
+
+# Linux 系统依赖安装脚本（复用）
+.linux_deps: &linux_deps
+  - apt-get update && apt-get install -y
+      libssl-dev pkg-config
+      libxkbcommon-dev libgl1-mesa-dev
+      libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+# 版本号计算脚本（各 job 复用）
+.compute_version: &compute_version
+  - |
+    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    COMMIT=$(git rev-parse --short=7 HEAD)
+    DATE=$(date +%Y%m%d)
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      FULL_VERSION="v${VERSION}+${COMMIT}"
+    else
+      FULL_VERSION="v${VERSION}+${DATE}.${COMMIT}"
+    fi
+    echo "版本号: ${FULL_VERSION}"
+
+# ============================================================
+# 阶段 1：fmt 与 clippy 并行
+# ============================================================
+fmt:
+  stage: lint
+  image: rustlang/rust:nightly
+  before_script:
+    - rustup component add rustfmt
+  script:
+    - cargo fmt --all -- --check
+  cache:
+    <<: *cargo_cache
+
+clippy:
+  stage: lint
+  image: rustlang/rust:nightly
+  before_script:
+    - *linux_deps
+    - rustup component add clippy
+  script:
+    - cargo clippy --all --all-targets -- -D warnings
+  cache:
+    <<: *cargo_cache
+
+# ============================================================
+# 阶段 2：测试（等 fmt + clippy 通过）
+# ============================================================
+test:
+  stage: test
+  image: rustlang/rust:nightly
+  needs: [fmt, clippy]
+  before_script:
+    - *linux_deps
+  script:
+    - cargo test --all
+  cache:
+    <<: *cargo_cache
+
+# ============================================================
+# 阶段 3：跨平台构建（等测试通过）
+# ============================================================
+
+# 构建 - Linux x86_64
+build:linux-x64:
+  stage: build
+  image: rustlang/rust:nightly
+  needs: [test]
+  before_script:
+    - *linux_deps
+    - apt-get install -y upx-ucl
+  script:
+    - *compute_version
+    - cargo build --release --target x86_64-unknown-linux-gnu
+    - upx --best --lzma target/x86_64-unknown-linux-gnu/release/task-graph-editor || true
+    - PACKAGE_NAME="task-graph-editor-${FULL_VERSION}-linux-x64"
+    - mkdir -p "dist/${PACKAGE_NAME}"
+    - cp target/x86_64-unknown-linux-gnu/release/task-graph-editor "dist/${PACKAGE_NAME}/"
+    - echo -n "${FULL_VERSION}" > "dist/${PACKAGE_NAME}/VERSION"
+    - cd dist && tar czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
+  artifacts:
+    paths:
+      - dist/task-graph-editor-*-linux-x64.tar.gz
+    expire_in: 30 days
+  cache:
+    <<: *cargo_cache
+
+# 构建 - macOS ARM64（UPX 跳过）
+build:macos-arm64:
+  stage: build
+  needs: [test]
+  tags:
+    - macos
+    - arm64
+  before_script:
+    - brew install openssl pkg-config || true
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+    - source "$HOME/.cargo/env"
+    - rustup target add aarch64-apple-darwin
+  script:
+    - *compute_version
+    - cargo build --release --target aarch64-apple-darwin
+    - PACKAGE_NAME="task-graph-editor-${FULL_VERSION}-macos-arm64"
+    - mkdir -p "dist/${PACKAGE_NAME}"
+    - cp target/aarch64-apple-darwin/release/task-graph-editor "dist/${PACKAGE_NAME}/"
+    - echo -n "${FULL_VERSION}" > "dist/${PACKAGE_NAME}/VERSION"
+    - cd dist && tar czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
+  artifacts:
+    paths:
+      - dist/task-graph-editor-*-macos-arm64.tar.gz
+    expire_in: 30 days
+  cache:
+    <<: *cargo_cache
+
+# 构建 - Windows x86_64
+build:windows-x64:
+  stage: build
+  needs: [test]
+  tags:
+    - windows
+    - x64
+  before_script:
+    - choco install nasm upx -y
+    - rustup target add x86_64-pc-windows-msvc
+  script:
+    - $Version = (Select-String -Path Cargo.toml -Pattern '^version\s*=' | Select-Object -First 1).Line -replace '.*"(.*)".*', '$1'
+    - $Commit = (git rev-parse --short=7 HEAD)
+    - $Date = Get-Date -Format "yyyyMMdd"
+    - |
+      if ($env:CI_COMMIT_TAG) {
+        $FullVersion = "v${Version}+${Commit}"
+      } else {
+        $FullVersion = "v${Version}+${Date}.${Commit}"
+      }
+    - Write-Host "版本号: ${FullVersion}"
+    - cargo build --release --target x86_64-pc-windows-msvc
+    - upx --best --lzma "target\x86_64-pc-windows-msvc\release\task-graph-editor.exe"
+    - $PackageName = "task-graph-editor-${FullVersion}-windows-x64"
+    - New-Item -ItemType Directory -Force -Path "dist\${PackageName}"
+    - Copy-Item "target\x86_64-pc-windows-msvc\release\task-graph-editor.exe" -Destination "dist\${PackageName}\"
+    - '[System.IO.File]::WriteAllText("dist\${PackageName}\VERSION", $FullVersion)'
+    - Compress-Archive -Path "dist\${PackageName}" -DestinationPath "dist\${PackageName}.zip"
+  artifacts:
+    paths:
+      - dist/task-graph-editor-*-windows-x64.zip
+    expire_in: 30 days
+  cache:
+    <<: *cargo_cache
