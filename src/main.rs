@@ -6,6 +6,7 @@
 mod app;
 mod model;
 mod ssh;
+mod worker;
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;

@@ -17,7 +17,8 @@ task-graph-editor/
 ├── src/
 │   ├── main.rs                 # 入口：mimalloc、字体嵌入、窗口配置
 │   ├── model.rs                # 数据模型：位姿结构体、JSON 解析/序列化、ROS2 输出解析、登录持久化
-│   ├── app.rs                  # GUI 应用：连接面板、文件列表（右键菜单：上传/备份/删除）、元数据编辑、位姿编辑器、ROS2 数据获取
+│   ├── app.rs                  # GUI 应用：连接面板、文件列表（右键菜单）、元数据编辑、位姿编辑器、响应轮询
+│   ├── worker.rs               # 后台工作线程：所有 SSH/SFTP/ROS2 操作在此异步执行
 │   └── ssh.rs                  # SSH/SFTP 封装：连接、认证、文件操作、命令执行
 ├── assets/fonts/               # 更纱黑体（SarasaTermSCNerd，编译时嵌入）
 └── scripts/
@@ -57,13 +58,11 @@ cargo check
 ## 架构与数据流
 
 ```
-egui UI (app.rs)
-    ↕
+egui UI (app.rs) ──WorkerRequest──→ Worker 线程 (worker.rs)
+    ↑                                    ↓
+    └──WorkerResponse──←── SshConnection (ssh.rs) ←→ 远程文件 + ROS2 命令
+
 TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/login.json
-    ↕
-JSON 字符串 ←→ SshConnection (ssh.rs) ←→ 远程文件 /home/linux/Workspace/task_graphs/{task_id}.json
-                    ↕
-              ROS2 命令（ros2 topic echo / python3 脚本）
 ```
 
 - `raw_json` 保留未编辑的原始 JSON，序列化时仅更新编辑过的字段
@@ -89,7 +88,7 @@ JSON 字符串 ←→ SshConnection (ssh.rs) ←→ 远程文件 /home/linux/Wor
 - **Rust edition**：2024
 - **全局分配器**：mimalloc（`#[global_allocator]`）
 - **错误处理**：优先 `Result`/`Option`，避免 `unwrap()` 在非测试代码中使用
-- **无异步运行时**：全同步 SSH/SFTP，无 tokio 依赖
+- **异步模式**：SSH 操作在后台线程执行（`std::thread` + `mpsc`），UI 线程通过 `WorkerHandle` 通信，无 tokio 依赖
 - **字体**：更纱黑体通过 `include_bytes!` 编译时嵌入，零运行时依赖
 - **Windows**：Release 构建隐藏控制台窗口（`windows_subsystem = "windows"`）
 
