@@ -1,5 +1,8 @@
 //! 任务图编辑器 - 远程 JSON 位姿编辑工具
 
+// Windows 下隐藏控制台窗口
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod model;
 mod ssh;

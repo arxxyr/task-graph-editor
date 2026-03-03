@@ -1,0 +1,223 @@
+name: Build Release
+
+on:
+  push:
+    branches: [master, dev]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ============================================================
+  # 阶段 1：fmt 与 clippy 并行
+  # ============================================================
+  fmt:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - name: 缓存 Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: clippy
+
+      - name: 安装 Linux 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev pkg-config \
+            libxkbcommon-dev libgl1-mesa-dev \
+            libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Clippy 检查
+        run: cargo clippy --all --all-targets -- -D warnings
+
+  # ============================================================
+  # 阶段 2：测试（等 fmt + clippy 通过）
+  # ============================================================
+  test:
+    needs: [fmt, clippy]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: 缓存 Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: test
+
+      - name: 安装 Linux 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev pkg-config \
+            libxkbcommon-dev libgl1-mesa-dev \
+            libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: 运行测试
+        run: cargo test --all
+
+  # ============================================================
+  # 阶段 3：跨平台构建（等测试通过）
+  # ============================================================
+  build:
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+            artifact: task-graph-editor
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+            artifact: task-graph-editor
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x64
+            artifact: task-graph-editor.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: build-${{ matrix.platform }}
+
+      - name: 计算版本号
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          COMMIT=$(git rev-parse --short=7 HEAD)
+          DATE=$(date +%Y%m%d)
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            FULL_VERSION="v${VERSION}+${COMMIT}"
+          else
+            FULL_VERSION="v${VERSION}+${DATE}.${COMMIT}"
+          fi
+
+          echo "full_version=${FULL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "版本号: ${FULL_VERSION}"
+
+      # Linux 系统依赖
+      - name: 安装 Linux 依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev pkg-config \
+            libxkbcommon-dev libgl1-mesa-dev \
+            libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      # macOS 系统依赖
+      - name: 安装 macOS 依赖
+        if: runner.os == 'macOS'
+        run: brew install openssl pkg-config
+
+      # Windows：NASM 用于 openssl vendored 编译
+      - name: 安装 Windows 依赖
+        if: runner.os == 'Windows'
+        run: choco install nasm -y
+
+      - name: 构建 Release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # UPX 压缩（macOS 跳过）
+      - name: UPX 压缩
+        if: runner.os != 'macOS'
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          version: latest
+          files: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          args: --best --lzma
+
+      - name: 打包产物 (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          FULL_VERSION="${{ steps.version.outputs.full_version }}"
+          PACKAGE_NAME="task-graph-editor-${FULL_VERSION}-${{ matrix.platform }}"
+          mkdir -p "dist/${PACKAGE_NAME}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${PACKAGE_NAME}/"
+          echo -n "${FULL_VERSION}" > "dist/${PACKAGE_NAME}/VERSION"
+          cd dist
+          tar czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
+
+      - name: 打包产物 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $FullVersion = "${{ steps.version.outputs.full_version }}"
+          $PackageName = "task-graph-editor-${FullVersion}-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path "dist/${PackageName}"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -Destination "dist/${PackageName}/"
+          [System.IO.File]::WriteAllText("dist/${PackageName}/VERSION", $FullVersion)
+          Compress-Archive -Path "dist/${PackageName}" -DestinationPath "dist/${PackageName}.zip"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-graph-editor-${{ matrix.platform }}
+          path: |
+            dist/task-graph-editor-*-${{ matrix.platform }}.tar.gz
+            dist/task-graph-editor-*-${{ matrix.platform }}.zip
+          if-no-files-found: ignore
+
+  # ============================================================
+  # 有 tag 时自动创建 Release
+  # ============================================================
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
