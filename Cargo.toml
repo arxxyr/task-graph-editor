@@ -1,6 +1,6 @@
 [package]
 name = "task-graph-editor"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,7 @@ ssh2 = "0.9"
 thiserror = "2"
 mimalloc = { version = "0.1", default-features = false }
 rfd = "0.15"
+chrono = "0.4"
 
 # Windows 下使用 vendored OpenSSL（ssh2 依赖链需要）
 [target.'cfg(windows)'.dependencies]
