@@ -385,6 +385,82 @@ impl App {
         }
     }
 
+    /// 备份远程文件到当前目录：{源文件名}-backup-YYYYMMDDHHmm.json
+    fn backup_file(&mut self, filename: &str) {
+        let Some(conn) = &self.connection else {
+            self.status_message = "未连接".into();
+            return;
+        };
+
+        let remote_dir = &self.remote_dir;
+        let src_path = format!("{remote_dir}/{filename}");
+
+        // 读取源文件内容
+        let content = match conn.read_file(&src_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status_message = format!("读取文件失败: {e}");
+                return;
+            }
+        };
+
+        // 生成备份文件名：{stem}-backup-YYYYMMDDHHmm.json，重名则追加编号
+        let stem = filename.strip_suffix(".json").unwrap_or(filename);
+        let now = chrono::Local::now();
+        let timestamp = now.format("%Y%m%d%H%M");
+        let base_name = format!("{stem}-backup-{timestamp}");
+
+        let mut backup_name = format!("{base_name}.json");
+        if self.file_list.contains(&backup_name) {
+            let mut seq = 1u32;
+            loop {
+                backup_name = format!("{base_name}-{seq}.json");
+                if !self.file_list.contains(&backup_name) {
+                    break;
+                }
+                seq += 1;
+            }
+        }
+        let backup_path = format!("{remote_dir}/{backup_name}");
+
+        match conn.write_file(&backup_path, &content) {
+            Ok(()) => {
+                self.status_message = format!("已备份: {filename} → {backup_name}");
+                self.refresh_file_list();
+            }
+            Err(e) => {
+                self.status_message = format!("备份失败: {e}");
+            }
+        }
+    }
+
+    /// 删除远程文件
+    fn delete_file(&mut self, filename: &str) {
+        let Some(conn) = &self.connection else {
+            self.status_message = "未连接".into();
+            return;
+        };
+
+        let remote_dir = &self.remote_dir;
+        let path = format!("{remote_dir}/{filename}");
+
+        match conn.exec_command(&format!("rm -f '{path}'")) {
+            Ok(_) => {
+                self.status_message = format!("已删除: {filename}");
+                // 如果删除的是当前选中文件，清空编辑区
+                if self.selected_file.as_deref() == Some(filename) {
+                    self.selected_file = None;
+                    self.task_data = None;
+                    self.selected_pose_index = None;
+                }
+                self.refresh_file_list();
+            }
+            Err(e) => {
+                self.status_message = format!("删除失败: {e}");
+            }
+        }
+    }
+
     /// 弹出本地文件选择对话框，将选中的文件上传到远程目录
     fn upload_file(&mut self) {
         let Some(conn) = &self.connection else {
@@ -501,21 +577,95 @@ impl App {
             ui.separator();
 
             let mut clicked_file = None;
+            let mut backup_file = None;
+            let mut delete_file = None;
+            let mut do_upload = false;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    let row_width = ui.available_width();
+                    let row_height = ui.spacing().interact_size.y;
                     for filename in &self.file_list {
                         let is_selected = self.selected_file.as_ref() == Some(filename);
-                        let label = egui::SelectableLabel::new(is_selected, filename.as_str());
-                        if ui.add(label).clicked() {
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(row_width, row_height),
+                            egui::Sense::click(),
+                        );
+                        if ui.is_rect_visible(rect) {
+                            let visuals = ui.style().interact_selectable(&resp, is_selected);
+                            // 悬停或选中时绘制整行背景
+                            if is_selected || resp.hovered() || resp.highlighted() {
+                                ui.painter().rect(
+                                    rect.expand(visuals.expansion),
+                                    visuals.corner_radius,
+                                    visuals.weak_bg_fill,
+                                    visuals.bg_stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            // 文字左对齐、垂直居中
+                            let text_pos = egui::pos2(
+                                rect.left() + ui.spacing().button_padding.x,
+                                rect.center().y,
+                            );
+                            ui.painter().text(
+                                text_pos,
+                                egui::Align2::LEFT_CENTER,
+                                filename.as_str(),
+                                egui::TextStyle::Body.resolve(ui.style()),
+                                visuals.text_color(),
+                            );
+                        }
+                        if resp.clicked() {
                             clicked_file = Some(filename.clone());
                         }
+                        // 右键菜单：上传文件、备份、分割线、删除
+                        let fname = filename.clone();
+                        let fname2 = filename.clone();
+                        resp.context_menu(|ui| {
+                            if ui.button("上传文件").clicked() {
+                                do_upload = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("备份").clicked() {
+                                backup_file = Some(fname);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            let del_btn = egui::Button::new(
+                                egui::RichText::new("删除").color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(200, 50, 50));
+                            if ui.add(del_btn).clicked() {
+                                delete_file = Some(fname2);
+                                ui.close_menu();
+                            }
+                        });
                     }
+
+                    // 空白区域占满剩余空间，右键仅「上传文件」
+                    let blank_size = ui.available_size().max(egui::vec2(1.0, 1.0));
+                    let blank_resp = ui.allocate_response(blank_size, egui::Sense::click());
+                    blank_resp.context_menu(|ui| {
+                        if ui.button("上传文件").clicked() {
+                            do_upload = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
 
             if let Some(filename) = clicked_file {
                 self.selected_file = Some(filename.clone());
                 self.load_file(&filename);
+            }
+            if let Some(filename) = backup_file {
+                self.backup_file(&filename);
+            }
+            if let Some(filename) = delete_file {
+                self.delete_file(&filename);
+            }
+            if do_upload {
+                self.upload_file();
             }
         }
     }
@@ -741,10 +891,13 @@ impl eframe::App for App {
             // 顶部操作按钮栏
             ui.horizontal(|ui| {
                 if self.task_data.is_some() && self.connection.is_some() {
-                    if ui
-                        .button(egui::RichText::new("更新远程文件").size(14.0))
-                        .clicked()
-                    {
+                    let apply_btn = egui::Button::new(
+                        egui::RichText::new("应用到远程文件")
+                            .size(14.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(220, 80, 40));
+                    if ui.add(apply_btn).clicked() {
                         self.save_to_remote();
                     }
 
