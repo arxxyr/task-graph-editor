@@ -42,13 +42,15 @@ fn setup_fonts(ctx: &eframe::egui::Context) {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("任务图编辑器")
             .with_inner_size([1024.0, 720.0])
             .with_min_inner_size([800.0, 500.0]),
         ..Default::default()
     };
 
+    // app_name 用 ASCII 避免部分 Linux WM 对非 ASCII app ID 乱码
     eframe::run_native(
-        "任务图编辑器",
+        "task-graph-editor",
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
