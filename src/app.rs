@@ -112,6 +112,9 @@ pub struct App {
 
     /// 等待中的远程命令（用于解析 CommandOutput 响应）
     pending_command: Option<PendingCommand>,
+
+    /// 自动重连状态描述（非 None 表示正在自动重连中）
+    reconnect_status: Option<String>,
 }
 
 impl Default for App {
@@ -135,6 +138,7 @@ impl Default for App {
             task_data: None,
             selected_pose_index: None,
             pending_command: None,
+            reconnect_status: None,
         }
     }
 }
@@ -210,7 +214,7 @@ impl App {
         self.status_message = "正在连接...".into();
     }
 
-    /// 断开连接
+    /// 断开连接（同时取消自动重连）
     fn disconnect(&mut self) {
         if let Some(worker) = &self.worker {
             worker.send(WorkerRequest::Disconnect);
@@ -218,6 +222,7 @@ impl App {
         // Drop WorkerHandle，后台线程的 rx 会断开，线程自然退出
         self.worker = None;
         self.is_connected = false;
+        self.reconnect_status = None;
         self.file_list.clear();
         self.selected_file = None;
         self.task_data = None;
@@ -529,6 +534,39 @@ impl App {
                 self.status_message = format!("上传失败: {e}");
             }
 
+            WorkerResponse::ConnectionLost(reason) => {
+                self.is_connected = false;
+                // 不 drop worker — worker 会自动重连
+                self.busy = BusyState::Idle;
+                self.pending_command = None;
+                // 保留 file_list / task_data / selected_file，避免丢失未保存的编辑
+                self.status_message = format!("连接已断开: {reason}");
+            }
+
+            WorkerResponse::Reconnecting {
+                attempt,
+                delay_secs,
+            } => {
+                self.reconnect_status = Some(if attempt == 0 {
+                    format!("{delay_secs}秒后自动重连...")
+                } else {
+                    format!("第{attempt}次重连失败，{delay_secs}秒后重试...")
+                });
+            }
+
+            WorkerResponse::Reconnected {
+                ros_domain_id,
+                file_list,
+            } => {
+                self.is_connected = true;
+                self.reconnect_status = None;
+                if let Some(id) = ros_domain_id {
+                    self.ros_domain_id = id;
+                }
+                self.file_list = file_list;
+                self.status_message = format!("已重新连接到 {}", self.host);
+            }
+
             WorkerResponse::CommandOutput(result) => {
                 self.busy = BusyState::Idle;
                 let pending = self.pending_command.take();
@@ -613,9 +651,10 @@ impl App {
         ui.separator();
 
         let busy = self.is_busy();
+        let reconnecting = self.reconnect_status.is_some();
 
-        // 忙碌时禁用输入框
-        ui.add_enabled_ui(!busy, |ui| {
+        // 忙碌或重连中禁用输入框
+        ui.add_enabled_ui(!busy && !reconnecting, |ui| {
             egui::Grid::new("ssh_config")
                 .num_columns(2)
                 .spacing([8.0, 4.0])
@@ -670,6 +709,11 @@ impl App {
                 {
                     self.upload_file();
                 }
+            } else if reconnecting {
+                // 重连中：只显示断开按钮（取消自动重连）
+                if ui.button("断开连接").clicked() {
+                    self.disconnect();
+                }
             } else if ui.add_enabled(!busy, egui::Button::new("连接")).clicked() {
                 self.connect(ctx);
             }
@@ -682,6 +726,14 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(self.busy_text());
+            });
+        }
+
+        // 自动重连状态
+        if let Some(ref status) = self.reconnect_status {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.colored_label(egui::Color32::from_rgb(255, 200, 100), status);
             });
         }
 

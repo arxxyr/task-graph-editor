@@ -38,6 +38,11 @@ pub enum SshError {
     CommandFailed { exit_code: i32, output: String },
 }
 
+/// SSH keepalive 间隔（秒）
+///
+/// 每隔此间隔发送一次 SSH keepalive 包，防止空闲连接被服务器或中间网络设备（NAT/防火墙）超时断开。
+const KEEPALIVE_INTERVAL_SECS: u32 = 30;
+
 /// 封装 SSH 会话，提供文件操作接口
 pub struct SshConnection {
     session: Session,
@@ -71,7 +76,17 @@ impl SshConnection {
             }
         }
 
+        // 启用 SSH keepalive：定期发送心跳包，want_reply=true 以便检测对端是否存活
+        session.set_keepalive(true, KEEPALIVE_INTERVAL_SECS);
+
         Ok(Self { session })
+    }
+
+    /// 发送 SSH keepalive 心跳包
+    ///
+    /// 返回下次应发送心跳的秒数。连接已断开时返回 Err。
+    pub fn send_keepalive(&self) -> Result<u32, SshError> {
+        Ok(self.session.keepalive_send()?)
     }
 
     /// 列出远程目录下所有 .json 文件名

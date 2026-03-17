@@ -1,6 +1,7 @@
 //! 后台工作线程 — 所有 SSH/SFTP 操作在此线程执行，不阻塞 UI
 
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -121,6 +122,15 @@ pub enum WorkerResponse {
     UploadFailed(String),
     /// 命令执行结果
     CommandOutput(Result<String, String>),
+    /// SSH 连接丢失（keepalive 失败）
+    ConnectionLost(String),
+    /// 正在自动重连（attempt=0 表示尚未尝试，delay_secs 为下次重试等待秒数）
+    Reconnecting { attempt: u32, delay_secs: u64 },
+    /// 自动重连成功
+    Reconnected {
+        ros_domain_id: Option<String>,
+        file_list: Vec<String>,
+    },
 }
 
 /// App 持有的句柄，用于与后台线程通信
@@ -158,13 +168,66 @@ impl WorkerHandle {
     }
 }
 
+/// Keepalive 轮询间隔：每 15 秒检查一次是否需要发送心跳
+///
+/// 略短于 SSH keepalive 间隔（30s），确保在间隔窗口内至少调用一次 `keepalive_send()`。
+const KEEPALIVE_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 指数退避初始延迟
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(2);
+
+/// 指数退避最大延迟
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// 自动重连状态（指数退避）
+struct ReconnectState {
+    /// 已尝试重连次数
+    attempt: u32,
+    /// 当前退避延迟
+    delay: Duration,
+    /// 下次尝试重连的时间点
+    next_try: Instant,
+}
+
+impl ReconnectState {
+    fn new() -> Self {
+        Self {
+            attempt: 0,
+            delay: RECONNECT_INITIAL_DELAY,
+            next_try: Instant::now() + RECONNECT_INITIAL_DELAY,
+        }
+    }
+
+    /// 重连失败后增加退避延迟（翻倍，不超过最大值）
+    fn backoff(&mut self) {
+        self.delay = (self.delay * 2).min(RECONNECT_MAX_DELAY);
+        self.next_try = Instant::now() + self.delay;
+    }
+}
+
+/// 尝试读取远程 ROS_DOMAIN_ID
+fn read_ros_domain_id(conn: &SshConnection) -> Option<String> {
+    conn.exec_command("bash -ic 'echo $ROS_DOMAIN_ID' 2>/dev/null")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// 后台工作线程主循环
+///
+/// 三种运行模式：
+/// 1. **已连接**：处理请求，空闲时发送 keepalive 心跳
+/// 2. **重连中**：指数退避自动重连，期间仍响应 Disconnect 等请求
+/// 3. **未连接**：阻塞等待 Connect 请求
 fn worker_loop(
     rx: mpsc::Receiver<WorkerRequest>,
     tx: mpsc::Sender<WorkerResponse>,
     ctx: egui::Context,
 ) {
     let mut connection: Option<SshConnection> = None;
+    // 保存连接参数，用于自动重连时重建连接
+    let mut connect_params: Option<(SshConfig, String)> = None;
+    let mut reconnect: Option<ReconnectState> = None;
 
     /// 发送响应并请求 UI 重绘
     macro_rules! respond {
@@ -174,7 +237,80 @@ fn worker_loop(
         };
     }
 
-    while let Ok(request) = rx.recv() {
+    loop {
+        // ── 重连：到时间就尝试 ──
+        if let Some(ref mut rs) = reconnect
+            && Instant::now() >= rs.next_try
+        {
+            rs.attempt += 1;
+            if let Some((config, remote_dir)) = &connect_params {
+                match SshConnection::connect(config) {
+                    Ok(conn) => {
+                        let ros_domain_id = read_ros_domain_id(&conn);
+                        let file_list = conn.list_json_files(remote_dir).unwrap_or_default();
+                        connection = Some(conn);
+                        reconnect = None;
+                        respond!(WorkerResponse::Reconnected {
+                            ros_domain_id,
+                            file_list,
+                        });
+                    }
+                    Err(_) => {
+                        rs.backoff();
+                        respond!(WorkerResponse::Reconnecting {
+                            attempt: rs.attempt,
+                            delay_secs: rs.delay.as_secs(),
+                        });
+                    }
+                }
+            } else {
+                reconnect = None;
+            }
+            continue;
+        }
+
+        // ── 接收请求 ──
+        let request = if let Some(ref rs) = reconnect {
+            // 重连中：短轮询（最多 1 秒），保证及时响应 Disconnect
+            let wait = rs
+                .next_try
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1));
+            match rx.recv_timeout(wait) {
+                Ok(req) => req,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else if connection.is_some() {
+            // 已连接：keepalive 轮询
+            match rx.recv_timeout(KEEPALIVE_POLL_INTERVAL) {
+                Ok(req) => req,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(conn) = &connection
+                        && let Err(e) = conn.send_keepalive()
+                    {
+                        connection = None;
+                        let rs = ReconnectState::new();
+                        respond!(WorkerResponse::ConnectionLost(format!("SSH 心跳失败: {e}")));
+                        respond!(WorkerResponse::Reconnecting {
+                            attempt: 0,
+                            delay_secs: rs.delay.as_secs(),
+                        });
+                        reconnect = Some(rs);
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            // 未连接：阻塞等待
+            match rx.recv() {
+                Ok(req) => req,
+                Err(_) => break,
+            }
+        };
+
+        // ── 处理请求 ──
         match request {
             WorkerRequest::Connect {
                 host,
@@ -183,6 +319,7 @@ fn worker_loop(
                 password,
                 remote_dir,
             } => {
+                reconnect = None; // 取消进行中的自动重连
                 let config = SshConfig {
                     host,
                     port,
@@ -192,16 +329,9 @@ fn worker_loop(
 
                 match SshConnection::connect(&config) {
                     Ok(conn) => {
-                        // 尝试读取 ROS_DOMAIN_ID
-                        let ros_domain_id = conn
-                            .exec_command("bash -ic 'echo $ROS_DOMAIN_ID' 2>/dev/null")
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty());
-
-                        // 列出远程文件
+                        let ros_domain_id = read_ros_domain_id(&conn);
                         let file_list = conn.list_json_files(&remote_dir).unwrap_or_default();
-
+                        connect_params = Some((config, remote_dir));
                         connection = Some(conn);
                         respond!(WorkerResponse::Connected {
                             ros_domain_id,
@@ -216,6 +346,8 @@ fn worker_loop(
 
             WorkerRequest::Disconnect => {
                 connection = None;
+                reconnect = None;
+                connect_params = None;
                 respond!(WorkerResponse::Disconnected);
             }
 
