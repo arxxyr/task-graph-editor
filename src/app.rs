@@ -808,11 +808,11 @@ impl App {
                                 .clicked()
                             {
                                 do_upload = true;
-                                ui.close_menu();
+                                ui.close();
                             }
                             if ui.add_enabled(!busy, egui::Button::new("备份")).clicked() {
                                 backup_file = Some(fname);
-                                ui.close_menu();
+                                ui.close();
                             }
                             ui.separator();
                             let del_btn = egui::Button::new(
@@ -821,7 +821,7 @@ impl App {
                             .fill(egui::Color32::from_rgb(200, 50, 50));
                             if ui.add_enabled(!busy, del_btn).clicked() {
                                 delete_file = Some(fname2);
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     }
@@ -835,7 +835,7 @@ impl App {
                             .clicked()
                         {
                             do_upload = true;
-                            ui.close_menu();
+                            ui.close();
                         }
                     });
                 });
