@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-任务图编辑器（task-graph-editor）—— 基于 eframe/egui 的跨平台桌面 GUI 应用，通过 SSH 连接远程 Linux 主机，编辑机器人任务图 JSON 文件中的位姿数据，并支持从 ROS2 话题实时获取底盘位姿和关节角。
+任务图编辑器（task-graph-editor）—— 基于 eframe/egui 的跨平台桌面 GUI 应用，通过 SSH 连接远程 Linux 主机，编辑机器人任务图 JSON 文件中的所有 context 全局变量（位姿、轨迹、数组、标量、布尔等），并支持从 ROS2 话题实时获取底盘位姿和关节角。
 
 ## 项目结构
 
@@ -16,8 +16,8 @@ task-graph-editor/
 ├── .gitlab-ci.yml              # GitLab CI
 ├── src/
 │   ├── main.rs                 # 入口：mimalloc、字体嵌入、窗口配置
-│   ├── model.rs                # 数据模型：位姿结构体、JSON 解析/序列化、ROS2 输出解析、登录持久化
-│   ├── app.rs                  # GUI 应用：连接面板、文件列表（右键菜单）、元数据编辑、位姿编辑器、响应轮询
+│   ├── model.rs                # 数据模型：ContextValue（11 种类型）、JSON 解析/序列化、ROS2 输出解析、登录持久化
+│   ├── app.rs                  # GUI 应用：连接面板、文件列表（右键菜单）、元数据编辑、分组 context 编辑器、响应轮询
 │   ├── worker.rs               # 后台工作线程：所有 SSH/SFTP/ROS2 操作在此异步执行
 │   └── ssh.rs                  # SSH/SFTP 封装：连接、认证、文件操作、命令执行
 ├── assets/fonts/               # 更纱黑体（SarasaTermSCNerd，编译时嵌入）
@@ -67,18 +67,27 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
 
 - `raw_json` 保留未编辑的原始 JSON，序列化时仅更新编辑过的字段
 - JSON `config.context` 中的位姿字段是**字符串化 JSON**，需要二次解析
+- `config.context` 中所有字段自动识别类型（`ContextValue` 枚举，11 种变体）：
+  - `Pose` — 字符串化 RobotPose（chassis/head/waist）
+  - `Bool` / `Integer` / `Float` — 标量
+  - `NumericArray` / `NumericArray2D` — 字符串化的 1D/2D 数值数组
+  - `JointTrajectory` — 原生 JSON 数组（positions + time_from_start）
+  - `PoseArray` — 原生位姿数组
+  - `Text` / `Null` / `RawJson` — 其他
+- GUI 按类型分 5 个可折叠分组：位姿点位、基本参数、数组参数、轨迹数据、其他
+- 序列化时整数保持整数格式（如 `[4,3]` 不会变成 `[4.0,3.0]`）
 - 修改 `task_id` 后远程文件自动重命名为 `{task_id}.json`
 
 ## 关键依赖
 
 | 依赖 | 用途 |
 |------|------|
-| `eframe` 0.31 | egui 桌面应用框架 |
+| `eframe` 0.33 | egui 桌面应用框架 |
 | `ssh2` 0.9 | SSH/SFTP 协议（同步） |
 | `serde` + `serde_json` | JSON 序列化/反序列化 |
 | `thiserror` 2 | 错误类型派生 |
 | `mimalloc` 0.1 | 全局内存分配器 |
-| `rfd` 0.15 | 跨平台文件对话框 |
+| `rfd` 0.17 | 跨平台文件对话框 |
 | `chrono` 0.4 | 本地时间格式化（备份文件名时间戳） |
 
 ## 约定
