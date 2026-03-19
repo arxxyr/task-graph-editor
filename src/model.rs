@@ -36,13 +36,70 @@ pub struct RobotPose {
     pub waist_pose: Pose,
 }
 
-/// 从 context 中提取的一个位姿字段
+impl Default for RobotPose {
+    fn default() -> Self {
+        let p = Pose {
+            position: Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            orientation: Orientation {
+                w: 1.0,
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        };
+        Self {
+            chassis_pose: p.clone(),
+            head_pose: p.clone(),
+            waist_pose: p,
+        }
+    }
+}
+
+/// 轨迹点（关节轨迹的单个路径点）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrajectoryPoint {
+    pub positions: Vec<f64>,
+    pub time_from_start: f64,
+}
+
+/// context 字段值类型
 #[derive(Debug, Clone)]
-pub struct PoseField {
-    /// context 中的 key 名（如 "after_leak_point"、"mark_leak_point"）
+pub enum ContextValue {
+    /// 位姿点（字符串化 JSON，含 chassis_pose/head_pose/waist_pose）
+    Pose(RobotPose),
+    /// 布尔值
+    Bool(bool),
+    /// 整数
+    Integer(i64),
+    /// 浮点数
+    Float(f64),
+    /// 字符串化的数值数组（如 "[0.01,0.17,0.34]"、"[4,3]"）
+    NumericArray(Vec<f64>),
+    /// 字符串化的二维数值数组（如 "[[0.30,0.34,0.45],...]"）
+    NumericArray2D(Vec<Vec<f64>>),
+    /// 关节轨迹（原生 JSON 数组，每个元素含 positions 和 time_from_start）
+    JointTrajectory(Vec<TrajectoryPoint>),
+    /// 位姿数组（原生 JSON 数组，可以为空）
+    PoseArray(Vec<RobotPose>),
+    /// 普通字符串（无法解析为位姿或数组的字符串值）
+    Text(String),
+    /// JSON null
+    Null,
+    /// 无法归类的其他 JSON 值
+    RawJson(serde_json::Value),
+}
+
+/// context 中的一个字段
+#[derive(Debug, Clone)]
+pub struct ContextField {
+    /// context 中的 key 名
     pub key: String,
-    /// 解析后的机器人位姿
-    pub pose: RobotPose,
+    /// 值
+    pub value: ContextValue,
 }
 
 /// GUI 编辑用的任务图数据
@@ -50,8 +107,8 @@ pub struct PoseField {
 pub struct TaskGraphData {
     pub map_id: String,
     pub task_id: String,
-    /// 所有包含位姿信息的 context 字段（按 key 排序）
-    pub pose_fields: Vec<PoseField>,
+    /// 所有 context 字段（按 key 排序）
+    pub context_fields: Vec<ContextField>,
     /// 原始 JSON（用于合并回写时保留未编辑字段）
     pub raw_json: serde_json::Value,
 }
@@ -65,10 +122,84 @@ pub enum ParseError {
     MissingField(String),
 }
 
+// ============================================================
+// Context 值类型识别
+// ============================================================
+
+/// 分类字符串类型的 context 值
+fn classify_string_value(s: &str) -> ContextValue {
+    // 尝试解析为 RobotPose
+    if let Ok(pose) = serde_json::from_str::<RobotPose>(s) {
+        return ContextValue::Pose(pose);
+    }
+    // 尝试解析为二维数值数组（必须非空，避免空数组误判）
+    if let Ok(arr2d) = serde_json::from_str::<Vec<Vec<f64>>>(s)
+        && !arr2d.is_empty()
+    {
+        return ContextValue::NumericArray2D(arr2d);
+    }
+    // 尝试解析为一维数值数组
+    if let Ok(arr) = serde_json::from_str::<Vec<f64>>(s) {
+        return ContextValue::NumericArray(arr);
+    }
+    ContextValue::Text(s.to_string())
+}
+
+/// 分类数组类型的 context 值
+fn classify_array_value(
+    key: &str,
+    value: &serde_json::Value,
+    arr: &[serde_json::Value],
+) -> ContextValue {
+    if arr.is_empty() {
+        // 空数组：根据 key 名推断类型
+        if key.contains("traj") {
+            return ContextValue::JointTrajectory(Vec::new());
+        }
+        if key.contains("pose") {
+            return ContextValue::PoseArray(Vec::new());
+        }
+        return ContextValue::RawJson(value.clone());
+    }
+    // 尝试解析为轨迹点数组
+    if let Ok(traj) = serde_json::from_value::<Vec<TrajectoryPoint>>(value.clone()) {
+        return ContextValue::JointTrajectory(traj);
+    }
+    // 尝试解析为位姿数组
+    if let Ok(poses) = serde_json::from_value::<Vec<RobotPose>>(value.clone()) {
+        return ContextValue::PoseArray(poses);
+    }
+    ContextValue::RawJson(value.clone())
+}
+
+/// 识别 context 中一个值的类型
+fn classify_context_value(key: &str, value: &serde_json::Value) -> ContextValue {
+    match value {
+        serde_json::Value::Null => ContextValue::Null,
+        serde_json::Value::Bool(b) => ContextValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                ContextValue::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                ContextValue::Float(f)
+            } else {
+                ContextValue::RawJson(value.clone())
+            }
+        }
+        serde_json::Value::String(s) => classify_string_value(s),
+        serde_json::Value::Array(arr) => classify_array_value(key, value, arr),
+        _ => ContextValue::RawJson(value.clone()),
+    }
+}
+
+// ============================================================
+// 解析与序列化
+// ============================================================
+
 /// 从 JSON 字符串解析任务图数据
 ///
-/// 提取 map_id、task_id，并遍历 config.context 中所有字符串值，
-/// 尝试将其解析为 RobotPose（包含 chassis_pose/head_pose/waist_pose）。
+/// 提取 map_id、task_id，并遍历 config.context 中所有字段，
+/// 自动识别类型（位姿、轨迹、数组、标量、布尔等）。
 pub fn parse_task_graph(json_str: &str) -> Result<TaskGraphData, ParseError> {
     let raw: serde_json::Value = serde_json::from_str(json_str)?;
 
@@ -84,39 +215,70 @@ pub fn parse_task_graph(json_str: &str) -> Result<TaskGraphData, ParseError> {
         .ok_or_else(|| ParseError::MissingField("task_id".into()))?
         .to_string();
 
-    let mut pose_fields = Vec::new();
+    let mut context_fields = Vec::new();
 
-    // 遍历 config.context，找出所有位姿字符串字段
     if let Some(context) = raw
         .get("config")
         .and_then(|c| c.get("context"))
         .and_then(|c| c.as_object())
     {
-        // 用 BTreeMap 排序保证顺序稳定
+        // BTreeMap 保证按 key 排序
         let sorted: BTreeMap<_, _> = context.iter().collect();
         for (key, value) in sorted {
-            if let Some(s) = value.as_str()
-                && let Ok(pose) = serde_json::from_str::<RobotPose>(s)
-            {
-                pose_fields.push(PoseField {
-                    key: key.clone(),
-                    pose,
-                });
-            }
+            context_fields.push(ContextField {
+                key: key.clone(),
+                value: classify_context_value(key, value),
+            });
         }
     }
 
     Ok(TaskGraphData {
         map_id,
         task_id,
-        pose_fields,
+        context_fields,
         raw_json: raw,
+    })
+}
+
+/// 将 f64 值转为 JSON 值，整数输出为整数格式
+fn numeric_to_json_value(v: f64) -> serde_json::Value {
+    if v.fract() == 0.0 && v.abs() < i64::MAX as f64 {
+        serde_json::Value::Number(serde_json::Number::from(v as i64))
+    } else {
+        serde_json::json!(v)
+    }
+}
+
+/// 将 ContextValue 序列化为 JSON 值
+fn serialize_context_value(value: &ContextValue) -> Result<serde_json::Value, serde_json::Error> {
+    Ok(match value {
+        ContextValue::Pose(pose) => serde_json::Value::String(serde_json::to_string(pose)?),
+        ContextValue::Bool(b) => serde_json::Value::Bool(*b),
+        ContextValue::Integer(i) => serde_json::json!(*i),
+        ContextValue::Float(f) => serde_json::json!(*f),
+        ContextValue::NumericArray(arr) => {
+            let json_arr: Vec<serde_json::Value> =
+                arr.iter().map(|&v| numeric_to_json_value(v)).collect();
+            serde_json::Value::String(serde_json::to_string(&json_arr)?)
+        }
+        ContextValue::NumericArray2D(arr2d) => {
+            let json_arr: Vec<Vec<serde_json::Value>> = arr2d
+                .iter()
+                .map(|row| row.iter().map(|&v| numeric_to_json_value(v)).collect())
+                .collect();
+            serde_json::Value::String(serde_json::to_string(&json_arr)?)
+        }
+        ContextValue::JointTrajectory(traj) => serde_json::to_value(traj)?,
+        ContextValue::PoseArray(poses) => serde_json::to_value(poses)?,
+        ContextValue::Text(s) => serde_json::Value::String(s.clone()),
+        ContextValue::Null => serde_json::Value::Null,
+        ContextValue::RawJson(v) => v.clone(),
     })
 }
 
 /// 将编辑后的数据合并回原始 JSON 并输出格式化字符串
 ///
-/// 修改 map_id、task_id，并将位姿字段重新序列化为字符串写回 context。
+/// 修改 map_id、task_id，并将所有 context 字段重新序列化写回。
 pub fn serialize_task_graph(data: &TaskGraphData) -> Result<String, serde_json::Error> {
     let mut json = data.raw_json.clone();
 
@@ -124,15 +286,15 @@ pub fn serialize_task_graph(data: &TaskGraphData) -> Result<String, serde_json::
     json["map_id"] = serde_json::Value::String(data.map_id.clone());
     json["task_id"] = serde_json::Value::String(data.task_id.clone());
 
-    // 更新 context 中的位姿字段（重新序列化为字符串）
+    // 更新 context 中的所有字段
     if let Some(context) = json
         .get_mut("config")
         .and_then(|c| c.get_mut("context"))
         .and_then(|c| c.as_object_mut())
     {
-        for field in &data.pose_fields {
-            let pose_str = serde_json::to_string(&field.pose)?;
-            context.insert(field.key.clone(), serde_json::Value::String(pose_str));
+        for field in &data.context_fields {
+            let value = serialize_context_value(&field.value)?;
+            context.insert(field.key.clone(), value);
         }
     }
 
@@ -342,7 +504,17 @@ mod tests {
             "context": {
                 "point_a": "{\"chassis_pose\":{\"position\":{\"x\":1.0,\"y\":2.0,\"z\":0.0},\"orientation\":{\"w\":1.0,\"x\":0.0,\"y\":0.0,\"z\":0.0}},\"head_pose\":{\"position\":{\"x\":0.0,\"y\":0.0,\"z\":0.0},\"orientation\":{\"w\":1.0,\"x\":0.0,\"y\":0.0,\"z\":0.0}},\"waist_pose\":{\"position\":{\"x\":0.5,\"y\":0.3,\"z\":0.0},\"orientation\":{\"w\":1.0,\"x\":0.0,\"y\":0.0,\"z\":0.0}}}",
                 "some_number": 42,
-                "some_string": "not_a_pose"
+                "some_string": "not_a_pose",
+                "some_bool": true,
+                "some_float": 1.234,
+                "heights": "[0.01,0.17,0.34]",
+                "angles_2d": "[[0.1,0.2],[0.3,0.4]]",
+                "null_val": null,
+                "pick_poses": [],
+                "jt1_traj": [
+                    {"positions": [1.0, 2.0, 3.0], "time_from_start": 0.5},
+                    {"positions": [4.0, 5.0, 6.0], "time_from_start": 1.0}
+                ]
             },
             "nodes": [],
             "edges": []
@@ -360,24 +532,219 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_extracts_pose_fields() {
+    fn test_parse_extracts_all_context_fields() {
         let data = parse_task_graph(TEST_JSON).unwrap();
-        assert_eq!(data.pose_fields.len(), 1);
-        assert_eq!(data.pose_fields[0].key, "point_a");
-        assert!((data.pose_fields[0].pose.chassis_pose.position.x - 1.0).abs() < f64::EPSILON);
+        // angles_2d, heights, jt1_traj, null_val, pick_poses,
+        // point_a, some_bool, some_float, some_number, some_string
+        assert_eq!(data.context_fields.len(), 10);
+    }
+
+    #[test]
+    fn test_parse_pose_field() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "point_a")
+            .unwrap();
+        match &field.value {
+            ContextValue::Pose(pose) => {
+                assert!((pose.chassis_pose.position.x - 1.0).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected Pose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_integer_field() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "some_number")
+            .unwrap();
+        assert!(matches!(field.value, ContextValue::Integer(42)));
+    }
+
+    #[test]
+    fn test_parse_float_field() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "some_float")
+            .unwrap();
+        match &field.value {
+            ContextValue::Float(f) => assert!((*f - 1.234).abs() < f64::EPSILON),
+            other => panic!("Expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_field() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "some_bool")
+            .unwrap();
+        assert!(matches!(field.value, ContextValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_parse_numeric_array() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "heights")
+            .unwrap();
+        match &field.value {
+            ContextValue::NumericArray(arr) => {
+                assert_eq!(arr.len(), 3);
+                assert!((arr[0] - 0.01).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected NumericArray, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_numeric_array_2d() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "angles_2d")
+            .unwrap();
+        match &field.value {
+            ContextValue::NumericArray2D(arr) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0].len(), 2);
+            }
+            other => panic!("Expected NumericArray2D, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_null_field() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "null_val")
+            .unwrap();
+        assert!(matches!(field.value, ContextValue::Null));
+    }
+
+    #[test]
+    fn test_parse_pose_array() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "pick_poses")
+            .unwrap();
+        match &field.value {
+            ContextValue::PoseArray(poses) => assert!(poses.is_empty()),
+            other => panic!("Expected PoseArray, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_trajectory() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "jt1_traj")
+            .unwrap();
+        match &field.value {
+            ContextValue::JointTrajectory(traj) => {
+                assert_eq!(traj.len(), 2);
+                assert_eq!(traj[0].positions.len(), 3);
+                assert!((traj[0].time_from_start - 0.5).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected JointTrajectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_text_field() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let field = data
+            .context_fields
+            .iter()
+            .find(|f| f.key == "some_string")
+            .unwrap();
+        match &field.value {
+            ContextValue::Text(s) => assert_eq!(s, "not_a_pose"),
+            other => panic!("Expected Text, got {other:?}"),
+        }
     }
 
     #[test]
     fn test_roundtrip_preserves_data() {
         let mut data = parse_task_graph(TEST_JSON).unwrap();
         data.map_id = "new-map".into();
-        data.pose_fields[0].pose.chassis_pose.position.x = 99.0;
+        for field in &mut data.context_fields {
+            if field.key == "point_a"
+                && let ContextValue::Pose(ref mut pose) = field.value
+            {
+                pose.chassis_pose.position.x = 99.0;
+            }
+        }
 
         let output = serialize_task_graph(&data).unwrap();
         let reparsed = parse_task_graph(&output).unwrap();
 
         assert_eq!(reparsed.map_id, "new-map");
-        assert!((reparsed.pose_fields[0].pose.chassis_pose.position.x - 99.0).abs() < f64::EPSILON);
+        let field = reparsed
+            .context_fields
+            .iter()
+            .find(|f| f.key == "point_a")
+            .unwrap();
+        match &field.value {
+            ContextValue::Pose(pose) => {
+                assert!((pose.chassis_pose.position.x - 99.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected Pose"),
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_all_types() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let output = serialize_task_graph(&data).unwrap();
+        let reparsed = parse_task_graph(&output).unwrap();
+
+        assert_eq!(data.context_fields.len(), reparsed.context_fields.len());
+
+        // 验证整数保持为整数
+        let field = reparsed
+            .context_fields
+            .iter()
+            .find(|f| f.key == "some_number")
+            .unwrap();
+        assert!(matches!(field.value, ContextValue::Integer(42)));
+
+        // 验证浮点保持为浮点
+        let field = reparsed
+            .context_fields
+            .iter()
+            .find(|f| f.key == "some_float")
+            .unwrap();
+        assert!(matches!(field.value, ContextValue::Float(_)));
+
+        // 验证轨迹保持完整
+        let field = reparsed
+            .context_fields
+            .iter()
+            .find(|f| f.key == "jt1_traj")
+            .unwrap();
+        match &field.value {
+            ContextValue::JointTrajectory(traj) => assert_eq!(traj.len(), 2),
+            other => panic!("Expected JointTrajectory, got {other:?}"),
+        }
     }
 
     #[test]
@@ -443,5 +810,17 @@ pose:
         assert!(parse_joint_states("head_joint_1=1.0 head_joint_2=2.0 body_joint_1=3.0").is_none());
         assert!(parse_joint_states("").is_none());
         assert!(parse_joint_states("random text").is_none());
+    }
+
+    #[test]
+    fn test_numeric_to_json_value_integer() {
+        let v = numeric_to_json_value(4.0);
+        assert_eq!(v, serde_json::json!(4));
+    }
+
+    #[test]
+    fn test_numeric_to_json_value_float() {
+        let v = numeric_to_json_value(0.01);
+        assert_eq!(v, serde_json::json!(0.01));
     }
 }

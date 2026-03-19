@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::model::{self, LoginConfig, Pose, TaskGraphData};
+use crate::model::{self, ContextValue, LoginConfig, Pose, RobotPose, TaskGraphData};
 use crate::worker::{BusyState, WorkerHandle, WorkerRequest, WorkerResponse};
 
 /// ROS2 环境 source 前缀（不含 ROS_DOMAIN_ID，运行时动态拼接）
@@ -65,11 +65,11 @@ fn format_f64(v: f64, _decimals: std::ops::RangeInclusive<usize>) -> String {
 /// 等待中的远程命令类型（用于识别 CommandOutput 响应的来源）
 enum PendingCommand {
     /// 获取底盘位姿
-    ChassisPose { pose_index: usize },
+    ChassisPose { field_index: usize },
     /// 获取头部关节角
-    HeadJoints { pose_index: usize },
+    HeadJoints { field_index: usize },
     /// 获取腰部关节角
-    WaistJoints { pose_index: usize },
+    WaistJoints { field_index: usize },
 }
 
 /// 应用主状态
@@ -107,8 +107,8 @@ pub struct App {
     // 编辑数据
     task_data: Option<TaskGraphData>,
 
-    // 当前选中的位姿索引（用于高亮和获取底盘位姿）
-    selected_pose_index: Option<usize>,
+    // 当前选中的位姿字段索引（索引到 context_fields，仅用于 Pose 类型）
+    selected_field_index: Option<usize>,
 
     /// 等待中的远程命令（用于解析 CommandOutput 响应）
     pending_command: Option<PendingCommand>,
@@ -136,7 +136,7 @@ impl Default for App {
             file_list: Vec::new(),
             selected_file: None,
             task_data: None,
-            selected_pose_index: None,
+            selected_field_index: None,
             pending_command: None,
             reconnect_status: None,
         }
@@ -156,7 +156,6 @@ impl App {
             BusyState::Connecting => "正在连接...",
             BusyState::Refreshing => "正在刷新文件列表...",
             BusyState::Loading(name) => {
-                // 返回静态文字，具体文件名在调用处拼接
                 let _ = name;
                 "正在加载文件..."
             }
@@ -196,6 +195,18 @@ impl App {
         model::save_login_config(&config);
     }
 
+    /// 检查选中字段是否为 Pose 类型
+    fn has_pose_selection(&self) -> bool {
+        self.selected_field_index.is_some_and(|idx| {
+            self.task_data.as_ref().is_some_and(|data| {
+                matches!(
+                    data.context_fields.get(idx).map(|f| &f.value),
+                    Some(ContextValue::Pose(_))
+                )
+            })
+        })
+    }
+
     /// 尝试连接远程主机（异步）
     fn connect(&mut self, ctx: &egui::Context) {
         let port = self.port.parse::<u16>().unwrap_or(22);
@@ -219,14 +230,13 @@ impl App {
         if let Some(worker) = &self.worker {
             worker.send(WorkerRequest::Disconnect);
         }
-        // Drop WorkerHandle，后台线程的 rx 会断开，线程自然退出
         self.worker = None;
         self.is_connected = false;
         self.reconnect_status = None;
         self.file_list.clear();
         self.selected_file = None;
         self.task_data = None;
-        self.selected_pose_index = None;
+        self.selected_field_index = None;
         self.pending_command = None;
         self.busy = BusyState::Idle;
         self.status_message = "已断开连接".into();
@@ -291,14 +301,18 @@ impl App {
 
     /// 获取底盘位姿（异步）
     fn fetch_chassis_pose(&mut self) {
-        let Some(idx) = self.selected_pose_index else {
+        let Some(idx) = self.selected_field_index else {
             self.status_message = "请先选中一个位姿点位".into();
             return;
         };
+        if !self.has_pose_selection() {
+            self.status_message = "选中的字段不是位姿类型".into();
+            return;
+        }
 
         self.busy = BusyState::Fetching("底盘位姿".into());
         self.status_message = "正在获取底盘位姿...".into();
-        self.pending_command = Some(PendingCommand::ChassisPose { pose_index: idx });
+        self.pending_command = Some(PendingCommand::ChassisPose { field_index: idx });
 
         let cmd = self.ros_cmd("timeout 15 ros2 topic echo /tracked_pose --once 2>/dev/null");
         self.send_request(WorkerRequest::ExecCommand { command: cmd });
@@ -306,14 +320,18 @@ impl App {
 
     /// 获取头部关节角（异步）
     fn fetch_head_joints(&mut self) {
-        let Some(idx) = self.selected_pose_index else {
+        let Some(idx) = self.selected_field_index else {
             self.status_message = "请先选中一个位姿点位".into();
             return;
         };
+        if !self.has_pose_selection() {
+            self.status_message = "选中的字段不是位姿类型".into();
+            return;
+        }
 
         self.busy = BusyState::Fetching("头部关节角".into());
         self.status_message = "正在获取头部关节角...".into();
-        self.pending_command = Some(PendingCommand::HeadJoints { pose_index: idx });
+        self.pending_command = Some(PendingCommand::HeadJoints { field_index: idx });
 
         let cmd = self.ros_cmd("timeout 15 python3 -");
         self.send_request(WorkerRequest::ExecCommandWithStdin {
@@ -324,14 +342,18 @@ impl App {
 
     /// 获取腰部关节角（异步）
     fn fetch_waist_joints(&mut self) {
-        let Some(idx) = self.selected_pose_index else {
+        let Some(idx) = self.selected_field_index else {
             self.status_message = "请先选中一个位姿点位".into();
             return;
         };
+        if !self.has_pose_selection() {
+            self.status_message = "选中的字段不是位姿类型".into();
+            return;
+        }
 
         self.busy = BusyState::Fetching("腰部关节角".into());
         self.status_message = "正在获取腰部关节角...".into();
-        self.pending_command = Some(PendingCommand::WaistJoints { pose_index: idx });
+        self.pending_command = Some(PendingCommand::WaistJoints { field_index: idx });
 
         let cmd = self.ros_cmd("timeout 15 python3 -");
         self.send_request(WorkerRequest::ExecCommandWithStdin {
@@ -370,7 +392,7 @@ impl App {
             .set_title("选择要上传的 JSON 文件")
             .pick_file()
         else {
-            return; // 用户取消了对话框
+            return;
         };
 
         let filename = path
@@ -424,7 +446,6 @@ impl App {
                 }
                 self.file_list = file_list;
                 self.status_message = format!("已连接到 {}", self.host);
-                // 连接成功后保存登录信息
                 self.save_login_config();
             }
 
@@ -435,7 +456,6 @@ impl App {
             }
 
             WorkerResponse::Disconnected => {
-                // disconnect() 已经处理了 UI 状态，这里只确认
                 self.busy = BusyState::Idle;
             }
 
@@ -450,7 +470,7 @@ impl App {
                     Ok(content) => match model::parse_task_graph(&content) {
                         Ok(data) => {
                             self.task_data = Some(data);
-                            self.selected_pose_index = None;
+                            self.selected_field_index = None;
                             self.status_message = format!("已加载: {filename}");
                         }
                         Err(e) => {
@@ -506,11 +526,10 @@ impl App {
             } => {
                 self.busy = BusyState::Idle;
                 self.status_message = format!("已删除: {filename}");
-                // 如果删除的是当前选中文件，清空编辑区
                 if self.selected_file.as_deref() == Some(filename.as_str()) {
                     self.selected_file = None;
                     self.task_data = None;
-                    self.selected_pose_index = None;
+                    self.selected_field_index = None;
                 }
                 self.apply_file_list(file_list);
             }
@@ -536,10 +555,8 @@ impl App {
 
             WorkerResponse::ConnectionLost(reason) => {
                 self.is_connected = false;
-                // 不 drop worker — worker 会自动重连
                 self.busy = BusyState::Idle;
                 self.pending_command = None;
-                // 保留 file_list / task_data / selected_file，避免丢失未保存的编辑
                 self.status_message = format!("连接已断开: {reason}");
             }
 
@@ -571,13 +588,14 @@ impl App {
                 self.busy = BusyState::Idle;
                 let pending = self.pending_command.take();
                 match (result, pending) {
-                    (Ok(output), Some(PendingCommand::ChassisPose { pose_index })) => {
+                    (Ok(output), Some(PendingCommand::ChassisPose { field_index })) => {
                         match model::parse_tracked_pose(&output) {
-                            Some(pose) => {
+                            Some(chassis_pose) => {
                                 if let Some(data) = &mut self.task_data
-                                    && let Some(field) = data.pose_fields.get_mut(pose_index)
+                                    && let Some(field) = data.context_fields.get_mut(field_index)
+                                    && let ContextValue::Pose(ref mut pose) = field.value
                                 {
-                                    field.pose.chassis_pose = pose;
+                                    pose.chassis_pose = chassis_pose;
                                     self.status_message = format!("已填入底盘位姿 → {}", field.key);
                                 }
                             }
@@ -586,14 +604,15 @@ impl App {
                             }
                         }
                     }
-                    (Ok(output), Some(PendingCommand::HeadJoints { pose_index })) => {
+                    (Ok(output), Some(PendingCommand::HeadJoints { field_index })) => {
                         match model::parse_joint_states(&output) {
                             Some(angles) => {
                                 if let Some(data) = &mut self.task_data
-                                    && let Some(field) = data.pose_fields.get_mut(pose_index)
+                                    && let Some(field) = data.context_fields.get_mut(field_index)
+                                    && let ContextValue::Pose(ref mut pose) = field.value
                                 {
-                                    field.pose.head_pose.position.x = angles.head_joint_1;
-                                    field.pose.head_pose.position.y = angles.head_joint_2;
+                                    pose.head_pose.position.x = angles.head_joint_1;
+                                    pose.head_pose.position.y = angles.head_joint_2;
                                     self.status_message =
                                         format!("已填入头部关节角 → {}", field.key);
                                 }
@@ -603,14 +622,15 @@ impl App {
                             }
                         }
                     }
-                    (Ok(output), Some(PendingCommand::WaistJoints { pose_index })) => {
+                    (Ok(output), Some(PendingCommand::WaistJoints { field_index })) => {
                         match model::parse_joint_states(&output) {
                             Some(angles) => {
                                 if let Some(data) = &mut self.task_data
-                                    && let Some(field) = data.pose_fields.get_mut(pose_index)
+                                    && let Some(field) = data.context_fields.get_mut(field_index)
+                                    && let ContextValue::Pose(ref mut pose) = field.value
                                 {
-                                    field.pose.waist_pose.position.x = angles.body_joint_1;
-                                    field.pose.waist_pose.position.y = angles.body_joint_2;
+                                    pose.waist_pose.position.x = angles.body_joint_1;
+                                    pose.waist_pose.position.y = angles.body_joint_2;
                                     self.status_message =
                                         format!("已填入腰部关节角 → {}", field.key);
                                 }
@@ -633,7 +653,6 @@ impl App {
 
     /// 轮询后台线程响应（在 update() 开头调用）
     fn poll_worker(&mut self) {
-        // 先收集所有响应，避免 &self.worker 和 &mut self 的借用冲突
         let responses: Vec<_> = self
             .worker
             .as_ref()
@@ -653,7 +672,6 @@ impl App {
         let busy = self.is_busy();
         let reconnecting = self.reconnect_status.is_some();
 
-        // 忙碌或重连中禁用输入框
         ui.add_enabled_ui(!busy && !reconnecting, |ui| {
             egui::Grid::new("ssh_config")
                 .num_columns(2)
@@ -710,7 +728,6 @@ impl App {
                     self.upload_file();
                 }
             } else if reconnecting {
-                // 重连中：只显示断开按钮（取消自动重连）
                 if ui.button("断开连接").clicked() {
                     self.disconnect();
                 }
@@ -721,7 +738,6 @@ impl App {
 
         ui.add_space(8.0);
 
-        // 忙碌状态指示
         if busy {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -729,7 +745,6 @@ impl App {
             });
         }
 
-        // 自动重连状态
         if let Some(ref status) = self.reconnect_status {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -737,7 +752,6 @@ impl App {
             });
         }
 
-        // 状态栏
         if !self.status_message.is_empty() {
             ui.colored_label(
                 if self.status_message.contains("失败") || self.status_message.contains("错误")
@@ -773,7 +787,6 @@ impl App {
                         );
                         if ui.is_rect_visible(rect) {
                             let visuals = ui.style().interact_selectable(&resp, is_selected);
-                            // 悬停或选中时绘制整行背景
                             if is_selected || resp.hovered() || resp.highlighted() {
                                 ui.painter().rect(
                                     rect.expand(visuals.expansion),
@@ -783,7 +796,6 @@ impl App {
                                     egui::StrokeKind::Inside,
                                 );
                             }
-                            // 文字左对齐、垂直居中
                             let text_pos = egui::pos2(
                                 rect.left() + ui.spacing().button_padding.x,
                                 rect.center().y,
@@ -799,7 +811,6 @@ impl App {
                         if resp.clicked() && !busy {
                             clicked_file = Some(filename.clone());
                         }
-                        // 右键菜单：上传文件、备份、分割线、删除
                         let fname = filename.clone();
                         let fname2 = filename.clone();
                         resp.context_menu(|ui| {
@@ -826,7 +837,6 @@ impl App {
                         });
                     }
 
-                    // 空白区域占满剩余空间，右键仅「上传文件」
                     let blank_size = ui.available_size().max(egui::vec2(1.0, 1.0));
                     let blank_resp = ui.allocate_response(blank_size, egui::Sense::click());
                     blank_resp.context_menu(|ui| {
@@ -856,7 +866,7 @@ impl App {
         }
     }
 
-    /// 绘制右侧面板：元数据 + 位姿编辑器 + 操作按钮
+    /// 绘制右侧面板：元数据 + 按类型分组的 context 编辑器
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         let Some(data) = &mut self.task_data else {
             ui.centered_and_justified(|ui| {
@@ -882,91 +892,372 @@ impl App {
             });
 
         ui.add_space(12.0);
-        ui.heading("位姿编辑");
-        ui.separator();
 
-        // 提取 selected_pose_index 避免借用冲突
-        let mut selected = self.selected_pose_index;
+        // 按类型分类字段索引
+        let mut pose_indices = Vec::new();
+        let mut scalar_indices = Vec::new();
+        let mut array_indices = Vec::new();
+        let mut traj_indices = Vec::new();
+        let mut other_indices = Vec::new();
+
+        for (i, field) in data.context_fields.iter().enumerate() {
+            match &field.value {
+                ContextValue::Pose(_) => pose_indices.push(i),
+                ContextValue::Bool(_) | ContextValue::Integer(_) | ContextValue::Float(_) => {
+                    scalar_indices.push(i);
+                }
+                ContextValue::NumericArray(_) | ContextValue::NumericArray2D(_) => {
+                    array_indices.push(i);
+                }
+                ContextValue::JointTrajectory(_) => traj_indices.push(i),
+                _ => other_indices.push(i),
+            }
+        }
+
+        let mut selected = self.selected_field_index;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (i, field) in data.pose_fields.iter_mut().enumerate() {
-                    let is_selected = selected == Some(i);
+                // ── 位姿点位 ──
+                if !pose_indices.is_empty() {
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(format!("位姿点位 ({})", pose_indices.len())).heading(),
+                    )
+                    .id_salt("section_pose")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for &i in &pose_indices {
+                            let is_selected = selected == Some(i);
+                            let frame = if is_selected {
+                                egui::Frame::new()
+                                    .fill(egui::Color32::from_rgba_premultiplied(30, 30, 30, 25))
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgba_premultiplied(60, 60, 60, 80),
+                                    ))
+                                    .inner_margin(6.0)
+                                    .corner_radius(4.0)
+                            } else {
+                                egui::Frame::new().inner_margin(6.0)
+                            };
 
-                    // 选中的位姿用极淡灰色背景 + 细灰边框，不影响阅读
-                    let frame = if is_selected {
-                        egui::Frame::new()
-                            .fill(egui::Color32::from_rgba_premultiplied(30, 30, 30, 25))
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                egui::Color32::from_rgba_premultiplied(60, 60, 60, 80),
-                            ))
-                            .inner_margin(6.0)
-                            .corner_radius(4.0)
-                    } else {
-                        egui::Frame::new().inner_margin(6.0)
-                    };
+                            let available_w = ui.available_width();
+                            let key = data.context_fields[i].key.clone();
+                            let frame_resp = frame.show(ui, |ui| {
+                                ui.set_min_width(available_w);
+                                let title = if is_selected {
+                                    egui::RichText::new(&key)
+                                        .strong()
+                                        .size(14.0)
+                                        .color(egui::Color32::from_rgb(255, 180, 50))
+                                } else {
+                                    egui::RichText::new(&key).strong().size(14.0)
+                                };
+                                egui::CollapsingHeader::new(title)
+                                    .id_salt(format!("pose_{key}"))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        let field = &mut data.context_fields[i];
+                                        if let ContextValue::Pose(ref mut pose) = field.value {
+                                            ui.indent(format!("pose_{key}_indent"), |ui| {
+                                                Self::draw_single_pose(
+                                                    ui,
+                                                    "底盘 (chassis)",
+                                                    &mut pose.chassis_pose,
+                                                );
+                                                Self::draw_single_pose(
+                                                    ui,
+                                                    "头部 (head)",
+                                                    &mut pose.head_pose,
+                                                );
+                                                Self::draw_single_pose(
+                                                    ui,
+                                                    "腰部 (waist)",
+                                                    &mut pose.waist_pose,
+                                                );
+                                            });
+                                        }
+                                    });
+                            });
 
-                    let available_w = ui.available_width();
-                    let frame_resp = frame.show(ui, |ui| {
-                        ui.set_min_width(available_w);
-                        // 选中时标题用橙色，未选中用默认色
-                        let title = if is_selected {
-                            egui::RichText::new(&field.key)
-                                .strong()
-                                .size(14.0)
-                                .color(egui::Color32::from_rgb(255, 180, 50))
-                        } else {
-                            egui::RichText::new(&field.key).strong().size(14.0)
-                        };
-                        egui::CollapsingHeader::new(title)
-                            .default_open(i == 0)
+                            // 检测鼠标点击选中位姿
+                            let rect = frame_resp.response.rect;
+                            if ui.input(|i| i.pointer.any_click())
+                                && ui
+                                    .input(|i| i.pointer.interact_pos())
+                                    .is_some_and(|pos| rect.contains(pos))
+                            {
+                                selected = Some(i);
+                            }
+
+                            ui.add_space(2.0);
+                        }
+                    });
+                }
+
+                // ── 基本参数 ──
+                if !scalar_indices.is_empty() {
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(format!("基本参数 ({})", scalar_indices.len()))
+                            .heading(),
+                    )
+                    .id_salt("section_scalar")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::Grid::new("scalar_params")
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .striped(true)
                             .show(ui, |ui| {
-                                ui.indent(format!("{}_indent", field.key), |ui| {
-                                    Self::draw_single_pose(
-                                        ui,
-                                        "底盘 (chassis)",
-                                        &field.key,
-                                        "chassis",
-                                        &mut field.pose.chassis_pose,
-                                    );
-                                    Self::draw_single_pose(
-                                        ui,
-                                        "头部 (head)",
-                                        &field.key,
-                                        "head",
-                                        &mut field.pose.head_pose,
-                                    );
-                                    Self::draw_single_pose(
-                                        ui,
-                                        "腰部 (waist)",
-                                        &field.key,
-                                        "waist",
-                                        &mut field.pose.waist_pose,
-                                    );
-                                });
+                                for &i in &scalar_indices {
+                                    let field = &mut data.context_fields[i];
+                                    ui.label(&field.key);
+                                    match &mut field.value {
+                                        ContextValue::Bool(b) => {
+                                            ui.checkbox(b, "");
+                                        }
+                                        ContextValue::Integer(v) => {
+                                            let mut f = *v as f64;
+                                            let drag = egui::DragValue::new(&mut f)
+                                                .speed(1.0)
+                                                .custom_formatter(|v, _| format!("{}", v as i64))
+                                                .custom_parser(|s| {
+                                                    s.parse::<i64>().ok().map(|i| i as f64)
+                                                });
+                                            if ui.add(drag).changed() {
+                                                *v = f as i64;
+                                            }
+                                        }
+                                        ContextValue::Float(f) => {
+                                            ui.add(
+                                                egui::DragValue::new(f)
+                                                    .speed(0.01)
+                                                    .custom_formatter(format_f64)
+                                                    .custom_parser(|s| s.parse::<f64>().ok()),
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                    ui.end_row();
+                                }
                             });
                     });
+                }
 
-                    // 检测 frame 区域内的鼠标点击来选中位姿
-                    // 不用 interact() 以免吞掉 CollapsingHeader 的点击事件
-                    let rect = frame_resp.response.rect;
-                    if ui.input(|i| i.pointer.any_click())
-                        && ui
-                            .input(|i| i.pointer.interact_pos())
-                            .is_some_and(|pos| rect.contains(pos))
-                    {
-                        selected = Some(i);
-                    }
+                // ── 数组参数 ──
+                if !array_indices.is_empty() {
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(format!("数组参数 ({})", array_indices.len()))
+                            .heading(),
+                    )
+                    .id_salt("section_array")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for &i in &array_indices {
+                            let field = &mut data.context_fields[i];
+                            let key = field.key.clone();
+                            match &mut field.value {
+                                ContextValue::NumericArray(arr) => {
+                                    egui::CollapsingHeader::new(format!(
+                                        "{key} [{} 个元素]",
+                                        arr.len()
+                                    ))
+                                    .id_salt(format!("arr_{key}"))
+                                    .show(ui, |ui| {
+                                        for (j, val) in arr.iter_mut().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("[{j}]:"));
+                                                ui.add(
+                                                    egui::DragValue::new(val)
+                                                        .speed(0.01)
+                                                        .custom_formatter(format_f64)
+                                                        .custom_parser(|s| s.parse::<f64>().ok()),
+                                                );
+                                            });
+                                        }
+                                    });
+                                }
+                                ContextValue::NumericArray2D(arr2d) => {
+                                    let rows = arr2d.len();
+                                    let cols = arr2d.first().map(|r| r.len()).unwrap_or(0);
+                                    egui::CollapsingHeader::new(format!("{key} [{rows} x {cols}]"))
+                                        .id_salt(format!("arr2d_{key}"))
+                                        .show(ui, |ui| {
+                                            for (row_idx, row) in arr2d.iter_mut().enumerate() {
+                                                egui::CollapsingHeader::new(format!("[{row_idx}]"))
+                                                    .id_salt(format!("arr2d_{key}_r{row_idx}"))
+                                                    .show(ui, |ui| {
+                                                        for (col_idx, val) in
+                                                            row.iter_mut().enumerate()
+                                                        {
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(format!("[{col_idx}]:"));
+                                                                ui.add(
+                                                                    egui::DragValue::new(val)
+                                                                        .speed(0.01)
+                                                                        .custom_formatter(
+                                                                            format_f64,
+                                                                        )
+                                                                        .custom_parser(|s| {
+                                                                            s.parse::<f64>().ok()
+                                                                        }),
+                                                                );
+                                                            });
+                                                        }
+                                                    });
+                                            }
+                                        });
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                }
 
-                    ui.add_space(4.0);
+                // ── 轨迹数据 ──
+                if !traj_indices.is_empty() {
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(format!("轨迹数据 ({})", traj_indices.len())).heading(),
+                    )
+                    .id_salt("section_traj")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for &i in &traj_indices {
+                            let field = &mut data.context_fields[i];
+                            let key = field.key.clone();
+                            if let ContextValue::JointTrajectory(ref mut traj) = field.value {
+                                let num_axes = traj.first().map(|p| p.positions.len()).unwrap_or(0);
+                                egui::CollapsingHeader::new(format!(
+                                    "{key} [{} 个点, {} 轴]",
+                                    traj.len(),
+                                    num_axes
+                                ))
+                                .id_salt(format!("traj_{key}"))
+                                .show(ui, |ui| {
+                                    for (j, point) in traj.iter_mut().enumerate() {
+                                        egui::CollapsingHeader::new(format!(
+                                            "[{j}] t = {:.3}s",
+                                            point.time_from_start
+                                        ))
+                                        .id_salt(format!("traj_{key}_p{j}"))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label("时间:");
+                                                ui.add(
+                                                    egui::DragValue::new(
+                                                        &mut point.time_from_start,
+                                                    )
+                                                    .speed(0.1)
+                                                    .custom_formatter(format_f64)
+                                                    .custom_parser(|s| s.parse::<f64>().ok()),
+                                                );
+                                            });
+                                            for (k, pos) in point.positions.iter_mut().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(format!("关节 {k}:"));
+                                                    ui.add(
+                                                        egui::DragValue::new(pos)
+                                                            .speed(0.001)
+                                                            .custom_formatter(format_f64)
+                                                            .custom_parser(|s| {
+                                                                s.parse::<f64>().ok()
+                                                            }),
+                                                    );
+                                                });
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                    });
+                }
+
+                // ── 其他 ──
+                if !other_indices.is_empty() {
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(format!("其他 ({})", other_indices.len())).heading(),
+                    )
+                    .id_salt("section_other")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for &i in &other_indices {
+                            let field = &mut data.context_fields[i];
+                            let key = field.key.clone();
+                            match &mut field.value {
+                                ContextValue::Null => {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{key}:"));
+                                        ui.colored_label(egui::Color32::GRAY, "null");
+                                        // 对包含 "pose" 的 null 字段提供创建位姿按钮
+                                        if key.contains("pose")
+                                            && ui.small_button("创建位姿").clicked()
+                                        {
+                                            data.context_fields[i].value =
+                                                ContextValue::Pose(RobotPose::default());
+                                        }
+                                    });
+                                }
+                                ContextValue::Text(s) => {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{key}:"));
+                                        ui.text_edit_singleline(s);
+                                    });
+                                }
+                                ContextValue::PoseArray(poses) => {
+                                    egui::CollapsingHeader::new(format!(
+                                        "{key} [{} 个位姿]",
+                                        poses.len()
+                                    ))
+                                    .id_salt(format!("posearr_{key}"))
+                                    .show(ui, |ui| {
+                                        if poses.is_empty() {
+                                            ui.colored_label(egui::Color32::GRAY, "(空)");
+                                        }
+                                        for (j, pose) in poses.iter_mut().enumerate() {
+                                            egui::CollapsingHeader::new(format!("[{j}]"))
+                                                .id_salt(format!("posearr_{key}_p{j}"))
+                                                .show(ui, |ui| {
+                                                    Self::draw_single_pose(
+                                                        ui,
+                                                        &format!("[{j}] 底盘"),
+                                                        &mut pose.chassis_pose,
+                                                    );
+                                                    Self::draw_single_pose(
+                                                        ui,
+                                                        &format!("[{j}] 头部"),
+                                                        &mut pose.head_pose,
+                                                    );
+                                                    Self::draw_single_pose(
+                                                        ui,
+                                                        &format!("[{j}] 腰部"),
+                                                        &mut pose.waist_pose,
+                                                    );
+                                                });
+                                        }
+                                    });
+                                }
+                                ContextValue::RawJson(v) => {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{key}:"));
+                                        ui.colored_label(egui::Color32::GRAY, v.to_string());
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
                 }
 
                 ui.add_space(16.0);
             });
 
-        self.selected_pose_index = selected;
+        self.selected_field_index = selected;
     }
 
     /// 绘制单个 f64 编辑行: `label: [drag_value]`
@@ -982,25 +1273,8 @@ impl App {
         });
     }
 
-    /// 绘制单个部位的位姿，竖向排列
-    ///
-    /// ```text
-    /// chassis:
-    ///   位置:
-    ///     x: [value]
-    ///     y: [value]
-    ///     z: [value]
-    ///   姿态:
-    ///     w: [value]
-    ///     ...
-    /// ```
-    fn draw_single_pose(
-        ui: &mut egui::Ui,
-        label: &str,
-        _field_key: &str,
-        _part: &str,
-        pose: &mut Pose,
-    ) {
+    /// 绘制单个部位的位姿（位置 + 姿态），竖向排列
+    fn draw_single_pose(ui: &mut egui::Ui, label: &str, pose: &mut Pose) {
         ui.label(egui::RichText::new(label).underline());
         ui.indent(label, |ui| {
             ui.label("位置:");
@@ -1027,19 +1301,16 @@ impl eframe::App for App {
         self.poll_worker();
 
         // UI 缩放：Shift + (+/-) 或 Shift + 鼠标滚轮
-        // 先用 input_mut 拦截滚轮事件，防止被 ScrollArea 消费掉
         let shift = ctx.input(|i| i.modifiers.shift);
         if shift {
             let mut zoom_delta = 0.0f32;
 
-            // Shift + 键盘 +/-
             if ctx.input(|i| i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)) {
                 zoom_delta = 0.1;
             } else if ctx.input(|i| i.key_pressed(egui::Key::Minus)) {
                 zoom_delta = -0.1;
             }
 
-            // Shift + 鼠标滚轮（用 input_mut 消费事件，取 x/y 中绝对值较大的）
             ctx.input_mut(|i| {
                 for event in &i.raw.events {
                     if let egui::Event::MouseWheel { delta, .. } = event {
@@ -1054,7 +1325,6 @@ impl eframe::App for App {
                     }
                 }
                 if zoom_delta.abs() > f32::EPSILON {
-                    // 移除滚轮事件，防止同时触发 ScrollArea 滚动
                     i.raw
                         .events
                         .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
@@ -1094,8 +1364,8 @@ impl eframe::App for App {
 
                     ui.add_space(12.0);
 
-                    let has_selection = self.selected_pose_index.is_some();
-                    let can_fetch = has_selection && !busy;
+                    let has_pose = self.has_pose_selection();
+                    let can_fetch = has_pose && !busy;
                     let no_selection_hint = "请先点击位姿名称选中一个点位";
 
                     let r1 = ui.add_enabled(
@@ -1105,7 +1375,7 @@ impl eframe::App for App {
                     if r1.clicked() {
                         self.fetch_chassis_pose();
                     }
-                    if !has_selection {
+                    if !has_pose {
                         r1.on_hover_text(no_selection_hint);
                     }
 
@@ -1116,7 +1386,7 @@ impl eframe::App for App {
                     if r2.clicked() {
                         self.fetch_head_joints();
                     }
-                    if !has_selection {
+                    if !has_pose {
                         r2.on_hover_text(no_selection_hint);
                     }
 
@@ -1127,7 +1397,7 @@ impl eframe::App for App {
                     if r3.clicked() {
                         self.fetch_waist_joints();
                     }
-                    if !has_selection {
+                    if !has_pose {
                         r3.on_hover_text(no_selection_hint);
                     }
                 }
