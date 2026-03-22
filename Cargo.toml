@@ -13,9 +13,10 @@ mimalloc = { version = "0.1", default-features = false }
 rfd = "0.17.2"
 chrono = "0.4"
 
-# Windows 下使用 vendored OpenSSL（ssh2 依赖链需要）
-[target.'cfg(windows)'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
+# vendored OpenSSL（ssh2 依赖链需要，全平台免安装）
+[dependencies.openssl]
+version = "0.10"
+features = ["vendored"]
 
 [profile.release]
 strip = true
