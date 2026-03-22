@@ -1,4 +1,8 @@
-name: Build Release
+# GitHub Actions CI/CD 配置
+# 任务图编辑器 - 持续集成
+# 版本格式: v主版本.次版本.修订号+commit短哈希 (release) | v主版本.次版本.修订号+日期.commit短哈希 (dev)
+
+name: CI
 
 on:
   push:
@@ -9,41 +13,39 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
   CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
 
 jobs:
-  # ============================================================
-  # 阶段 1：fmt 与 clippy 并行
-  # ============================================================
+  # ============ 代码检查 ============
   fmt:
-    runs-on: ubuntu-22.04
+    name: Format Check
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 Rust 工具链
+      - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
 
-      - name: 格式检查
+      - name: Check formatting
         run: cargo fmt --all -- --check
 
   clippy:
-    runs-on: ubuntu-22.04
+    name: Clippy
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 Rust 工具链
+      - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy
 
-      - name: 缓存 Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: clippy
-
-      - name: 安装 Linux 依赖
+      - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -51,27 +53,24 @@ jobs:
             libxkbcommon-dev libgl1-mesa-dev \
             libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - name: Clippy 检查
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy
         run: cargo clippy --all --all-targets -- -D warnings
 
-  # ============================================================
-  # 阶段 2：测试（等 fmt + clippy 通过）
-  # ============================================================
+  # ============ 测试 ============
   test:
+    name: Test
+    runs-on: ubuntu-latest
     needs: [fmt, clippy]
-    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 Rust 工具链
+      - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: 缓存 Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: test
-
-      - name: 安装 Linux 依赖
+      - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -79,13 +78,16 @@ jobs:
             libxkbcommon-dev libgl1-mesa-dev \
             libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - name: 运行测试
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
         run: cargo test --all
 
-  # ============================================================
-  # 阶段 3：跨平台构建（等测试通过）
-  # ============================================================
+  # ============ 构建 ============
   build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
     needs: [test]
     strategy:
       fail-fast: false
@@ -94,50 +96,66 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             platform: linux-x64
-            artifact: task-graph-editor
-          - os: macos-14
-            target: aarch64-apple-darwin
-            platform: macos-arm64
-            artifact: task-graph-editor
+            exe_suffix: ""
+            archive_ext: "tar.gz"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform: windows-x64
-            artifact: task-graph-editor.exe
-
-    runs-on: ${{ matrix.os }}
+            exe_suffix: ".exe"
+            archive_ext: "zip"
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+            exe_suffix: ""
+            archive_ext: "zip"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 Rust 工具链
+      - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
 
-      - name: 缓存 Rust
+      - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: build-${{ matrix.platform }}
+          key: ${{ matrix.target }}
 
-      - name: 计算版本号
+      # 生成版本信息
+      - name: Generate version info
         id: version
         shell: bash
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          COMMIT=$(git rev-parse --short=7 HEAD)
-          DATE=$(date +%Y%m%d)
+          BASE_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "base_version=$BASE_VERSION" >> $GITHUB_OUTPUT
 
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            FULL_VERSION="v${VERSION}+${COMMIT}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            BUILD_META="${SHORT_SHA}"
+            BUILD_TYPE="release"
           else
-            FULL_VERSION="v${VERSION}+${DATE}.${COMMIT}"
+            BUILD_DATE=$(date -u +%Y%m%d)
+            BUILD_META="${BUILD_DATE}.${SHORT_SHA}"
+            BUILD_TYPE="dev"
           fi
+          echo "build_meta=$BUILD_META" >> $GITHUB_OUTPUT
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
 
-          echo "full_version=${FULL_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "版本号: ${FULL_VERSION}"
+          FULL_VERSION="v${BASE_VERSION}+${BUILD_META}"
+          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
+
+          PACKAGE_NAME="task-graph-editor-${FULL_VERSION}-${{ matrix.platform }}"
+          echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+
+          echo "=== Version Info ==="
+          echo "Build Type: $BUILD_TYPE"
+          echo "Full Version: $FULL_VERSION"
 
       # Linux 系统依赖
-      - name: 安装 Linux 依赖
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -146,78 +164,213 @@ jobs:
             libxkbcommon-dev libgl1-mesa-dev \
             libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      # macOS 系统依赖
-      - name: 安装 macOS 依赖
+      # macOS 系统依赖（vendored OpenSSL 仍需 pkg-config）
+      - name: Install macOS dependencies
         if: runner.os == 'macOS'
-        run: brew install openssl pkg-config
+        run: brew install pkg-config
 
-      # Windows：NASM 用于 openssl vendored 编译
-      - name: 安装 Windows 依赖
+      # Windows: NASM 用于 openssl vendored 编译
+      - name: Install Windows dependencies
         if: runner.os == 'Windows'
         run: choco install nasm -y
 
-      - name: 构建 Release
+      - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
-      # UPX 压缩（macOS 跳过）
-      - name: UPX 压缩
-        if: runner.os != 'macOS'
-        uses: crazy-max/ghaction-upx@v3
-        with:
-          version: latest
-          files: target/${{ matrix.target }}/release/${{ matrix.artifact }}
-          args: --best --lzma
-
-      - name: 打包产物 (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Verify build artifacts
+        shell: bash
         run: |
-          FULL_VERSION="${{ steps.version.outputs.full_version }}"
-          PACKAGE_NAME="task-graph-editor-${FULL_VERSION}-${{ matrix.platform }}"
-          mkdir -p "dist/${PACKAGE_NAME}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${PACKAGE_NAME}/"
-          echo -n "${FULL_VERSION}" > "dist/${PACKAGE_NAME}/VERSION"
-          cd dist
-          tar czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
+          echo "=== Executable ==="
+          ls -lh "target/${{ matrix.target }}/release/task-graph-editor${{ matrix.exe_suffix }}"
 
-      - name: 打包产物 (Windows)
+      # 验证 ELF 完整性（Linux）
+      - name: Verify ELF integrity
+        if: runner.os == 'Linux'
+        run: |
+          EXE="target/${{ matrix.target }}/release/task-graph-editor"
+          echo "=== 检查动态段 ==="
+          readelf -d "$EXE" | head -10
+          if readelf -d "$EXE" 2>&1 | grep -q "NEEDED"; then
+            echo "ELF 结构完整"
+          else
+            echo "ELF 结构异常！"
+            exit 1
+          fi
+
+      # UPX 压缩（Linux/Windows，macOS 不支持）
+      - name: Install UPX (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: Install UPX (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install upx -y
+
+      - name: Compress binary with UPX
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          EXE="target/${{ matrix.target }}/release/task-graph-editor${{ matrix.exe_suffix }}"
+          echo "=== 压缩前 ==="
+          ls -lh "$EXE"
+          upx --best --lzma "$EXE" || true
+          echo "=== 压缩后 ==="
+          ls -lh "$EXE"
+
+      # 打包产物 (Linux)
+      - name: Package artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p package
+          cp target/${{ matrix.target }}/release/task-graph-editor package/
+          echo "${{ steps.version.outputs.full_version }}" > package/VERSION
+          cd package
+          tar -czvf ../${{ steps.version.outputs.package_name }}.tar.gz .
+          cd ..
+
+      # 打包产物 (macOS .app bundle)
+      - name: Package artifacts (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP_NAME="任务图编辑器.app"
+          mkdir -p "package/${APP_NAME}/Contents/MacOS"
+          mkdir -p "package/${APP_NAME}/Contents/Resources"
+
+          cp "target/${{ matrix.target }}/release/task-graph-editor" "package/${APP_NAME}/Contents/MacOS/task-graph-editor"
+
+          cat > "package/${APP_NAME}/Contents/Info.plist" << 'PLIST_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>任务图编辑器</string>
+              <key>CFBundleDisplayName</key>
+              <string>任务图编辑器</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.task-graph-editor</string>
+              <key>CFBundleVersion</key>
+              <string>PLACEHOLDER_VERSION</string>
+              <key>CFBundleShortVersionString</key>
+              <string>PLACEHOLDER_VERSION</string>
+              <key>CFBundleExecutable</key>
+              <string>task-graph-editor</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>LSMinimumSystemVersion</key>
+              <string>11.0</string>
+          </dict>
+          </plist>
+          PLIST_EOF
+
+          # 替换版本号占位符
+          sed -i '' "s/PLACEHOLDER_VERSION/${{ steps.version.outputs.base_version }}/g" "package/${APP_NAME}/Contents/Info.plist"
+
+          cd package
+          zip -r -q ../${{ steps.version.outputs.package_name }}.zip "${APP_NAME}"
+          cd ..
+
+      # 打包产物 (Windows)
+      - name: Package artifacts (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $FullVersion = "${{ steps.version.outputs.full_version }}"
-          $PackageName = "task-graph-editor-${FullVersion}-${{ matrix.platform }}"
-          New-Item -ItemType Directory -Force -Path "dist/${PackageName}"
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -Destination "dist/${PackageName}/"
-          [System.IO.File]::WriteAllText("dist/${PackageName}/VERSION", $FullVersion)
-          Compress-Archive -Path "dist/${PackageName}" -DestinationPath "dist/${PackageName}.zip"
+          New-Item -ItemType Directory -Force -Path package
+          Copy-Item target/${{ matrix.target }}/release/task-graph-editor.exe package/
+          "${{ steps.version.outputs.full_version }}" | Out-File -FilePath package/VERSION -Encoding UTF8
+          Compress-Archive -Path package/* -DestinationPath "${{ steps.version.outputs.package_name }}.zip"
 
-      - name: 上传构建产物
+      - name: Upload artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
-          name: task-graph-editor-${{ matrix.platform }}
+          name: ${{ steps.version.outputs.package_name }}
           path: |
-            dist/task-graph-editor-*-${{ matrix.platform }}.tar.gz
-            dist/task-graph-editor-*-${{ matrix.platform }}.zip
-          if-no-files-found: ignore
+            ${{ steps.version.outputs.package_name }}.tar.gz
+            ${{ steps.version.outputs.package_name }}.zip
+          retention-days: 7
 
-  # ============================================================
-  # 有 tag 时自动创建 Release
-  # ============================================================
+  # ============ Release 发布 ============
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Create Release
     runs-on: ubuntu-latest
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
-
     steps:
-      - name: 下载所有构建产物
+      - uses: actions/checkout@v4
+
+      - name: Generate version info
+        id: version
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/}"
+          echo "tag_version=$TAG_VERSION" >> $GITHUB_OUTPUT
+
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          FULL_VERSION="${TAG_VERSION}+${SHORT_SHA}"
+          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
+
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+          echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: 创建 GitHub Release
+      - name: List artifacts
+        run: |
+          echo "=== Downloaded artifacts ==="
+          find artifacts -type f -name "*.tar.gz" -o -name "*.zip" | head -20
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release/ \;
+          echo "=== Release files ==="
+          ls -la release/
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          name: "Release ${{ steps.version.outputs.full_version }}"
+          tag_name: ${{ steps.version.outputs.tag_version }}
+          files: release/*
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          draft: false
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
+          body: |
+            ## 版本信息
+            - **版本号**: ${{ steps.version.outputs.full_version }}
+            - **构建日期**: ${{ steps.version.outputs.build_date }}
+            - **Commit**: ${{ github.sha }}
+
+            ## 下载
+            - Linux x64: `task-graph-editor-${{ steps.version.outputs.full_version }}-linux-x64.tar.gz`
+            - Windows x64: `task-graph-editor-${{ steps.version.outputs.full_version }}-windows-x64.zip`
+            - macOS ARM64: `task-graph-editor-${{ steps.version.outputs.full_version }}-macos-arm64.zip`（.app bundle，双击运行）
+
+            ## 说明
+            - 字体已编译嵌入，无需额外安装
+            - macOS 版本为 .app bundle，双击即可运行，无终端窗口
+            - Linux/Windows 解压后直接运行可执行文件
+
+  # ============ Dev 构建通知 ============
+  dev-build-summary:
+    name: Dev Build Summary
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev'
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Dev Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Branch: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Artifacts are available for download from the Actions tab." >> $GITHUB_STEP_SUMMARY
