@@ -933,7 +933,7 @@ impl App {
                                 egui::Frame::new()
                                     .fill(egui::Color32::from_rgba_premultiplied(30, 30, 30, 25))
                                     .stroke(egui::Stroke::new(
-                                        1.0,
+                                        1.0_f32,
                                         egui::Color32::from_rgba_premultiplied(60, 60, 60, 80),
                                     ))
                                     .inner_margin(6.0)
