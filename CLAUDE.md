@@ -67,14 +67,16 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
 
 - `raw_json` 保留未编辑的原始 JSON，序列化时仅更新编辑过的字段
 - JSON `config.context` 中的位姿字段是**字符串化 JSON**，需要二次解析
-- `config.context` 中所有字段自动识别类型（`ContextValue` 枚举，11 种变体）：
+- `config.context` 中所有字段自动识别类型（`ContextValue` 枚举，12 种变体）：
   - `Pose` — 字符串化 RobotPose（chassis/head/waist）
   - `Bool` / `Integer` / `Float` — 标量
   - `NumericArray` / `NumericArray2D` — 字符串化的 1D/2D 数值数组
   - `JointTrajectory` — 原生 JSON 数组（positions + time_from_start）
   - `PoseArray` — 原生位姿数组
+  - `NestedGroup` — 原生 JSON 对象，成员递归分类（如 `station_profiles.station_1.*`），支持任意层级嵌套
   - `Text` / `Null` / `RawJson` — 其他
-- GUI 按类型分 5 个可折叠分组：位姿点位、基本参数、数组参数、轨迹数据、其他
+- GUI 按类型分 6 个可折叠分组：位姿点位、基本参数、数组参数、轨迹数据、嵌套分组、其他（嵌套分组内部递归复用同一分组结构）
+- 位姿选中用索引路径（`Vec<usize>`）表示，嵌套分组内的位姿同样支持 ROS2 一键回填底盘/头部/腰部数据
 - 序列化时整数保持整数格式（如 `[4,3]` 不会变成 `[4.0,3.0]`）
 - 修改 `task_id` 后远程文件自动重命名为 `{task_id}.json`
 

@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::model::{self, ContextValue, LoginConfig, Pose, RobotPose, TaskGraphData};
+use crate::model::{self, ContextField, ContextValue, LoginConfig, Pose, RobotPose, TaskGraphData};
 use crate::worker::{BusyState, WorkerHandle, WorkerRequest, WorkerResponse};
 
 /// ROS2 环境 source 前缀（不含 ROS_DOMAIN_ID，运行时动态拼接）
@@ -63,13 +63,16 @@ fn format_f64(v: f64, _decimals: std::ops::RangeInclusive<usize>) -> String {
 }
 
 /// 等待中的远程命令类型（用于识别 CommandOutput 响应的来源）
+///
+/// `field_path` 是索引路径：首元素索引顶层 context_fields，
+/// 后续元素依次下钻嵌套分组（见 `model::field_at_path`）。
 enum PendingCommand {
     /// 获取底盘位姿
-    ChassisPose { field_index: usize },
+    ChassisPose { field_path: Vec<usize> },
     /// 获取头部关节角
-    HeadJoints { field_index: usize },
+    HeadJoints { field_path: Vec<usize> },
     /// 获取腰部关节角
-    WaistJoints { field_index: usize },
+    WaistJoints { field_path: Vec<usize> },
 }
 
 /// 应用主状态
@@ -107,8 +110,8 @@ pub struct App {
     // 编辑数据
     task_data: Option<TaskGraphData>,
 
-    // 当前选中的位姿字段索引（索引到 context_fields，仅用于 Pose 类型）
-    selected_field_index: Option<usize>,
+    // 当前选中的位姿字段索引路径（支持嵌套分组下钻，仅用于 Pose 类型）
+    selected_pose_path: Option<Vec<usize>>,
 
     /// 等待中的远程命令（用于解析 CommandOutput 响应）
     pending_command: Option<PendingCommand>,
@@ -136,7 +139,7 @@ impl Default for App {
             file_list: Vec::new(),
             selected_file: None,
             task_data: None,
-            selected_field_index: None,
+            selected_pose_path: None,
             pending_command: None,
             reconnect_status: None,
         }
@@ -195,16 +198,31 @@ impl App {
         model::save_login_config(&config);
     }
 
-    /// 检查选中字段是否为 Pose 类型
+    /// 检查选中字段是否为 Pose 类型（支持嵌套分组路径）
     fn has_pose_selection(&self) -> bool {
-        self.selected_field_index.is_some_and(|idx| {
+        self.selected_pose_path.as_ref().is_some_and(|path| {
             self.task_data.as_ref().is_some_and(|data| {
                 matches!(
-                    data.context_fields.get(idx).map(|f| &f.value),
+                    model::field_at_path(&data.context_fields, path).map(|f| &f.value),
                     Some(ContextValue::Pose(_))
                 )
             })
         })
+    }
+
+    /// 将获取到的远程数据写入选中路径的位姿字段，成功时返回 key 路径（用于状态提示）
+    fn apply_to_pose_at(
+        &mut self,
+        field_path: &[usize],
+        apply: impl FnOnce(&mut RobotPose),
+    ) -> Option<String> {
+        let data = self.task_data.as_mut()?;
+        let field = model::field_at_path_mut(&mut data.context_fields, field_path)?;
+        let ContextValue::Pose(pose) = &mut field.value else {
+            return None;
+        };
+        apply(pose);
+        Some(model::key_path_string(&data.context_fields, field_path))
     }
 
     /// 尝试连接远程主机（异步）
@@ -236,7 +254,7 @@ impl App {
         self.file_list.clear();
         self.selected_file = None;
         self.task_data = None;
-        self.selected_field_index = None;
+        self.selected_pose_path = None;
         self.pending_command = None;
         self.busy = BusyState::Idle;
         self.status_message = "已断开连接".into();
@@ -299,20 +317,28 @@ impl App {
         });
     }
 
-    /// 获取底盘位姿（异步）
-    fn fetch_chassis_pose(&mut self) {
-        let Some(idx) = self.selected_field_index else {
+    /// 校验当前选中位姿并返回其索引路径（无有效选中时写状态提示）
+    fn validated_pose_path(&mut self) -> Option<Vec<usize>> {
+        let Some(path) = self.selected_pose_path.clone() else {
             self.status_message = "请先选中一个位姿点位".into();
-            return;
+            return None;
         };
         if !self.has_pose_selection() {
             self.status_message = "选中的字段不是位姿类型".into();
-            return;
+            return None;
         }
+        Some(path)
+    }
+
+    /// 获取底盘位姿（异步）
+    fn fetch_chassis_pose(&mut self) {
+        let Some(path) = self.validated_pose_path() else {
+            return;
+        };
 
         self.busy = BusyState::Fetching("底盘位姿".into());
         self.status_message = "正在获取底盘位姿...".into();
-        self.pending_command = Some(PendingCommand::ChassisPose { field_index: idx });
+        self.pending_command = Some(PendingCommand::ChassisPose { field_path: path });
 
         let cmd = self.ros_cmd("timeout 15 ros2 topic echo /tracked_pose --once 2>/dev/null");
         self.send_request(WorkerRequest::ExecCommand { command: cmd });
@@ -320,18 +346,13 @@ impl App {
 
     /// 获取头部关节角（异步）
     fn fetch_head_joints(&mut self) {
-        let Some(idx) = self.selected_field_index else {
-            self.status_message = "请先选中一个位姿点位".into();
+        let Some(path) = self.validated_pose_path() else {
             return;
         };
-        if !self.has_pose_selection() {
-            self.status_message = "选中的字段不是位姿类型".into();
-            return;
-        }
 
         self.busy = BusyState::Fetching("头部关节角".into());
         self.status_message = "正在获取头部关节角...".into();
-        self.pending_command = Some(PendingCommand::HeadJoints { field_index: idx });
+        self.pending_command = Some(PendingCommand::HeadJoints { field_path: path });
 
         let cmd = self.ros_cmd("timeout 15 python3 -");
         self.send_request(WorkerRequest::ExecCommandWithStdin {
@@ -342,18 +363,13 @@ impl App {
 
     /// 获取腰部关节角（异步）
     fn fetch_waist_joints(&mut self) {
-        let Some(idx) = self.selected_field_index else {
-            self.status_message = "请先选中一个位姿点位".into();
+        let Some(path) = self.validated_pose_path() else {
             return;
         };
-        if !self.has_pose_selection() {
-            self.status_message = "选中的字段不是位姿类型".into();
-            return;
-        }
 
         self.busy = BusyState::Fetching("腰部关节角".into());
         self.status_message = "正在获取腰部关节角...".into();
-        self.pending_command = Some(PendingCommand::WaistJoints { field_index: idx });
+        self.pending_command = Some(PendingCommand::WaistJoints { field_path: path });
 
         let cmd = self.ros_cmd("timeout 15 python3 -");
         self.send_request(WorkerRequest::ExecCommandWithStdin {
@@ -470,7 +486,7 @@ impl App {
                     Ok(content) => match model::parse_task_graph(&content) {
                         Ok(data) => {
                             self.task_data = Some(data);
-                            self.selected_field_index = None;
+                            self.selected_pose_path = None;
                             self.status_message = format!("已加载: {filename}");
                         }
                         Err(e) => {
@@ -529,7 +545,7 @@ impl App {
                 if self.selected_file.as_deref() == Some(filename.as_str()) {
                     self.selected_file = None;
                     self.task_data = None;
-                    self.selected_field_index = None;
+                    self.selected_pose_path = None;
                 }
                 self.apply_file_list(file_list);
             }
@@ -588,15 +604,19 @@ impl App {
                 self.busy = BusyState::Idle;
                 let pending = self.pending_command.take();
                 match (result, pending) {
-                    (Ok(output), Some(PendingCommand::ChassisPose { field_index })) => {
+                    (Ok(output), Some(PendingCommand::ChassisPose { field_path })) => {
                         match model::parse_tracked_pose(&output) {
-                            Some(chassis_pose) => {
-                                if let Some(data) = &mut self.task_data
-                                    && let Some(field) = data.context_fields.get_mut(field_index)
-                                    && let ContextValue::Pose(ref mut pose) = field.value
-                                {
-                                    pose.chassis_pose = chassis_pose;
-                                    self.status_message = format!("已填入底盘位姿 → {}", field.key);
+                            Some(chassis) => {
+                                match self.apply_to_pose_at(&field_path, |pose| {
+                                    pose.chassis_pose = chassis;
+                                }) {
+                                    Some(key_path) => {
+                                        self.status_message =
+                                            format!("已填入底盘位姿 → {key_path}");
+                                    }
+                                    None => {
+                                        self.status_message = "目标位姿字段已不存在".into();
+                                    }
                                 }
                             }
                             None => {
@@ -604,17 +624,20 @@ impl App {
                             }
                         }
                     }
-                    (Ok(output), Some(PendingCommand::HeadJoints { field_index })) => {
+                    (Ok(output), Some(PendingCommand::HeadJoints { field_path })) => {
                         match model::parse_joint_states(&output) {
                             Some(angles) => {
-                                if let Some(data) = &mut self.task_data
-                                    && let Some(field) = data.context_fields.get_mut(field_index)
-                                    && let ContextValue::Pose(ref mut pose) = field.value
-                                {
+                                match self.apply_to_pose_at(&field_path, |pose| {
                                     pose.head_pose.position.x = angles.head_joint_1;
                                     pose.head_pose.position.y = angles.head_joint_2;
-                                    self.status_message =
-                                        format!("已填入头部关节角 → {}", field.key);
+                                }) {
+                                    Some(key_path) => {
+                                        self.status_message =
+                                            format!("已填入头部关节角 → {key_path}");
+                                    }
+                                    None => {
+                                        self.status_message = "目标位姿字段已不存在".into();
+                                    }
                                 }
                             }
                             None => {
@@ -622,17 +645,20 @@ impl App {
                             }
                         }
                     }
-                    (Ok(output), Some(PendingCommand::WaistJoints { field_index })) => {
+                    (Ok(output), Some(PendingCommand::WaistJoints { field_path })) => {
                         match model::parse_joint_states(&output) {
                             Some(angles) => {
-                                if let Some(data) = &mut self.task_data
-                                    && let Some(field) = data.context_fields.get_mut(field_index)
-                                    && let ContextValue::Pose(ref mut pose) = field.value
-                                {
+                                match self.apply_to_pose_at(&field_path, |pose| {
                                     pose.waist_pose.position.x = angles.body_joint_1;
                                     pose.waist_pose.position.y = angles.body_joint_2;
-                                    self.status_message =
-                                        format!("已填入腰部关节角 → {}", field.key);
+                                }) {
+                                    Some(key_path) => {
+                                        self.status_message =
+                                            format!("已填入腰部关节角 → {key_path}");
+                                    }
+                                    None => {
+                                        self.status_message = "目标位姿字段已不存在".into();
+                                    }
                                 }
                             }
                             None => {
@@ -893,14 +919,38 @@ impl App {
 
         ui.add_space(12.0);
 
+        let mut selected = self.selected_pose_path.clone();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                Self::draw_fields_grouped(ui, &mut data.context_fields, &[], "", &mut selected);
+                ui.add_space(16.0);
+            });
+
+        self.selected_pose_path = selected;
+    }
+
+    /// 递归绘制一组 context 字段（按类型分组），支持嵌套分组下钻
+    ///
+    /// - `path_prefix`: 顶层到当前层的索引路径前缀，用于构造位姿选中路径
+    /// - `id_prefix`: egui 控件 id 前缀，避免不同层级同名 key 的 id 冲突
+    fn draw_fields_grouped(
+        ui: &mut egui::Ui,
+        fields: &mut [ContextField],
+        path_prefix: &[usize],
+        id_prefix: &str,
+        selected: &mut Option<Vec<usize>>,
+    ) {
         // 按类型分类字段索引
         let mut pose_indices = Vec::new();
         let mut scalar_indices = Vec::new();
         let mut array_indices = Vec::new();
         let mut traj_indices = Vec::new();
+        let mut nested_indices = Vec::new();
         let mut other_indices = Vec::new();
 
-        for (i, field) in data.context_fields.iter().enumerate() {
+        for (i, field) in fields.iter().enumerate() {
             match &field.value {
                 ContextValue::Pose(_) => pose_indices.push(i),
                 ContextValue::Bool(_) | ContextValue::Integer(_) | ContextValue::Float(_) => {
@@ -910,354 +960,368 @@ impl App {
                     array_indices.push(i);
                 }
                 ContextValue::JointTrajectory(_) => traj_indices.push(i),
+                ContextValue::NestedGroup(_) => nested_indices.push(i),
                 _ => other_indices.push(i),
             }
         }
 
-        let mut selected = self.selected_field_index;
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+        // ── 位姿点位 ──
+        if !pose_indices.is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("位姿点位 ({})", pose_indices.len())).heading(),
+            )
+            .id_salt(format!("{id_prefix}section_pose"))
+            .default_open(true)
             .show(ui, |ui| {
-                // ── 位姿点位 ──
-                if !pose_indices.is_empty() {
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new(format!("位姿点位 ({})", pose_indices.len())).heading(),
-                    )
-                    .id_salt("section_pose")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for &i in &pose_indices {
-                            let is_selected = selected == Some(i);
-                            let frame = if is_selected {
-                                egui::Frame::new()
-                                    .fill(egui::Color32::from_rgba_premultiplied(30, 30, 30, 25))
-                                    .stroke(egui::Stroke::new(
-                                        1.0_f32,
-                                        egui::Color32::from_rgba_premultiplied(60, 60, 60, 80),
-                                    ))
-                                    .inner_margin(6.0)
-                                    .corner_radius(4.0)
-                            } else {
-                                egui::Frame::new().inner_margin(6.0)
-                            };
+                for &i in &pose_indices {
+                    let full_path: Vec<usize> = path_prefix.iter().copied().chain([i]).collect();
+                    let is_selected = selected.as_deref() == Some(full_path.as_slice());
+                    let frame = if is_selected {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_premultiplied(30, 30, 30, 25))
+                            .stroke(egui::Stroke::new(
+                                1.0_f32,
+                                egui::Color32::from_rgba_premultiplied(60, 60, 60, 80),
+                            ))
+                            .inner_margin(6.0)
+                            .corner_radius(4.0)
+                    } else {
+                        egui::Frame::new().inner_margin(6.0)
+                    };
 
-                            let available_w = ui.available_width();
-                            let key = data.context_fields[i].key.clone();
-                            let frame_resp = frame.show(ui, |ui| {
-                                ui.set_min_width(available_w);
-                                let title = if is_selected {
-                                    egui::RichText::new(&key)
-                                        .strong()
-                                        .size(14.0)
-                                        .color(egui::Color32::from_rgb(255, 180, 50))
-                                } else {
-                                    egui::RichText::new(&key).strong().size(14.0)
-                                };
-                                egui::CollapsingHeader::new(title)
-                                    .id_salt(format!("pose_{key}"))
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        let field = &mut data.context_fields[i];
-                                        if let ContextValue::Pose(ref mut pose) = field.value {
-                                            ui.indent(format!("pose_{key}_indent"), |ui| {
-                                                Self::draw_single_pose(
-                                                    ui,
-                                                    "底盘 (chassis)",
-                                                    &mut pose.chassis_pose,
-                                                );
-                                                Self::draw_single_pose(
-                                                    ui,
-                                                    "头部 (head)",
-                                                    &mut pose.head_pose,
-                                                );
-                                                Self::draw_single_pose(
-                                                    ui,
-                                                    "腰部 (waist)",
-                                                    &mut pose.waist_pose,
-                                                );
-                                            });
-                                        }
+                    let available_w = ui.available_width();
+                    let key = fields[i].key.clone();
+                    let frame_resp = frame.show(ui, |ui| {
+                        ui.set_min_width(available_w);
+                        let title = if is_selected {
+                            egui::RichText::new(&key)
+                                .strong()
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(255, 180, 50))
+                        } else {
+                            egui::RichText::new(&key).strong().size(14.0)
+                        };
+                        egui::CollapsingHeader::new(title)
+                            .id_salt(format!("{id_prefix}pose_{key}"))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let field = &mut fields[i];
+                                if let ContextValue::Pose(ref mut pose) = field.value {
+                                    ui.indent(format!("{id_prefix}pose_{key}_indent"), |ui| {
+                                        Self::draw_single_pose(
+                                            ui,
+                                            "底盘 (chassis)",
+                                            &mut pose.chassis_pose,
+                                        );
+                                        Self::draw_single_pose(
+                                            ui,
+                                            "头部 (head)",
+                                            &mut pose.head_pose,
+                                        );
+                                        Self::draw_single_pose(
+                                            ui,
+                                            "腰部 (waist)",
+                                            &mut pose.waist_pose,
+                                        );
                                     });
+                                }
                             });
+                    });
 
-                            // 检测鼠标点击选中位姿
-                            let rect = frame_resp.response.rect;
-                            if ui.input(|i| i.pointer.any_click())
-                                && ui
-                                    .input(|i| i.pointer.interact_pos())
-                                    .is_some_and(|pos| rect.contains(pos))
-                            {
-                                selected = Some(i);
+                    // 检测鼠标点击选中位姿
+                    let rect = frame_resp.response.rect;
+                    if ui.input(|i| i.pointer.any_click())
+                        && ui
+                            .input(|i| i.pointer.interact_pos())
+                            .is_some_and(|pos| rect.contains(pos))
+                    {
+                        *selected = Some(full_path);
+                    }
+
+                    ui.add_space(2.0);
+                }
+            });
+        }
+
+        // ── 基本参数 ──
+        if !scalar_indices.is_empty() {
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("基本参数 ({})", scalar_indices.len())).heading(),
+            )
+            .id_salt(format!("{id_prefix}section_scalar"))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new(format!("{id_prefix}scalar_params"))
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for &i in &scalar_indices {
+                            let field = &mut fields[i];
+                            ui.label(&field.key);
+                            match &mut field.value {
+                                ContextValue::Bool(b) => {
+                                    ui.checkbox(b, "");
+                                }
+                                ContextValue::Integer(v) => {
+                                    let mut f = *v as f64;
+                                    let drag = egui::DragValue::new(&mut f)
+                                        .speed(1.0)
+                                        .custom_formatter(|v, _| format!("{}", v as i64))
+                                        .custom_parser(|s| s.parse::<i64>().ok().map(|i| i as f64));
+                                    if ui.add(drag).changed() {
+                                        *v = f as i64;
+                                    }
+                                }
+                                ContextValue::Float(f) => {
+                                    ui.add(
+                                        egui::DragValue::new(f)
+                                            .speed(0.01)
+                                            .custom_formatter(format_f64)
+                                            .custom_parser(|s| s.parse::<f64>().ok()),
+                                    );
+                                }
+                                _ => {}
                             }
-
-                            ui.add_space(2.0);
+                            ui.end_row();
                         }
                     });
-                }
+            });
+        }
 
-                // ── 基本参数 ──
-                if !scalar_indices.is_empty() {
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new(format!("基本参数 ({})", scalar_indices.len()))
-                            .heading(),
-                    )
-                    .id_salt("section_scalar")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        egui::Grid::new("scalar_params")
-                            .num_columns(2)
-                            .spacing([8.0, 4.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for &i in &scalar_indices {
-                                    let field = &mut data.context_fields[i];
-                                    ui.label(&field.key);
-                                    match &mut field.value {
-                                        ContextValue::Bool(b) => {
-                                            ui.checkbox(b, "");
-                                        }
-                                        ContextValue::Integer(v) => {
-                                            let mut f = *v as f64;
-                                            let drag = egui::DragValue::new(&mut f)
-                                                .speed(1.0)
-                                                .custom_formatter(|v, _| format!("{}", v as i64))
-                                                .custom_parser(|s| {
-                                                    s.parse::<i64>().ok().map(|i| i as f64)
-                                                });
-                                            if ui.add(drag).changed() {
-                                                *v = f as i64;
-                                            }
-                                        }
-                                        ContextValue::Float(f) => {
+        // ── 数组参数 ──
+        if !array_indices.is_empty() {
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("数组参数 ({})", array_indices.len())).heading(),
+            )
+            .id_salt(format!("{id_prefix}section_array"))
+            .default_open(true)
+            .show(ui, |ui| {
+                for &i in &array_indices {
+                    let field = &mut fields[i];
+                    let key = field.key.clone();
+                    match &mut field.value {
+                        ContextValue::NumericArray(arr) => {
+                            egui::CollapsingHeader::new(format!("{key} [{} 个元素]", arr.len()))
+                                .id_salt(format!("{id_prefix}arr_{key}"))
+                                .show(ui, |ui| {
+                                    for (j, val) in arr.iter_mut().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("[{j}]:"));
                                             ui.add(
-                                                egui::DragValue::new(f)
+                                                egui::DragValue::new(val)
                                                     .speed(0.01)
                                                     .custom_formatter(format_f64)
                                                     .custom_parser(|s| s.parse::<f64>().ok()),
                                             );
-                                        }
-                                        _ => {}
-                                    }
-                                    ui.end_row();
-                                }
-                            });
-                    });
-                }
-
-                // ── 数组参数 ──
-                if !array_indices.is_empty() {
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new(format!("数组参数 ({})", array_indices.len()))
-                            .heading(),
-                    )
-                    .id_salt("section_array")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for &i in &array_indices {
-                            let field = &mut data.context_fields[i];
-                            let key = field.key.clone();
-                            match &mut field.value {
-                                ContextValue::NumericArray(arr) => {
-                                    egui::CollapsingHeader::new(format!(
-                                        "{key} [{} 个元素]",
-                                        arr.len()
-                                    ))
-                                    .id_salt(format!("arr_{key}"))
-                                    .show(ui, |ui| {
-                                        for (j, val) in arr.iter_mut().enumerate() {
-                                            ui.horizontal(|ui| {
-                                                ui.label(format!("[{j}]:"));
-                                                ui.add(
-                                                    egui::DragValue::new(val)
-                                                        .speed(0.01)
-                                                        .custom_formatter(format_f64)
-                                                        .custom_parser(|s| s.parse::<f64>().ok()),
-                                                );
-                                            });
-                                        }
-                                    });
-                                }
-                                ContextValue::NumericArray2D(arr2d) => {
-                                    let rows = arr2d.len();
-                                    let cols = arr2d.first().map(|r| r.len()).unwrap_or(0);
-                                    egui::CollapsingHeader::new(format!("{key} [{rows} x {cols}]"))
-                                        .id_salt(format!("arr2d_{key}"))
-                                        .show(ui, |ui| {
-                                            for (row_idx, row) in arr2d.iter_mut().enumerate() {
-                                                egui::CollapsingHeader::new(format!("[{row_idx}]"))
-                                                    .id_salt(format!("arr2d_{key}_r{row_idx}"))
-                                                    .show(ui, |ui| {
-                                                        for (col_idx, val) in
-                                                            row.iter_mut().enumerate()
-                                                        {
-                                                            ui.horizontal(|ui| {
-                                                                ui.label(format!("[{col_idx}]:"));
-                                                                ui.add(
-                                                                    egui::DragValue::new(val)
-                                                                        .speed(0.01)
-                                                                        .custom_formatter(
-                                                                            format_f64,
-                                                                        )
-                                                                        .custom_parser(|s| {
-                                                                            s.parse::<f64>().ok()
-                                                                        }),
-                                                                );
-                                                            });
-                                                        }
-                                                    });
-                                            }
                                         });
-                                }
-                                _ => {}
-                            }
+                                    }
+                                });
                         }
-                    });
-                }
-
-                // ── 轨迹数据 ──
-                if !traj_indices.is_empty() {
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new(format!("轨迹数据 ({})", traj_indices.len())).heading(),
-                    )
-                    .id_salt("section_traj")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        for &i in &traj_indices {
-                            let field = &mut data.context_fields[i];
-                            let key = field.key.clone();
-                            if let ContextValue::JointTrajectory(ref mut traj) = field.value {
-                                let num_axes = traj.first().map(|p| p.positions.len()).unwrap_or(0);
-                                egui::CollapsingHeader::new(format!(
-                                    "{key} [{} 个点, {} 轴]",
-                                    traj.len(),
-                                    num_axes
-                                ))
-                                .id_salt(format!("traj_{key}"))
+                        ContextValue::NumericArray2D(arr2d) => {
+                            let rows = arr2d.len();
+                            let cols = arr2d.first().map(|r| r.len()).unwrap_or(0);
+                            egui::CollapsingHeader::new(format!("{key} [{rows} x {cols}]"))
+                                .id_salt(format!("{id_prefix}arr2d_{key}"))
                                 .show(ui, |ui| {
-                                    for (j, point) in traj.iter_mut().enumerate() {
-                                        egui::CollapsingHeader::new(format!(
-                                            "[{j}] t = {:.3}s",
-                                            point.time_from_start
-                                        ))
-                                        .id_salt(format!("traj_{key}_p{j}"))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label("时间:");
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut point.time_from_start,
-                                                    )
-                                                    .speed(0.1)
+                                    for (row_idx, row) in arr2d.iter_mut().enumerate() {
+                                        egui::CollapsingHeader::new(format!("[{row_idx}]"))
+                                            .id_salt(format!("{id_prefix}arr2d_{key}_r{row_idx}"))
+                                            .show(ui, |ui| {
+                                                for (col_idx, val) in row.iter_mut().enumerate() {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(format!("[{col_idx}]:"));
+                                                        ui.add(
+                                                            egui::DragValue::new(val)
+                                                                .speed(0.01)
+                                                                .custom_formatter(format_f64)
+                                                                .custom_parser(|s| {
+                                                                    s.parse::<f64>().ok()
+                                                                }),
+                                                        );
+                                                    });
+                                                }
+                                            });
+                                    }
+                                });
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        // ── 轨迹数据 ──
+        if !traj_indices.is_empty() {
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("轨迹数据 ({})", traj_indices.len())).heading(),
+            )
+            .id_salt(format!("{id_prefix}section_traj"))
+            .default_open(false)
+            .show(ui, |ui| {
+                for &i in &traj_indices {
+                    let field = &mut fields[i];
+                    let key = field.key.clone();
+                    if let ContextValue::JointTrajectory(ref mut traj) = field.value {
+                        let num_axes = traj.first().map(|p| p.positions.len()).unwrap_or(0);
+                        egui::CollapsingHeader::new(format!(
+                            "{key} [{} 个点, {} 轴]",
+                            traj.len(),
+                            num_axes
+                        ))
+                        .id_salt(format!("{id_prefix}traj_{key}"))
+                        .show(ui, |ui| {
+                            for (j, point) in traj.iter_mut().enumerate() {
+                                egui::CollapsingHeader::new(format!(
+                                    "[{j}] t = {:.3}s",
+                                    point.time_from_start
+                                ))
+                                .id_salt(format!("{id_prefix}traj_{key}_p{j}"))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("时间:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut point.time_from_start)
+                                                .speed(0.1)
+                                                .custom_formatter(format_f64)
+                                                .custom_parser(|s| s.parse::<f64>().ok()),
+                                        );
+                                    });
+                                    for (k, pos) in point.positions.iter_mut().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("关节 {k}:"));
+                                            ui.add(
+                                                egui::DragValue::new(pos)
+                                                    .speed(0.001)
                                                     .custom_formatter(format_f64)
                                                     .custom_parser(|s| s.parse::<f64>().ok()),
-                                                );
-                                            });
-                                            for (k, pos) in point.positions.iter_mut().enumerate() {
-                                                ui.horizontal(|ui| {
-                                                    ui.label(format!("关节 {k}:"));
-                                                    ui.add(
-                                                        egui::DragValue::new(pos)
-                                                            .speed(0.001)
-                                                            .custom_formatter(format_f64)
-                                                            .custom_parser(|s| {
-                                                                s.parse::<f64>().ok()
-                                                            }),
-                                                    );
-                                                });
-                                            }
+                                            );
                                         });
                                     }
                                 });
                             }
-                        }
-                    });
+                        });
+                    }
                 }
-
-                // ── 其他 ──
-                if !other_indices.is_empty() {
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new(
-                        egui::RichText::new(format!("其他 ({})", other_indices.len())).heading(),
-                    )
-                    .id_salt("section_other")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for &i in &other_indices {
-                            let field = &mut data.context_fields[i];
-                            let key = field.key.clone();
-                            match &mut field.value {
-                                ContextValue::Null => {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{key}:"));
-                                        ui.colored_label(egui::Color32::GRAY, "null");
-                                        // 对包含 "pose" 的 null 字段提供创建位姿按钮
-                                        if key.contains("pose")
-                                            && ui.small_button("创建位姿").clicked()
-                                        {
-                                            data.context_fields[i].value =
-                                                ContextValue::Pose(RobotPose::default());
-                                        }
-                                    });
-                                }
-                                ContextValue::Text(s) => {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{key}:"));
-                                        ui.text_edit_singleline(s);
-                                    });
-                                }
-                                ContextValue::PoseArray(poses) => {
-                                    egui::CollapsingHeader::new(format!(
-                                        "{key} [{} 个位姿]",
-                                        poses.len()
-                                    ))
-                                    .id_salt(format!("posearr_{key}"))
-                                    .show(ui, |ui| {
-                                        if poses.is_empty() {
-                                            ui.colored_label(egui::Color32::GRAY, "(空)");
-                                        }
-                                        for (j, pose) in poses.iter_mut().enumerate() {
-                                            egui::CollapsingHeader::new(format!("[{j}]"))
-                                                .id_salt(format!("posearr_{key}_p{j}"))
-                                                .show(ui, |ui| {
-                                                    Self::draw_single_pose(
-                                                        ui,
-                                                        &format!("[{j}] 底盘"),
-                                                        &mut pose.chassis_pose,
-                                                    );
-                                                    Self::draw_single_pose(
-                                                        ui,
-                                                        &format!("[{j}] 头部"),
-                                                        &mut pose.head_pose,
-                                                    );
-                                                    Self::draw_single_pose(
-                                                        ui,
-                                                        &format!("[{j}] 腰部"),
-                                                        &mut pose.waist_pose,
-                                                    );
-                                                });
-                                        }
-                                    });
-                                }
-                                ContextValue::RawJson(v) => {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{key}:"));
-                                        ui.colored_label(egui::Color32::GRAY, v.to_string());
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
-                    });
-                }
-
-                ui.add_space(16.0);
             });
+        }
 
-        self.selected_field_index = selected;
+        // ── 嵌套分组 ──
+        if !nested_indices.is_empty() {
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("嵌套分组 ({})", nested_indices.len())).heading(),
+            )
+            .id_salt(format!("{id_prefix}section_nested"))
+            .default_open(true)
+            .show(ui, |ui| {
+                for &i in &nested_indices {
+                    let key = fields[i].key.clone();
+                    let mut child_path = path_prefix.to_vec();
+                    child_path.push(i);
+                    let child_id_prefix = format!("{id_prefix}{key}/");
+                    if let ContextValue::NestedGroup(ref mut children) = fields[i].value {
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new(format!("{key} ({} 项)", children.len()))
+                                .strong()
+                                .size(14.0),
+                        )
+                        .id_salt(format!("{id_prefix}nested_{key}"))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if children.is_empty() {
+                                ui.colored_label(egui::Color32::GRAY, "(空)");
+                            } else {
+                                ui.indent(format!("{id_prefix}nested_{key}_indent"), |ui| {
+                                    Self::draw_fields_grouped(
+                                        ui,
+                                        children,
+                                        &child_path,
+                                        &child_id_prefix,
+                                        selected,
+                                    );
+                                });
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
+        // ── 其他 ──
+        if !other_indices.is_empty() {
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("其他 ({})", other_indices.len())).heading(),
+            )
+            .id_salt(format!("{id_prefix}section_other"))
+            .default_open(true)
+            .show(ui, |ui| {
+                for &i in &other_indices {
+                    let field = &mut fields[i];
+                    let key = field.key.clone();
+                    match &mut field.value {
+                        ContextValue::Null => {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{key}:"));
+                                ui.colored_label(egui::Color32::GRAY, "null");
+                                // 对包含 "pose" 的 null 字段提供创建位姿按钮
+                                if key.contains("pose") && ui.small_button("创建位姿").clicked()
+                                {
+                                    fields[i].value = ContextValue::Pose(RobotPose::default());
+                                }
+                            });
+                        }
+                        ContextValue::Text(s) => {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{key}:"));
+                                ui.text_edit_singleline(s);
+                            });
+                        }
+                        ContextValue::PoseArray(poses) => {
+                            egui::CollapsingHeader::new(format!("{key} [{} 个位姿]", poses.len()))
+                                .id_salt(format!("{id_prefix}posearr_{key}"))
+                                .show(ui, |ui| {
+                                    if poses.is_empty() {
+                                        ui.colored_label(egui::Color32::GRAY, "(空)");
+                                    }
+                                    for (j, pose) in poses.iter_mut().enumerate() {
+                                        egui::CollapsingHeader::new(format!("[{j}]"))
+                                            .id_salt(format!("{id_prefix}posearr_{key}_p{j}"))
+                                            .show(ui, |ui| {
+                                                Self::draw_single_pose(
+                                                    ui,
+                                                    &format!("[{j}] 底盘"),
+                                                    &mut pose.chassis_pose,
+                                                );
+                                                Self::draw_single_pose(
+                                                    ui,
+                                                    &format!("[{j}] 头部"),
+                                                    &mut pose.head_pose,
+                                                );
+                                                Self::draw_single_pose(
+                                                    ui,
+                                                    &format!("[{j}] 腰部"),
+                                                    &mut pose.waist_pose,
+                                                );
+                                            });
+                                    }
+                                });
+                        }
+                        ContextValue::RawJson(v) => {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{key}:"));
+                                ui.colored_label(egui::Color32::GRAY, v.to_string());
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
     }
 
     /// 绘制单个 f64 编辑行: `label: [drag_value]`
