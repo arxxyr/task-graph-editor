@@ -85,6 +85,8 @@ pub enum ContextValue {
     JointTrajectory(Vec<TrajectoryPoint>),
     /// 位姿数组（原生 JSON 数组，可以为空）
     PoseArray(Vec<RobotPose>),
+    /// 嵌套分组（原生 JSON 对象，成员递归分类，如 station_profiles.station_1.*）
+    NestedGroup(Vec<ContextField>),
     /// 普通字符串（无法解析为位姿或数组的字符串值）
     Text(String),
     /// JSON null
@@ -172,6 +174,23 @@ fn classify_array_value(
     ContextValue::RawJson(value.clone())
 }
 
+/// 分类对象类型的 context 值：递归分类每个成员，形成嵌套分组
+///
+/// 适配 station_profiles 之类的嵌套模式：
+/// `{"station_1": {"_box_slot_1_pose": "{...}", "enabled": true, ...}, ...}`
+fn classify_object_value(map: &serde_json::Map<String, serde_json::Value>) -> ContextValue {
+    // BTreeMap 保证按 key 排序，与顶层 context 行为一致
+    let sorted: BTreeMap<_, _> = map.iter().collect();
+    let fields = sorted
+        .into_iter()
+        .map(|(key, value)| ContextField {
+            key: key.clone(),
+            value: classify_context_value(key, value),
+        })
+        .collect();
+    ContextValue::NestedGroup(fields)
+}
+
 /// 识别 context 中一个值的类型
 fn classify_context_value(key: &str, value: &serde_json::Value) -> ContextValue {
     match value {
@@ -188,7 +207,7 @@ fn classify_context_value(key: &str, value: &serde_json::Value) -> ContextValue 
         }
         serde_json::Value::String(s) => classify_string_value(s),
         serde_json::Value::Array(arr) => classify_array_value(key, value, arr),
-        _ => ContextValue::RawJson(value.clone()),
+        serde_json::Value::Object(map) => classify_object_value(map),
     }
 }
 
@@ -270,6 +289,13 @@ fn serialize_context_value(value: &ContextValue) -> Result<serde_json::Value, se
         }
         ContextValue::JointTrajectory(traj) => serde_json::to_value(traj)?,
         ContextValue::PoseArray(poses) => serde_json::to_value(poses)?,
+        ContextValue::NestedGroup(fields) => {
+            let mut map = serde_json::Map::with_capacity(fields.len());
+            for field in fields {
+                map.insert(field.key.clone(), serialize_context_value(&field.value)?);
+            }
+            serde_json::Value::Object(map)
+        }
         ContextValue::Text(s) => serde_json::Value::String(s.clone()),
         ContextValue::Null => serde_json::Value::Null,
         ContextValue::RawJson(v) => v.clone(),
@@ -299,6 +325,57 @@ pub fn serialize_task_graph(data: &TaskGraphData) -> Result<String, serde_json::
     }
 
     serde_json::to_string_pretty(&json)
+}
+
+// ============================================================
+// 索引路径查找（支持嵌套分组下钻）
+// ============================================================
+
+/// 沿索引路径查找字段（不可变）
+///
+/// 路径首元素索引顶层 `context_fields`，后续元素依次下钻嵌套分组。
+/// 路径为空、索引越界、或中间节点不是嵌套分组时返回 `None`。
+pub fn field_at_path<'a>(fields: &'a [ContextField], path: &[usize]) -> Option<&'a ContextField> {
+    let (&first, rest) = path.split_first()?;
+    let field = fields.get(first)?;
+    if rest.is_empty() {
+        return Some(field);
+    }
+    match &field.value {
+        ContextValue::NestedGroup(children) => field_at_path(children, rest),
+        _ => None,
+    }
+}
+
+/// 沿索引路径查找字段（可变）
+pub fn field_at_path_mut<'a>(
+    fields: &'a mut [ContextField],
+    path: &[usize],
+) -> Option<&'a mut ContextField> {
+    let (&first, rest) = path.split_first()?;
+    let field = fields.get_mut(first)?;
+    if rest.is_empty() {
+        return Some(field);
+    }
+    match &mut field.value {
+        ContextValue::NestedGroup(children) => field_at_path_mut(children, rest),
+        _ => None,
+    }
+}
+
+/// 将索引路径转换为 key 路径字符串（如 `station_profiles.station_2._box_slot_1_pose`）
+pub fn key_path_string(fields: &[ContextField], path: &[usize]) -> String {
+    let mut parts = Vec::with_capacity(path.len());
+    let mut current = fields;
+    for &idx in path {
+        let Some(field) = current.get(idx) else { break };
+        parts.push(field.key.as_str());
+        current = match &field.value {
+            ContextValue::NestedGroup(children) => children,
+            _ => &[],
+        };
+    }
+    parts.join(".")
 }
 
 // ============================================================
@@ -514,7 +591,22 @@ mod tests {
                 "jt1_traj": [
                     {"positions": [1.0, 2.0, 3.0], "time_from_start": 0.5},
                     {"positions": [4.0, 5.0, 6.0], "time_from_start": 1.0}
-                ]
+                ],
+                "active_profile": {},
+                "station_profiles": {
+                    "station_1": {
+                        "slot_pose": "{\"chassis_pose\":{\"position\":{\"x\":-3.8,\"y\":0.34,\"z\":0.0},\"orientation\":{\"w\":1.0,\"x\":0.0,\"y\":0.0,\"z\":0.0}},\"head_pose\":{\"position\":{\"x\":0.0,\"y\":-0.12,\"z\":0.0},\"orientation\":{\"w\":1.0,\"x\":0.0,\"y\":0.0,\"z\":0.0}},\"waist_pose\":{\"position\":{\"x\":0.68,\"y\":0.3,\"z\":0.0},\"orientation\":{\"w\":1.0,\"x\":0.0,\"y\":0.0,\"z\":0.0}}}",
+                        "enabled": true,
+                        "capacity": 16,
+                        "pick_height": 0.5,
+                        "put_heights": "[ 0.04, 0.21, 0.40]",
+                        "warning": "示教点位提醒"
+                    },
+                    "station_2": {
+                        "enabled": false,
+                        "capacity": 8
+                    }
+                }
             },
             "nodes": [],
             "edges": []
@@ -534,9 +626,9 @@ mod tests {
     #[test]
     fn test_parse_extracts_all_context_fields() {
         let data = parse_task_graph(TEST_JSON).unwrap();
-        // angles_2d, heights, jt1_traj, null_val, pick_poses,
-        // point_a, some_bool, some_float, some_number, some_string
-        assert_eq!(data.context_fields.len(), 10);
+        // active_profile, angles_2d, heights, jt1_traj, null_val, pick_poses,
+        // point_a, some_bool, some_float, some_number, some_string, station_profiles
+        assert_eq!(data.context_fields.len(), 12);
     }
 
     #[test]
@@ -682,6 +774,153 @@ mod tests {
         }
     }
 
+    /// 从字段列表中按 key 查找嵌套分组的成员列表
+    fn nested_fields<'a>(fields: &'a [ContextField], key: &str) -> &'a [ContextField] {
+        let field = fields.iter().find(|f| f.key == key).unwrap();
+        match &field.value {
+            ContextValue::NestedGroup(children) => children,
+            other => panic!("Expected NestedGroup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_empty_nested_group() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        assert!(nested_fields(&data.context_fields, "active_profile").is_empty());
+    }
+
+    #[test]
+    fn test_parse_nested_group_classifies_members() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let stations = nested_fields(&data.context_fields, "station_profiles");
+        assert_eq!(stations.len(), 2);
+
+        // station_1 内部字段递归分类：位姿、布尔、整数、浮点、字符串化数组、文本
+        let station_1 = nested_fields(stations, "station_1");
+        assert_eq!(station_1.len(), 6);
+
+        let slot_pose = station_1.iter().find(|f| f.key == "slot_pose").unwrap();
+        match &slot_pose.value {
+            ContextValue::Pose(pose) => {
+                assert!((pose.chassis_pose.position.x - (-3.8)).abs() < f64::EPSILON);
+                assert!((pose.waist_pose.position.x - 0.68).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected Pose, got {other:?}"),
+        }
+
+        let enabled = station_1.iter().find(|f| f.key == "enabled").unwrap();
+        assert!(matches!(enabled.value, ContextValue::Bool(true)));
+
+        let capacity = station_1.iter().find(|f| f.key == "capacity").unwrap();
+        assert!(matches!(capacity.value, ContextValue::Integer(16)));
+
+        let heights = station_1.iter().find(|f| f.key == "put_heights").unwrap();
+        match &heights.value {
+            ContextValue::NumericArray(arr) => assert_eq!(arr.len(), 3),
+            other => panic!("Expected NumericArray, got {other:?}"),
+        }
+
+        let warning = station_1.iter().find(|f| f.key == "warning").unwrap();
+        match &warning.value {
+            ContextValue::Text(s) => assert_eq!(s, "示教点位提醒"),
+            other => panic!("Expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_roundtrip_preserves_edit() {
+        let mut data = parse_task_graph(TEST_JSON).unwrap();
+
+        // 定位 station_profiles → station_1 → slot_pose 并修改底盘 x
+        let sp_idx = data
+            .context_fields
+            .iter()
+            .position(|f| f.key == "station_profiles")
+            .unwrap();
+        let path = {
+            let stations = nested_fields(&data.context_fields, "station_profiles");
+            let st_idx = stations.iter().position(|f| f.key == "station_1").unwrap();
+            let station_1 = nested_fields(stations, "station_1");
+            let pose_idx = station_1.iter().position(|f| f.key == "slot_pose").unwrap();
+            vec![sp_idx, st_idx, pose_idx]
+        };
+
+        let field = field_at_path_mut(&mut data.context_fields, &path).unwrap();
+        match &mut field.value {
+            ContextValue::Pose(pose) => pose.chassis_pose.position.x = 77.5,
+            other => panic!("Expected Pose, got {other:?}"),
+        }
+
+        let output = serialize_task_graph(&data).unwrap();
+        let reparsed = parse_task_graph(&output).unwrap();
+
+        // 修改后的位姿保留；整数容量保持整数格式；布尔保持
+        let stations = nested_fields(&reparsed.context_fields, "station_profiles");
+        let station_1 = nested_fields(stations, "station_1");
+        let slot_pose = station_1.iter().find(|f| f.key == "slot_pose").unwrap();
+        match &slot_pose.value {
+            ContextValue::Pose(pose) => {
+                assert!((pose.chassis_pose.position.x - 77.5).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected Pose, got {other:?}"),
+        }
+        let capacity = station_1.iter().find(|f| f.key == "capacity").unwrap();
+        assert!(matches!(capacity.value, ContextValue::Integer(16)));
+
+        // 嵌套整数在 JSON 文本中保持整数字面量
+        assert!(output.contains("\"capacity\": 16"));
+
+        // 空分组序列化后仍是空对象
+        assert!(nested_fields(&reparsed.context_fields, "active_profile").is_empty());
+    }
+
+    #[test]
+    fn test_field_at_path_lookup() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let sp_idx = data
+            .context_fields
+            .iter()
+            .position(|f| f.key == "station_profiles")
+            .unwrap();
+
+        // 顶层单元素路径
+        let field = field_at_path(&data.context_fields, &[sp_idx]).unwrap();
+        assert_eq!(field.key, "station_profiles");
+
+        // 两级下钻（嵌套分组按 key 排序，station_1 在前）
+        let field = field_at_path(&data.context_fields, &[sp_idx, 0]).unwrap();
+        assert_eq!(field.key, "station_1");
+
+        // 空路径 / 越界 / 中间节点非嵌套分组均返回 None
+        assert!(field_at_path(&data.context_fields, &[]).is_none());
+        assert!(field_at_path(&data.context_fields, &[999]).is_none());
+        assert!(field_at_path(&data.context_fields, &[sp_idx, 0, 999]).is_none());
+        let point_a_idx = data
+            .context_fields
+            .iter()
+            .position(|f| f.key == "point_a")
+            .unwrap();
+        assert!(field_at_path(&data.context_fields, &[point_a_idx, 0]).is_none());
+    }
+
+    #[test]
+    fn test_key_path_string() {
+        let data = parse_task_graph(TEST_JSON).unwrap();
+        let sp_idx = data
+            .context_fields
+            .iter()
+            .position(|f| f.key == "station_profiles")
+            .unwrap();
+        assert_eq!(
+            key_path_string(&data.context_fields, &[sp_idx]),
+            "station_profiles"
+        );
+        assert_eq!(
+            key_path_string(&data.context_fields, &[sp_idx, 0]),
+            "station_profiles.station_1"
+        );
+    }
+
     #[test]
     fn test_roundtrip_preserves_data() {
         let mut data = parse_task_graph(TEST_JSON).unwrap();
@@ -810,6 +1049,90 @@ pose:
         assert!(parse_joint_states("head_joint_1=1.0 head_joint_2=2.0 body_joint_1=3.0").is_none());
         assert!(parse_joint_states("").is_none());
         assert!(parse_joint_states("random text").is_none());
+    }
+
+    /// 语义标准化：字符串化 JSON（对象/数组）解析为原生结构后递归处理，
+    /// 用于对比 roundtrip 前后 context 是否语义等价
+    fn normalize_json(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::String(s) => {
+                if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s)
+                    && (inner.is_object() || inner.is_array())
+                {
+                    return normalize_json(&inner);
+                }
+                v.clone()
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(normalize_json).collect())
+            }
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, val)| (k.clone(), normalize_json(val)))
+                    .collect(),
+            ),
+            _ => v.clone(),
+        }
+    }
+
+    /// 递归定位两个 JSON 值第一处差异的路径（用于失败时输出可读诊断）
+    fn find_first_diff(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> Option<String> {
+        match (a, b) {
+            (serde_json::Value::Object(ma), serde_json::Value::Object(mb)) => {
+                for (k, va) in ma {
+                    match mb.get(k) {
+                        Some(vb) => {
+                            if let Some(diff) = find_first_diff(va, vb, &format!("{path}.{k}")) {
+                                return Some(diff);
+                            }
+                        }
+                        None => return Some(format!("{path}.{k}: 仅左侧存在")),
+                    }
+                }
+                for k in mb.keys() {
+                    if !ma.contains_key(k) {
+                        return Some(format!("{path}.{k}: 仅右侧存在"));
+                    }
+                }
+                None
+            }
+            (serde_json::Value::Array(aa), serde_json::Value::Array(ab)) => {
+                if aa.len() != ab.len() {
+                    return Some(format!("{path}: 数组长度 {} != {}", aa.len(), ab.len()));
+                }
+                for (i, (va, vb)) in aa.iter().zip(ab).enumerate() {
+                    if let Some(diff) = find_first_diff(va, vb, &format!("{path}[{i}]")) {
+                        return Some(diff);
+                    }
+                }
+                None
+            }
+            _ => (a != b).then(|| format!("{path}: {a} != {b}")),
+        }
+    }
+
+    /// 真实任务图文件 roundtrip 验证（本地手动执行，CI 跳过）：
+    /// `TASK_GRAPH_REAL_FILE=/path/to/file.json cargo test -- --ignored`
+    #[test]
+    #[ignore = "依赖本地真实文件，通过 TASK_GRAPH_REAL_FILE 环境变量指定路径"]
+    fn test_real_file_roundtrip() {
+        let path =
+            std::env::var("TASK_GRAPH_REAL_FILE").expect("请设置 TASK_GRAPH_REAL_FILE 环境变量");
+        let content = std::fs::read_to_string(&path).expect("读取真实文件失败");
+
+        let data = parse_task_graph(&content).expect("解析真实文件失败");
+        let output = serialize_task_graph(&data).expect("序列化失败");
+        let reparsed = parse_task_graph(&output).expect("重新解析失败");
+        assert_eq!(data.context_fields.len(), reparsed.context_fields.len());
+
+        // 语义等价对比：原始 context vs 输出 context（字符串化 JSON 展开后逐项对比）
+        let original: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let rewritten: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let orig_ctx = normalize_json(&original["config"]["context"]);
+        let new_ctx = normalize_json(&rewritten["config"]["context"]);
+        if let Some(diff) = find_first_diff(&orig_ctx, &new_ctx, "context") {
+            panic!("roundtrip 后 context 语义不等价，首个差异: {diff}");
+        }
     }
 
     #[test]

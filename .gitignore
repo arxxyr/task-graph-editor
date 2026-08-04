@@ -1,2 +1,10 @@
 /target
 /dist
+bin
+.DS_Store
+.idea
+*.iml
+*.log
+*.tmp
+*.bak
+*.swp
