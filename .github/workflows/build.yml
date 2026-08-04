@@ -197,18 +197,14 @@ jobs:
             exit 1
           fi
 
-      # UPX 压缩（Linux/Windows，macOS 不支持）
+      # UPX 压缩（仅 Linux；macOS 不支持，Windows 跳过——
+      # UPX 加壳的无签名 exe 会触发 Defender/SmartScreen 木马误报）
       - name: Install UPX (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
 
-      - name: Install UPX (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: choco install upx -y
-
       - name: Compress binary with UPX
-        if: runner.os != 'macOS'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           EXE="target/${{ matrix.target }}/release/task-graph-editor${{ matrix.exe_suffix }}"

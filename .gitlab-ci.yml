@@ -209,7 +209,7 @@ build:windows-x64:
     - windows
     - x64
   before_script:
-    - choco install nasm upx -y
+    - choco install nasm -y
     - rustup default nightly
     - rustup target add x86_64-pc-windows-msvc
   script:
@@ -224,14 +224,7 @@ build:windows-x64:
       }
     - Write-Host "版本号: ${FullVersion}"
     - cargo build --release --target x86_64-pc-windows-msvc
-    # UPX 压缩
-    - |
-      $Exe = "target\x86_64-pc-windows-msvc\release\task-graph-editor.exe"
-      Write-Host "=== 压缩前 ==="
-      Get-Item $Exe | Select-Object Length
-      upx --best --lzma $Exe
-      Write-Host "=== 压缩后 ==="
-      Get-Item $Exe | Select-Object Length
+    # 不做 UPX 压缩：UPX 加壳的无签名 exe 会触发 Defender/SmartScreen 木马误报
     # 打包
     - $PackageName = "task-graph-editor-${FullVersion}-windows-x64"
     - New-Item -ItemType Directory -Force -Path package
