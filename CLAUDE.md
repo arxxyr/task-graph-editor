@@ -113,6 +113,6 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
 
 - 工具链：Rust nightly
 - 缓存：Swatinem/rust-cache@v2
-- UPX 压缩：Linux/Windows `--best --lzma`，macOS 跳过
+- UPX 压缩：仅 Linux `--best --lzma`；macOS 不支持；Windows 跳过（UPX 加壳的无签名 exe 会触发 Defender/SmartScreen 木马误报）
 - 产物命名：`task-graph-editor-{版本}-{平台}.{扩展名}`
 - 推送 `v*` 标签自动创建 Release（含 prerelease 检测）
