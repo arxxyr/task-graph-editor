@@ -6,6 +6,7 @@
 mod app;
 mod model;
 mod ssh;
+mod ssh_config;
 mod worker;
 
 #[global_allocator]

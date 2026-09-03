@@ -3,7 +3,18 @@
 use eframe::egui;
 
 use crate::model::{self, ContextField, ContextValue, LoginConfig, Pose, RobotPose, TaskGraphData};
+use crate::ssh::AuthMethod;
+use crate::ssh_config::{self, SshHostEntry};
 use crate::worker::{BusyState, WorkerHandle, WorkerRequest, WorkerResponse};
+
+/// 主机下拉按钮宽度
+const HOST_MENU_BUTTON_WIDTH: f32 = 22.0;
+
+/// 主机下拉菜单最小宽度
+const HOST_MENU_MIN_WIDTH: f32 = 280.0;
+
+/// 主机下拉菜单最大高度（超出部分滚动）
+const HOST_MENU_MAX_HEIGHT: f32 = 360.0;
 
 /// ROS2 环境 source 前缀（不含 ROS_DOMAIN_ID，运行时动态拼接）
 const ROS_ENV_PREFIX: &str =
@@ -62,6 +73,88 @@ fn format_f64(v: f64, _decimals: std::ops::RangeInclusive<usize>) -> String {
     if s.contains('.') { s } else { format!("{v}.0") }
 }
 
+/// 状态栏文字颜色：失败/错误红色，注意/警告橙色，其余绿色
+fn status_color(message: &str) -> egui::Color32 {
+    let has_any = |keywords: &[&str]| keywords.iter().any(|keyword| message.contains(keyword));
+    match (has_any(&["失败", "错误"]), has_any(&["注意", "警告"])) {
+        (true, _) => egui::Color32::from_rgb(255, 100, 100),
+        (false, true) => egui::Color32::from_rgb(255, 200, 100),
+        (false, false) => egui::Color32::from_rgb(100, 255, 100),
+    }
+}
+
+/// `user@host:port` 形式的目标描述（无 User 时省略 `user@`）
+fn host_entry_target(entry: &SshHostEntry) -> String {
+    match &entry.user {
+        Some(user) => format!("{user}@{}:{}", entry.host_name, entry.port),
+        None => format!("{}:{}", entry.host_name, entry.port),
+    }
+}
+
+/// 主机下拉菜单条目：别名 + 弱化显示的目标；配置了跳板/代理命令的条目附警示标记
+fn host_entry_label(ui: &egui::Ui, entry: &SshHostEntry) -> egui::text::LayoutJob {
+    let font_id = egui::TextStyle::Button.resolve(ui.style());
+    let visuals = ui.visuals();
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &entry.alias,
+        0.0,
+        egui::TextFormat {
+            font_id: font_id.clone(),
+            color: visuals.text_color(),
+            ..Default::default()
+        },
+    );
+    job.append(
+        &host_entry_target(entry),
+        12.0,
+        egui::TextFormat {
+            font_id: font_id.clone(),
+            color: visuals.weak_text_color(),
+            ..Default::default()
+        },
+    );
+    if entry.proxy_jump.is_some() || entry.proxy_command.is_some() {
+        job.append(
+            "跳板",
+            8.0,
+            egui::TextFormat {
+                font_id,
+                color: visuals.warn_fg_color,
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+/// 主机下拉菜单条目的悬停提示：列出全部生效配置
+fn host_entry_tooltip(entry: &SshHostEntry) -> String {
+    let mut lines = vec![
+        format!("HostName: {}", entry.host_name),
+        format!("Port: {}", entry.port),
+        format!(
+            "User: {}",
+            entry.user.as_deref().unwrap_or("(未设置，使用本地用户名)")
+        ),
+    ];
+    lines.extend(
+        entry
+            .identity_files
+            .iter()
+            .map(|path| format!("IdentityFile: {}", path.display())),
+    );
+    if let Some(jump) = &entry.proxy_jump {
+        lines.push(format!("ProxyJump: {jump}（本工具不支持跳板，将直连）"));
+    }
+    if let Some(command) = &entry.proxy_command {
+        lines.push(format!(
+            "ProxyCommand: {command}（本工具不支持代理命令，将直连）"
+        ));
+    }
+    lines.join("\n")
+}
+
 /// 等待中的远程命令类型（用于识别 CommandOutput 响应的来源）
 ///
 /// `field_path` 是索引路径：首元素索引顶层 context_fields，
@@ -82,6 +175,8 @@ pub struct App {
     port: String,
     username: String,
     password: String,
+    /// 私钥文件路径（密码为空时使用；空 = ssh-agent / 默认私钥）
+    identity_file: String,
 
     /// ROS_DOMAIN_ID（不同机器人可能不同）
     ros_domain_id: String,
@@ -118,6 +213,9 @@ pub struct App {
 
     /// 自动重连状态描述（非 None 表示正在自动重连中）
     reconnect_status: Option<String>,
+
+    /// `~/.ssh/config` 中解析出的主机列表（启动时读取，每次打开下拉菜单时刷新）
+    ssh_hosts: Vec<SshHostEntry>,
 }
 
 impl Default for App {
@@ -129,6 +227,7 @@ impl Default for App {
             port: config.port,
             username: config.username,
             password: config.password,
+            identity_file: config.identity_file,
             ros_domain_id: config.ros_domain_id,
             remote_dir: config.remote_dir,
             ui_scale: 1.0,
@@ -142,6 +241,7 @@ impl Default for App {
             selected_pose_path: None,
             pending_command: None,
             reconnect_status: None,
+            ssh_hosts: ssh_config::load_user_hosts(),
         }
     }
 }
@@ -192,10 +292,115 @@ impl App {
             port: self.port.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
+            identity_file: self.identity_file.clone(),
             ros_domain_id: self.ros_domain_id.clone(),
             remote_dir: self.remote_dir.clone(),
         };
         model::save_login_config(&config);
+    }
+
+    /// 将 ssh config 中的主机条目填入连接表单（密码保持不动，由用户自行决定）
+    fn apply_ssh_host(&mut self, index: usize) {
+        let Some(entry) = self.ssh_hosts.get(index).cloned() else {
+            return;
+        };
+        self.host = entry.host_name.clone();
+        self.port = entry.port.to_string();
+        // 无 User 时按 OpenSSH 语义回落到本地用户名
+        if let Some(user) = entry.user.clone().or_else(ssh_config::local_user_name) {
+            self.username = user;
+        }
+        // 优先取磁盘上真实存在的私钥；都不存在则填第一个，让后续连接错误一目了然
+        self.identity_file = entry
+            .identity_files
+            .iter()
+            .find(|path| path.is_file())
+            .or_else(|| entry.identity_files.first())
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+
+        let proxy_note = match (&entry.proxy_jump, &entry.proxy_command) {
+            (Some(jump), _) => {
+                format!("；注意：该主机配置了 ProxyJump {jump}，本工具不支持跳板，将直连")
+            }
+            (None, Some(command)) => format!(
+                "；注意：该主机配置了 ProxyCommand（{command}），本工具不支持代理命令，将直连"
+            ),
+            (None, None) => String::new(),
+        };
+        self.status_message = format!(
+            "已载入 ssh config 主机 {}：{}@{}:{}{proxy_note}",
+            entry.alias, self.username, self.host, self.port
+        );
+    }
+
+    /// 主机输入框 + 下拉菜单：可手动输入，也可从 `~/.ssh/config` 的 Host 条目中选择
+    fn host_field(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let text_width =
+                ui.spacing().text_edit_width - HOST_MENU_BUTTON_WIDTH - ui.spacing().item_spacing.x;
+            ui.add(
+                egui::TextEdit::singleline(&mut self.host)
+                    .desired_width(text_width)
+                    .hint_text("IP / 主机名"),
+            );
+
+            let button = ui
+                .add_sized(
+                    [HOST_MENU_BUTTON_WIDTH, ui.spacing().interact_size.y],
+                    egui::Button::new("▼"),
+                )
+                .on_hover_text("从 ~/.ssh/config 选择主机");
+            if button.clicked() {
+                // 每次打开菜单都重新读取，编辑过 ssh config 后无需重启
+                self.ssh_hosts = ssh_config::load_user_hosts();
+            }
+
+            let mut chosen: Option<usize> = None;
+            // 只在点击菜单外部时关闭：拖动滚动条、点空白处都不会误关；选中条目后手动关闭
+            egui::Popup::menu(&button)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    ui.set_min_width(HOST_MENU_MIN_WIDTH);
+                    if self.ssh_hosts.is_empty() {
+                        ui.weak("~/.ssh/config 中没有可用的 Host 条目");
+                        return;
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(HOST_MENU_MAX_HEIGHT)
+                        .show(ui, |ui| {
+                            for (index, entry) in self.ssh_hosts.iter().enumerate() {
+                                let label = host_entry_label(ui, entry);
+                                if ui
+                                    .button(label)
+                                    .on_hover_text(host_entry_tooltip(entry))
+                                    .clicked()
+                                {
+                                    chosen = Some(index);
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+
+            if let Some(index) = chosen {
+                self.apply_ssh_host(index);
+            }
+        });
+    }
+
+    /// 根据表单决定认证方式：密码非空 → 密码认证；否则公钥认证（ssh-agent → 私钥文件）
+    fn auth_method(&self) -> AuthMethod {
+        if !self.password.is_empty() {
+            return AuthMethod::Password(self.password.clone());
+        }
+        let identity_file = self.identity_file.trim();
+        let identity_files = if identity_file.is_empty() {
+            ssh_config::default_identity_files()
+        } else {
+            vec![ssh_config::expand_user_path(identity_file)]
+        };
+        AuthMethod::PublicKey { identity_files }
     }
 
     /// 检查选中字段是否为 Pose 类型（支持嵌套分组路径）
@@ -235,7 +440,7 @@ impl App {
             host: self.host.clone(),
             port,
             username: self.username.clone(),
-            password: self.password.clone(),
+            auth: self.auth_method(),
             remote_dir: self.remote_dir.clone(),
         });
         self.worker = Some(worker);
@@ -704,7 +909,7 @@ impl App {
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
                     ui.label("主机:");
-                    ui.text_edit_singleline(&mut self.host);
+                    self.host_field(ui);
                     ui.end_row();
 
                     ui.label("端口:");
@@ -716,9 +921,21 @@ impl App {
                     ui.end_row();
 
                     ui.label("密码:");
-                    let password_edit =
-                        egui::TextEdit::singleline(&mut self.password).password(true);
-                    ui.add(password_edit);
+                    let password_edit = egui::TextEdit::singleline(&mut self.password)
+                        .password(true)
+                        .hint_text("留空则用私钥认证");
+                    ui.add(password_edit).on_hover_text(
+                        "填写则用密码认证；留空则用公钥认证（ssh-agent → 私钥文件）",
+                    );
+                    ui.end_row();
+
+                    ui.label("私钥:");
+                    let identity_edit = egui::TextEdit::singleline(&mut self.identity_file)
+                        .hint_text("留空 = ssh-agent / 默认私钥");
+                    ui.add(identity_edit).on_hover_text(
+                        "密码留空时使用的私钥文件（从 ssh config 选择主机时自动填入）；\n\
+                         此项也留空则依次尝试 ~/.ssh/id_rsa、id_ecdsa、id_ed25519",
+                    );
                     ui.end_row();
 
                     ui.label("DOMAIN_ID:");
@@ -779,15 +996,7 @@ impl App {
         }
 
         if !self.status_message.is_empty() {
-            ui.colored_label(
-                if self.status_message.contains("失败") || self.status_message.contains("错误")
-                {
-                    egui::Color32::from_rgb(255, 100, 100)
-                } else {
-                    egui::Color32::from_rgb(100, 255, 100)
-                },
-                &self.status_message,
-            );
+            ui.colored_label(status_color(&self.status_message), &self.status_message);
             ui.separator();
         }
 

@@ -389,6 +389,9 @@ pub struct LoginConfig {
     pub port: String,
     pub username: String,
     pub password: String,
+    /// 私钥文件路径（密码为空时使用；空 = ssh-agent / 默认私钥）
+    #[serde(default)]
+    pub identity_file: String,
     /// ROS_DOMAIN_ID，不同机器人可能不同
     #[serde(default)]
     pub ros_domain_id: String,
@@ -408,6 +411,7 @@ impl Default for LoginConfig {
             port: "22".into(),
             username: "linux".into(),
             password: String::new(),
+            identity_file: String::new(),
             ros_domain_id: "11".into(),
             remote_dir: default_remote_dir(),
         }
@@ -416,10 +420,8 @@ impl Default for LoginConfig {
 
 /// 配置文件路径: ~/.config/task-graph-editor/login.json
 fn config_path() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
+    crate::ssh_config::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("task-graph-editor")
         .join("login.json")

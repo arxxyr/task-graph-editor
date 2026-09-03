@@ -30,7 +30,7 @@ pub enum WorkerRequest {
         host: String,
         port: u16,
         username: String,
-        password: String,
+        auth: AuthMethod,
         remote_dir: String,
     },
     /// 断开连接
@@ -316,7 +316,7 @@ fn worker_loop(
                 host,
                 port,
                 username,
-                password,
+                auth,
                 remote_dir,
             } => {
                 reconnect = None; // 取消进行中的自动重连
@@ -324,7 +324,7 @@ fn worker_loop(
                     host,
                     port,
                     username,
-                    auth: AuthMethod::Password(password),
+                    auth,
                 };
 
                 match SshConnection::connect(&config) {

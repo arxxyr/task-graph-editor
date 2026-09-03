@@ -19,7 +19,8 @@ task-graph-editor/
 │   ├── model.rs                # 数据模型：ContextValue（11 种类型）、JSON 解析/序列化、ROS2 输出解析、登录持久化
 │   ├── app.rs                  # GUI 应用：连接面板、文件列表（右键菜单）、元数据编辑、分组 context 编辑器、响应轮询
 │   ├── worker.rs               # 后台工作线程：所有 SSH/SFTP/ROS2 操作在此异步执行
-│   └── ssh.rs                  # SSH/SFTP 封装：连接、认证、文件操作、命令执行
+│   ├── ssh.rs                  # SSH/SFTP 封装：连接、认证（密码 / ssh-agent / 私钥）、文件操作、命令执行
+│   └── ssh_config.rs           # ~/.ssh/config 解析：Host/Match/Include、首值生效、token 展开（主机下拉菜单数据源）
 ├── assets/fonts/               # 更纱黑体（SarasaTermSCNerd，编译时嵌入）
 └── scripts/
     ├── build-release.sh        # 本地 Release 构建脚本
@@ -79,6 +80,8 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
 - 位姿选中用索引路径（`Vec<usize>`）表示，嵌套分组内的位姿同样支持 ROS2 一键回填底盘/头部/腰部数据
 - 序列化时整数保持整数格式（如 `[4,3]` 不会变成 `[4.0,3.0]`）
 - 修改 `task_id` 后远程文件自动重命名为 `{task_id}.json`
+- 连接面板的主机框带下拉菜单，数据来自本机 `~/.ssh/config`（每次打开菜单重新解析，也可手动输入）；选中后填入 HostName/Port/User/IdentityFile，`ProxyJump`/`ProxyCommand` 条目仅提示"不支持跳板，将直连"
+- 认证规则：密码非空 → 密码认证；密码为空 → 公钥认证（ssh-agent 全部身份 → 私钥框指定文件 → `~/.ssh/id_rsa`/`id_ecdsa`/`id_ed25519` 中存在者），全部失败时汇总每一步原因
 
 ## 关键依赖
 
