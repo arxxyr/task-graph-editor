@@ -33,7 +33,10 @@ bevy = { version = "0.19.1", default-features = false, features = [
     "bevy_feathers",    # Feathers 控件集
 ] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip：serde_json 默认的快速浮点解析在某些值上有 1 ULP 误差
+# （实测 0.9216510910864573 会被解析成 ...572），位姿坐标读一遍再存回去就变了。
+# 开启后用精确算法解析，保证 bit-for-bit 往返
+serde_json = { version = "1", features = ["float_roundtrip"] }
 ssh2 = "0.9"
 thiserror = "2"
 mimalloc = { version = "0.1", default-features = false }

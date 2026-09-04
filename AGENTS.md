@@ -89,12 +89,21 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
 - `config.context` 中所有字段自动识别类型（`ContextValue` 枚举，12 种变体）：
   - `Pose` — 字符串化 RobotPose（chassis/head/waist）
   - `Bool` / `Integer` / `Float` — 标量
-  - `NumericArray` / `NumericArray2D` — 字符串化的 1D/2D 数值数组
+  - `NumericArray` / `NumericArray2D` — 1D/2D 数值数组。真实任务图里两种写法都有
+    （字符串化的 `"[0.01,0.17]"` 与原生 JSON 数组），`stringified` 记住原样，
+    序列化按原形式写回，否则会悄悄改掉远程文件的数据格式
   - `JointTrajectory` — 原生 JSON 数组（positions + time_from_start）
   - `PoseArray` — 原生位姿数组
   - `NestedGroup` — 原生 JSON 对象，成员递归分类（如 `station_profiles.station_1.*`），支持任意层级嵌套
   - `Text` / `Null` / `RawJson` — 其他
-- 序列化时整数保持整数格式（如 `[4,3]` 不会变成 `[4.0,3.0]`）
+- 字符串化数组里的整数保持整数格式（如 `"[4,3]"` 不会变成 `"[4.0,3.0]"`）；
+  原生数组则照 f64 写回，`0.0` 不能收敛成 `0`——那会把 JSON 类型从 float 改成 int
+- **位姿键顺序统一为 position 在前**：真实文件里两种顺序都有（机器人端 Python 写的是
+  字母序，orientation 在前），本工具一律按 `Pose` 的字段声明顺序写出
+- `serde_json` 开了 `float_roundtrip`：默认的快速浮点解析有 1 ULP 误差
+  （实测 `0.9216510910864573` 会被读成 `...572`），位姿坐标读一遍存回去就变了
+- 解析覆盖率可用 `TGE_ANALYZE=<文件> cargo test 分析 -- --ignored --nocapture` 检查，
+  会列出未能识别的字段并输出往返结果供比对
 - 修改 `task_id` 后远程文件自动重命名为 `{task_id}.json`
 
 ### UI 层：保留模式下的重建策略

@@ -194,9 +194,9 @@ fn slot_in_value_mut(value: &mut ContextValue, slot: ValueSlot) -> Option<&mut f
         (ContextValue::Pose(pose), ValueSlot::Pose(part, comp)) => {
             Some(comp.get_mut(part.get_mut(pose)))
         }
-        (ContextValue::NumericArray(arr), ValueSlot::Array1D(i)) => arr.get_mut(i),
-        (ContextValue::NumericArray2D(arr), ValueSlot::Array2D(row, col)) => {
-            arr.get_mut(row)?.get_mut(col)
+        (ContextValue::NumericArray { values, .. }, ValueSlot::Array1D(i)) => values.get_mut(i),
+        (ContextValue::NumericArray2D { rows, .. }, ValueSlot::Array2D(row, col)) => {
+            rows.get_mut(row)?.get_mut(col)
         }
         (ContextValue::JointTrajectory(traj), ValueSlot::TrajTime(i)) => {
             Some(&mut traj.get_mut(i)?.time_from_start)
@@ -216,9 +216,11 @@ fn slot_in_value(value: &ContextValue, slot: ValueSlot) -> Option<f64> {
     match (value, slot) {
         (ContextValue::Float(f), ValueSlot::Scalar) => Some(*f),
         (ContextValue::Pose(pose), ValueSlot::Pose(part, comp)) => Some(comp.get(part.get(pose))),
-        (ContextValue::NumericArray(arr), ValueSlot::Array1D(i)) => arr.get(i).copied(),
-        (ContextValue::NumericArray2D(arr), ValueSlot::Array2D(row, col)) => {
-            arr.get(row)?.get(col).copied()
+        (ContextValue::NumericArray { values, .. }, ValueSlot::Array1D(i)) => {
+            values.get(i).copied()
+        }
+        (ContextValue::NumericArray2D { rows, .. }, ValueSlot::Array2D(row, col)) => {
+            rows.get(row)?.get(col).copied()
         }
         (ContextValue::JointTrajectory(traj), ValueSlot::TrajTime(i)) => {
             Some(traj.get(i)?.time_from_start)
@@ -328,11 +330,17 @@ mod tests {
                 },
                 ContextField {
                     key: "offsets".into(),
-                    value: ContextValue::NumericArray(vec![0.1, 0.2, 0.3]),
+                    value: ContextValue::NumericArray {
+                        values: vec![0.1, 0.2, 0.3],
+                        stringified: true,
+                    },
                 },
                 ContextField {
                     key: "grid".into(),
-                    value: ContextValue::NumericArray2D(vec![vec![1.0, 2.0], vec![3.0, 4.0]]),
+                    value: ContextValue::NumericArray2D {
+                        rows: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+                        stringified: true,
+                    },
                 },
                 ContextField {
                     key: "traj".into(),
@@ -461,14 +469,14 @@ mod tests {
         let mut data = sample_data();
         let b1 = ValueBinding::new(vec![5], ValueSlot::Array1D(1));
         assert!(apply_f64(&mut data, &b1, 8.5));
-        let ContextValue::NumericArray(arr) = &data.context_fields[5].value else {
+        let ContextValue::NumericArray { values: arr, .. } = &data.context_fields[5].value else {
             panic!("类型应为 NumericArray");
         };
         assert_eq!(arr, &[0.1, 8.5, 0.3]);
 
         let b2 = ValueBinding::new(vec![6], ValueSlot::Array2D(1, 0));
         assert!(apply_f64(&mut data, &b2, -1.0));
-        let ContextValue::NumericArray2D(arr2d) = &data.context_fields[6].value else {
+        let ContextValue::NumericArray2D { rows: arr2d, .. } = &data.context_fields[6].value else {
             panic!("类型应为 NumericArray2D");
         };
         assert_eq!(arr2d[1], vec![-1.0, 4.0]);

@@ -231,7 +231,7 @@ fn field_groups(
             ContextValue::Bool(_) | ContextValue::Integer(_) | ContextValue::Float(_) => {
                 &mut scalars
             }
-            ContextValue::NumericArray(_) | ContextValue::NumericArray2D(_) => &mut arrays,
+            ContextValue::NumericArray { .. } | ContextValue::NumericArray2D { .. } => &mut arrays,
             ContextValue::JointTrajectory(_) => &mut trajectories,
             ContextValue::NestedGroup(_) => &mut nested,
             _ => &mut others,
@@ -468,7 +468,7 @@ fn scalar_row(field: &ContextField, path: Vec<usize>) -> impl Scene {
 /// 数组字段：一维直接列出，二维每行懒加载
 fn array_section(field: &ContextField, path: Vec<usize>) -> BoxedScene {
     match &field.value {
-        ContextValue::NumericArray(values) => {
+        ContextValue::NumericArray { values, .. } => {
             let title = format!("{} [{} 个元素]", field.key, values.len());
             let rows: Vec<BoxedScene> = values
                 .iter()
@@ -486,7 +486,7 @@ fn array_section(field: &ContextField, path: Vec<usize>) -> BoxedScene {
                 .collect();
             boxed(widgets::collapsible(title, None, false, rows))
         }
-        ContextValue::NumericArray2D(rows) => {
+        ContextValue::NumericArray2D { rows, .. } => {
             let cols = rows.first().map(|r| r.len()).unwrap_or(0);
             let title = format!("{} [{} x {}]", field.key, rows.len(), cols);
             let row_sections: Vec<BoxedScene> = (0..rows.len())
@@ -774,7 +774,7 @@ fn fill_lazy_bodies(
                         None => continue,
                     }
                 }
-                (ContextValue::NumericArray2D(rows), LazyKind::Array2DRow(index)) => {
+                (ContextValue::NumericArray2D { rows, .. }, LazyKind::Array2DRow(index)) => {
                     match rows.get(index) {
                         Some(row) => array2d_row_body(row, &lazy.path, index),
                         None => continue,
