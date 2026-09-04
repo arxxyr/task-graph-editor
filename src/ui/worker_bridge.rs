@@ -170,6 +170,8 @@ fn apply_ssh_host(session: &mut Session, status: &mut StatusLine, index: usize) 
         }
         (None, None) => String::new(),
     };
+    // 表单是被程序改的，要把新值刷回输入框
+    session.form_version += 1;
     status.set(format!(
         "已载入 ssh config 主机 {}：{}@{}:{}{proxy_note}",
         entry.alias, session.login.username, session.login.host, session.login.port

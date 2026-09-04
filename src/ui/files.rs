@@ -65,12 +65,15 @@ impl ContextMenu {
 }
 
 /// 已渲染的列表版本，避免重复重建
+///
+/// 用 `Option` 而不是 `0` 表示"还没建过"：版本号本身从 0 开始，
+/// 若拿 0 当哨兵值，第一次真实更新（版本 0 → 1）会被误判成已渲染而丢掉。
 #[derive(Resource, Default)]
 struct RenderedList {
     /// 已渲染的文件列表版本
-    files: u64,
+    files: Option<u64>,
     /// 已渲染的右键菜单版本
-    menu: u64,
+    menu: Option<u64>,
 }
 
 /// 构建文件列表卡片
@@ -147,11 +150,10 @@ fn rebuild_file_rows(
     let Ok(slot) = slots.single() else {
         return;
     };
-    // 版本号相同则无需重建；version 为 0 时也要建一次（初始空列表的提示行）
-    if rendered.files == browser.list_version && rendered.files != 0 {
+    if rendered.files == Some(browser.list_version) {
         return;
     }
-    rendered.files = browser.list_version.max(1);
+    rendered.files = Some(browser.list_version);
 
     let mut rows: Vec<BoxedScene> = match browser.files.is_empty() {
         true => vec![boxed(bsn! {
@@ -337,13 +339,13 @@ fn rebuild_context_menu(
     mut roots: Query<(Entity, &mut Node), With<ContextMenuRoot>>,
     mut commands: Commands,
 ) {
-    if rendered.menu == menu.version {
+    if rendered.menu == Some(menu.version) {
         return;
     }
     let Ok((root, mut node)) = roots.single_mut() else {
         return;
     };
-    rendered.menu = menu.version;
+    rendered.menu = Some(menu.version);
 
     if !menu.open {
         node.display = Display::None;

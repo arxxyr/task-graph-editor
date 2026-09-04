@@ -87,8 +87,11 @@ struct LazyBody {
 /// 已渲染的编辑器版本
 #[derive(Resource, Default)]
 struct RenderedEditor {
-    /// 已渲染的结构版本
-    structure: u64,
+    /// 已渲染的结构版本；`None` 表示还没建过
+    ///
+    /// 不能拿 0 当"没建过"的哨兵：版本号从 0 起算，
+    /// 第一次加载文件（0 → 1）会被误判成已渲染，编辑器就永远是空的。
+    structure: Option<u64>,
     /// 已渲染的数值版本
     values: u64,
     /// 已渲染的操作栏状态（有数据、已连接、忙碌、选中位姿）
@@ -775,10 +778,10 @@ fn rebuild_editor(
     let Ok(slot) = slots.single() else {
         return;
     };
-    if rendered.structure == editor.structure_version && rendered.structure != 0 {
+    if rendered.structure == Some(editor.structure_version) {
         return;
     }
-    rendered.structure = editor.structure_version.max(1);
+    rendered.structure = Some(editor.structure_version);
     rendered.selection.clone_from(&editor.selected_pose_path);
 
     let content: Vec<BoxedScene> = match &editor.data {

@@ -54,6 +54,9 @@ pub struct Session {
     pub ssh_hosts: Vec<SshHostEntry>,
     /// 主机下拉菜单版本号：刷新主机列表后递增，驱动菜单项重建
     pub hosts_version: u64,
+    /// 表单值版本号：程序改动表单内容后递增（如套用 ssh config 主机），
+    /// 驱动把新值刷回输入框。用户自己打字不递增，否则会打断输入。
+    pub form_version: u64,
 }
 
 impl Default for Session {
@@ -67,6 +70,7 @@ impl Default for Session {
             pending_command: None,
             ssh_hosts: ssh_config::load_user_hosts(),
             hosts_version: 0,
+            form_version: 0,
         }
     }
 }

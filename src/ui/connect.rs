@@ -49,12 +49,15 @@ struct ConnectButtonsSlot;
 struct HostMenuSlot;
 
 /// 记录已渲染的版本号，避免重复重建
+///
+/// 一律用 `Option` 表示"还没渲染过"，不要拿 0 当哨兵——
+/// 版本号从 0 起算，否则第一次更新会被误判成已渲染而丢掉。
 #[derive(Resource, Default)]
 struct RenderedVersions {
     /// 已渲染的主机列表版本
-    hosts: u64,
-    /// 已渲染的表单值版本
-    form: u64,
+    hosts: Option<u64>,
+    /// 已刷回输入框的表单版本
+    form: Option<u64>,
     /// 已渲染的按钮状态（已连接、重连中、忙碌）
     buttons: Option<(bool, bool, bool)>,
 }
@@ -342,14 +345,13 @@ fn rebuild_host_menu(
     slots: Query<Entity, With<HostMenuSlot>>,
     mut commands: Commands,
 ) {
-    // 版本号未变，或菜单还没建好，都不重建
-    if rendered.hosts == session.hosts_version && rendered.hosts != 0 {
+    if rendered.hosts == Some(session.hosts_version) {
         return;
     }
     let Ok(slot) = slots.single() else {
         return;
     };
-    rendered.hosts = session.hosts_version.max(1);
+    rendered.hosts = Some(session.hosts_version);
 
     let items: Vec<BoxedScene> = match session.ssh_hosts.is_empty() {
         true => vec![boxed(bsn! {
@@ -414,7 +416,7 @@ fn refresh_form_fields(
     mut rendered: ResMut<RenderedVersions>,
     mut fields: Query<(&LoginField, &mut EditableText)>,
 ) {
-    if rendered.form == session.hosts_version || !session.is_changed() {
+    if rendered.form == Some(session.form_version) {
         return;
     }
     for (field, mut editable) in &mut fields {
@@ -432,7 +434,7 @@ fn refresh_form_fields(
             editable.queue_edit(TextEdit::Insert(expected.as_str().into()));
         }
     }
-    rendered.form = session.hosts_version;
+    rendered.form = Some(session.form_version);
 }
 
 /// 连接面板插件
