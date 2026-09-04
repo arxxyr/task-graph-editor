@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use bevy::ecs::system::NonSendMarker;
 use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 
@@ -280,31 +281,8 @@ fn handle_actions(
                 });
             }
 
-            AppAction::UploadFile => {
-                let Some(path) = rfd::FileDialog::new()
-                    .add_filter("JSON", &["json"])
-                    .set_title("选择要上传的 JSON 文件")
-                    .pick_file()
-                else {
-                    continue;
-                };
-                let filename = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        session.busy = BusyState::Working(format!("正在上传 {filename}"));
-                        status.set("");
-                        session.send(WorkerRequest::UploadFile {
-                            remote_dir: session.login.remote_dir.clone(),
-                            filename,
-                            content,
-                        });
-                    }
-                    Err(e) => status.set(format!("读取本地文件失败: {e}")),
-                }
-            }
+            // 要弹原生文件对话框，只能在主线程做，交给 handle_file_dialog
+            AppAction::UploadFile => {}
 
             AppAction::SaveToRemote => {
                 let Some(current_filename) = browser.selected.clone() else {
@@ -408,6 +386,50 @@ fn handle_actions(
             AppAction::ApplySshHost(index) => {
                 apply_ssh_host(&mut session, &mut status, *index);
             }
+        }
+    }
+}
+
+/// 处理需要弹原生文件对话框的操作
+///
+/// **必须钉在主线程**：macOS 的 `NSOpenPanel` 只能在主线程调用，而 Bevy 的多线程
+/// 调度器会把普通 system 丢到 Compute Task Pool（实测跑在 "Compute Task Pool (2)"），
+/// 在那里弹对话框会崩溃或卡死。`NonSendMarker` 是 `!Send` 的空类型，
+/// 带上它就会把这个 system 固定在主线程执行。
+///
+/// 对话框是模态的，打开期间主循环会停住、窗口不刷新——这与旧版行为一致。
+fn handle_file_dialog(
+    _main_thread: NonSendMarker,
+    mut actions: MessageReader<AppAction>,
+    mut session: ResMut<Session>,
+    mut status: ResMut<StatusLine>,
+) {
+    for action in actions.read() {
+        if !matches!(action, AppAction::UploadFile) {
+            continue;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_title("选择要上传的 JSON 文件")
+            .pick_file()
+        else {
+            continue;
+        };
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                session.busy = BusyState::Working(format!("正在上传 {filename}"));
+                status.set("");
+                session.send(WorkerRequest::UploadFile {
+                    remote_dir: session.login.remote_dir.clone(),
+                    filename,
+                    content,
+                });
+            }
+            Err(e) => status.set(format!("读取本地文件失败: {e}")),
         }
     }
 }
@@ -753,7 +775,9 @@ impl Plugin for WorkerBridgePlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<AppAction>().add_systems(
             Update,
-            (poll_worker, handle_actions).chain().in_set(UiSet::Update),
+            (poll_worker, handle_actions, handle_file_dialog)
+                .chain()
+                .in_set(UiSet::Update),
         );
     }
 }

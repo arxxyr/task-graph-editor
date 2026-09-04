@@ -200,6 +200,11 @@ shell 同样不会展开其中的 `~`。
 - **全局分配器**：mimalloc（`#[global_allocator]`）
 - **错误处理**：优先 `Result`/`Option`，避免 `unwrap()` 在非测试代码中使用
 - **控制流**：多分支优先 `match`，避免 if-else 链
+- **原生对话框必须钉在主线程**：`rfd` 弹的是 `NSOpenPanel`，它在非主线程会
+  `dispatch_sync` 到主队列；而 Bevy 的多线程调度器此刻正在主线程 `block_on` 等这个
+  system 跑完——两边互等，直接死锁（进程不崩、永久挂起，连崩溃报告都没有）。
+  给 system 加 `NonSendMarker` 参数即可钉住主线程，见 `worker_bridge::handle_file_dialog`。
+  Bevy 会把普通 system 丢到 Compute Task Pool，**不要默认自己在主线程**
 - **异步模式**：SSH 操作在后台线程执行（`std::thread` + `mpsc`），无 tokio 依赖。
   后台线程通过 winit 的 `EventLoopProxy` 唤醒主循环（`worker::WakeFn`，与 GUI 框架解耦）
 - **窗口刷新**：`WinitSettings` 用 reactive 模式，无输入时不重绘，空闲 CPU 占用接近零
