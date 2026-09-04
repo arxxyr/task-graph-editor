@@ -101,9 +101,36 @@ fn authenticate_with_agent(session: &Session, username: &str) -> Result<(), Stri
     ))
 }
 
+/// 展开路径开头的 `~`，并规整结尾斜杠
+///
+/// SFTP 协议不做 shell 展开：`~/Workspace/task_graphs` 会被原样当成路径，
+/// 服务端按相对路径解析成 `<home>/~/Workspace/task_graphs`，直接报"没有那个文件或目录"。
+/// 而在远程目录里填 `~/...` 是很自然的写法，所以这里自己替换成绝对路径。
+///
+/// `home` 取不到时保持原样——总比猜一个错的路径强。
+/// 只认 `~` 与 `~/`；`~user/...` 这种要查 passwd 才能解析，不处理。
+fn expand_home(path: &str, home: Option<&str>) -> String {
+    let path = path.trim();
+    let expanded = match (home, path.strip_prefix("~/")) {
+        (Some(home), Some(rest)) => format!("{}/{rest}", home.trim_end_matches('/')),
+        (Some(home), None) if path == "~" => home.trim_end_matches('/').to_string(),
+        _ => path.to_string(),
+    };
+    // 结尾斜杠对 readdir 无害，但拼子路径时会拼出 `//`；根目录要留着
+    match expanded.as_str() {
+        "/" => expanded,
+        _ => expanded.trim_end_matches('/').to_string(),
+    }
+}
+
 /// 封装 SSH 会话，提供文件操作接口
 pub struct SshConnection {
     session: Session,
+    /// 远程 home 目录，用于展开路径里的 `~`
+    ///
+    /// SFTP 协议不做 shell 展开，`~/x` 会被当成名字就叫 `~` 的目录，
+    /// 必须自己替换成绝对路径。取不到时保持原样。
+    home: Option<String>,
 }
 
 impl SshConnection {
@@ -129,7 +156,34 @@ impl SshConnection {
         // 启用 SSH keepalive：定期发送心跳包，want_reply=true 以便检测对端是否存活
         session.set_keepalive(true, KEEPALIVE_INTERVAL_SECS);
 
-        Ok(Self { session })
+        let mut connection = Self {
+            session,
+            home: None,
+        };
+        connection.home = connection.query_home();
+        tracing::info!(
+            host = %config.host,
+            port = config.port,
+            user = %config.username,
+            home = ?connection.home,
+            "SSH 已连接并认证"
+        );
+        Ok(connection)
+    }
+
+    /// 询问远程 home 目录（失败不致命，只是 `~` 展开会失效）
+    fn query_home(&self) -> Option<String> {
+        let home = self.exec_command("printf %s \"$HOME\"").ok()?;
+        let home = home.trim();
+        match home.is_empty() {
+            true => None,
+            false => Some(home.to_string()),
+        }
+    }
+
+    /// 展开路径开头的 `~`，并去掉多余的结尾斜杠
+    pub fn resolve_path(&self, path: &str) -> String {
+        expand_home(path, self.home.as_deref())
     }
 
     /// 发送 SSH keepalive 心跳包
@@ -141,8 +195,13 @@ impl SshConnection {
 
     /// 列出远程目录下所有 .json 文件名
     pub fn list_json_files(&self, dir: &str) -> Result<Vec<String>, SshError> {
+        let resolved = self.resolve_path(dir);
+        tracing::debug!(input = dir, resolved = %resolved, "SFTP readdir");
         let sftp = self.session.sftp()?;
-        let entries = sftp.readdir(Path::new(dir))?;
+        let entries = sftp.readdir(Path::new(&resolved)).map_err(|e| {
+            tracing::warn!(dir = %resolved, error = %e, "列出远程目录失败");
+            e
+        })?;
 
         let mut files: Vec<String> = entries
             .into_iter()
@@ -157,13 +216,16 @@ impl SshConnection {
             .collect();
 
         files.sort();
+        tracing::debug!(dir = %resolved, count = files.len(), "远程 JSON 文件");
         Ok(files)
     }
 
     /// 读取远程文件内容
     pub fn read_file(&self, path: &str) -> Result<String, SshError> {
+        let resolved = self.resolve_path(path);
+        tracing::debug!(path = %resolved, "SFTP 读取文件");
         let sftp = self.session.sftp()?;
-        let mut file = sftp.open(Path::new(path))?;
+        let mut file = sftp.open(Path::new(&resolved))?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         Ok(String::from_utf8(buf)?)
@@ -171,16 +233,32 @@ impl SshConnection {
 
     /// 写入远程文件（覆盖）
     pub fn write_file(&self, path: &str, content: &str) -> Result<(), SshError> {
+        let resolved = self.resolve_path(path);
+        tracing::debug!(path = %resolved, bytes = content.len(), "SFTP 写入文件");
         let sftp = self.session.sftp()?;
-        let mut file = sftp.create(Path::new(path))?;
+        let mut file = sftp.create(Path::new(&resolved))?;
         file.write_all(content.as_bytes())?;
         Ok(())
     }
 
     /// 重命名远程文件
     pub fn rename_file(&self, old_path: &str, new_path: &str) -> Result<(), SshError> {
+        let (old, new) = (self.resolve_path(old_path), self.resolve_path(new_path));
+        tracing::debug!(from = %old, to = %new, "SFTP 重命名");
         let sftp = self.session.sftp()?;
-        sftp.rename(Path::new(old_path), Path::new(new_path), None)?;
+        sftp.rename(Path::new(&old), Path::new(&new), None)?;
+        Ok(())
+    }
+
+    /// 删除远程文件
+    ///
+    /// 走 SFTP 而非 `rm`：原先的 `rm -f '<path>'` 把路径放进单引号里，
+    /// shell 不会展开其中的 `~`，删除会静默失败。
+    pub fn delete_file(&self, path: &str) -> Result<(), SshError> {
+        let resolved = self.resolve_path(path);
+        tracing::debug!(path = %resolved, "SFTP 删除文件");
+        let sftp = self.session.sftp()?;
+        sftp.unlink(Path::new(&resolved))?;
         Ok(())
     }
 
@@ -232,5 +310,80 @@ impl SshConnection {
         }
 
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_home;
+
+    #[test]
+    fn 展开波浪线开头的路径() {
+        assert_eq!(
+            expand_home("~/Workspace/task_graphs", Some("/home/linux")),
+            "/home/linux/Workspace/task_graphs"
+        );
+    }
+
+    #[test]
+    fn 展开时去掉结尾斜杠() {
+        // 用户在界面里习惯性带上结尾斜杠，拼子路径时会变成 //
+        assert_eq!(
+            expand_home("~/Workspace/task_graphs/", Some("/home/linux")),
+            "/home/linux/Workspace/task_graphs"
+        );
+    }
+
+    #[test]
+    fn 单独的波浪线展开为home() {
+        assert_eq!(expand_home("~", Some("/home/linux")), "/home/linux");
+    }
+
+    #[test]
+    fn home自带结尾斜杠不产生双斜杠() {
+        assert_eq!(expand_home("~/x", Some("/home/linux/")), "/home/linux/x");
+    }
+
+    #[test]
+    fn 取不到home时保持原样() {
+        // 猜一个错的路径不如原样传给服务端，让错误信息如实反映用户输入
+        assert_eq!(expand_home("~/x", None), "~/x");
+    }
+
+    #[test]
+    fn 绝对路径只规整结尾斜杠() {
+        assert_eq!(
+            expand_home("/home/linux/task_graphs/", Some("/home/linux")),
+            "/home/linux/task_graphs"
+        );
+    }
+
+    #[test]
+    fn 相对路径不动() {
+        assert_eq!(
+            expand_home("Workspace/tg", Some("/home/linux")),
+            "Workspace/tg"
+        );
+    }
+
+    #[test]
+    fn 根目录保留斜杠() {
+        assert_eq!(expand_home("/", Some("/home/linux")), "/");
+    }
+
+    #[test]
+    fn 前后空格被去掉() {
+        assert_eq!(expand_home("  ~/x  ", Some("/home/linux")), "/home/linux/x");
+    }
+
+    #[test]
+    fn 波浪线用户名形式不展开() {
+        // ~user 要查 passwd 才能解析，不处理，原样传给服务端
+        assert_eq!(expand_home("~root/x", Some("/home/linux")), "~root/x");
+    }
+
+    #[test]
+    fn 多个结尾斜杠都去掉() {
+        assert_eq!(expand_home("~/x///", Some("/home/linux")), "/home/linux/x");
     }
 }

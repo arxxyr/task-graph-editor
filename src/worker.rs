@@ -79,10 +79,10 @@ pub enum WorkerRequest {
 
 /// 后台线程返回的响应
 pub enum WorkerResponse {
-    /// 连接成功
+    /// 连接成功（文件列表可能单独失败，如远程目录写错）
     Connected {
         ros_domain_id: Option<String>,
-        file_list: Vec<String>,
+        file_list: Result<Vec<String>, String>,
     },
     /// 连接失败
     ConnectFailed(String),
@@ -131,10 +131,10 @@ pub enum WorkerResponse {
     ConnectionLost(String),
     /// 正在自动重连（attempt=0 表示尚未尝试，delay_secs 为下次重试等待秒数）
     Reconnecting { attempt: u32, delay_secs: u64 },
-    /// 自动重连成功
+    /// 自动重连成功（文件列表可能单独失败）
     Reconnected {
         ros_domain_id: Option<String>,
-        file_list: Vec<String>,
+        file_list: Result<Vec<String>, String>,
     },
 }
 
@@ -213,6 +213,24 @@ impl ReconnectState {
     }
 }
 
+/// 列出远程 JSON 文件，失败时记日志并返回空表
+///
+/// 连接流程不因列不出文件而中止（连接本身是成功的），但错误必须留痕——
+/// 早先这里是 `unwrap_or_default()`，目录写错时界面只显示"已连接"、
+/// 列表空空如也且没有任何提示。
+fn list_files_logged(conn: &SshConnection, remote_dir: &str) -> Result<Vec<String>, String> {
+    match conn.list_json_files(remote_dir) {
+        Ok(files) => {
+            tracing::info!(dir = %remote_dir, count = files.len(), "已获取文件列表");
+            Ok(files)
+        }
+        Err(e) => {
+            tracing::warn!(dir = %remote_dir, error = %e, "获取文件列表失败");
+            Err(e.to_string())
+        }
+    }
+}
+
 /// 尝试读取远程 ROS_DOMAIN_ID
 fn read_ros_domain_id(conn: &SshConnection) -> Option<String> {
     conn.exec_command("bash -ic 'echo $ROS_DOMAIN_ID' 2>/dev/null")
@@ -251,7 +269,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 match SshConnection::connect(config) {
                     Ok(conn) => {
                         let ros_domain_id = read_ros_domain_id(&conn);
-                        let file_list = conn.list_json_files(remote_dir).unwrap_or_default();
+                        let file_list = list_files_logged(&conn, remote_dir);
                         connection = Some(conn);
                         reconnect = None;
                         respond!(WorkerResponse::Reconnected {
@@ -331,10 +349,11 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                     auth,
                 };
 
+                tracing::info!(host = %config.host, port, user = %config.username, remote_dir = %remote_dir, "开始连接");
                 match SshConnection::connect(&config) {
                     Ok(conn) => {
                         let ros_domain_id = read_ros_domain_id(&conn);
-                        let file_list = conn.list_json_files(&remote_dir).unwrap_or_default();
+                        let file_list = list_files_logged(&conn, &remote_dir);
                         connect_params = Some((config, remote_dir));
                         connection = Some(conn);
                         respond!(WorkerResponse::Connected {
@@ -343,6 +362,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                         });
                     }
                     Err(e) => {
+                        tracing::warn!(error = %e, "SSH 连接失败");
                         respond!(WorkerResponse::ConnectFailed(e.to_string()));
                     }
                 }
@@ -486,7 +506,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 };
 
                 let path = format!("{remote_dir}/{filename}");
-                if let Err(e) = conn.exec_command(&format!("rm -f '{path}'")) {
+                if let Err(e) = conn.delete_file(&path) {
                     respond!(WorkerResponse::DeleteFailed(e.to_string()));
                     continue;
                 }

@@ -52,6 +52,10 @@ cargo run
 TGE_SCREENSHOT=/tmp/ui.png cargo run     # 启动后自动截一张再退出
 # 运行时按 F12 也可随时截图到当前目录
 
+# 排查问题：打开详细日志（SSH 连接参数、SFTP 路径展开、文件列表条数、界面重建时机）
+TGE_LOG=debug cargo run
+TGE_LOG=trace cargo run                  # 再加上 wgpu/naga 的警告
+
 # 测试
 cargo test
 cargo test <test_name>           # 运行单个测试
@@ -142,6 +146,16 @@ Bevy 是保留模式 UI，控件是实体而非每帧重绘的立即模式绘制
   选中后填入 HostName/Port/User/IdentityFile，`ProxyJump`/`ProxyCommand` 条目会标注"跳板 · 不支持，将直连"
 - 认证规则：密码非空 → 密码认证；密码为空 → 公钥认证（ssh-agent 全部身份 → 私钥框指定文件 →
   `~/.ssh/id_rsa`/`id_ecdsa`/`id_ed25519` 中存在者），全部失败时汇总每一步原因
+
+### 远程路径里的 `~`
+
+SFTP 协议**不做 shell 展开**：`~/Workspace/task_graphs` 会被服务端按相对路径解析成
+`<home>/~/Workspace/task_graphs`，直接报"没有那个文件或目录"。而在"远程目录"里填 `~/...`
+是很自然的写法，所以连接后会 `printf %s "$HOME"` 取一次远程 home 缓存起来，
+`SshConnection` 的每个路径入口都过 `resolve_path` 展开（`ssh.rs::expand_home`，带单测）。
+
+同理，删除文件走 SFTP `unlink` 而不是 `rm -f '<path>'`——后者把路径放进单引号里，
+shell 同样不会展开其中的 `~`。
 
 ## 关键依赖
 

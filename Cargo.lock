@@ -4369,6 +4369,7 @@ dependencies = [
  "serde_json",
  "ssh2",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

@@ -39,6 +39,9 @@ thiserror = "2"
 mimalloc = { version = "0.1", default-features = false }
 rfd = "0.17"
 chrono = "0.4"
+# 日志门面：ssh.rs / worker.rs 要与 GUI 框架解耦，不能直接用 bevy::log；
+# Bevy 的 LogPlugin 会接管 tracing 的全局 subscriber，两边自然汇到一处
+tracing = "0.1"
 
 # 仅为开启 icu_provider 的 logging feature，本项目不直接使用它：
 # 该 feature 关闭时，icu_provider 把 log::warn! 别名成 std::eprintln!

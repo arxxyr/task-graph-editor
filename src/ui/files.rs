@@ -153,6 +153,12 @@ fn rebuild_file_rows(
     if rendered.files == Some(browser.list_version) {
         return;
     }
+    debug!(
+        was = ?rendered.files,
+        now = browser.list_version,
+        count = browser.files.len(),
+        "重建文件列表行"
+    );
     rendered.files = Some(browser.list_version);
 
     let mut rows: Vec<BoxedScene> = match browser.files.is_empty() {

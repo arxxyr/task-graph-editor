@@ -781,6 +781,12 @@ fn rebuild_editor(
     if rendered.structure == Some(editor.structure_version) {
         return;
     }
+    debug!(
+        was = ?rendered.structure,
+        now = editor.structure_version,
+        has_data = editor.data.is_some(),
+        "重建编辑器"
+    );
     rendered.structure = Some(editor.structure_version);
     rendered.selection.clone_from(&editor.selected_pose_path);
 

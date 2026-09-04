@@ -213,6 +213,7 @@ fn handle_actions(
     proxy: Res<EventLoopProxyWrapper>,
 ) {
     for action in actions.read() {
+        debug!(?action, "处理界面操作");
         match action {
             AppAction::Connect => {
                 let port = session.login.port.parse::<u16>().unwrap_or(22);
@@ -421,11 +422,42 @@ fn apply_file_list(
         Ok(files) => {
             let empty = files.is_empty();
             browser.set_files(files);
+            debug!(
+                count = browser.files.len(),
+                version = browser.list_version,
+                "文件列表已更新"
+            );
             if empty {
                 status.set("远程目录下无 JSON 文件");
             }
         }
-        Err(e) => status.set(format!("获取文件列表失败: {e}")),
+        Err(e) => {
+            warn!(error = %e, "获取文件列表失败");
+            status.set(format!("获取文件列表失败: {e}"));
+        }
+    }
+}
+
+/// 响应类型名，只用于日志
+fn response_kind(response: &WorkerResponse) -> &'static str {
+    match response {
+        WorkerResponse::Connected { .. } => "Connected",
+        WorkerResponse::ConnectFailed(_) => "ConnectFailed",
+        WorkerResponse::Disconnected => "Disconnected",
+        WorkerResponse::FileList(_) => "FileList",
+        WorkerResponse::FileLoaded { .. } => "FileLoaded",
+        WorkerResponse::FileSaved { .. } => "FileSaved",
+        WorkerResponse::SaveFailed(_) => "SaveFailed",
+        WorkerResponse::BackupDone { .. } => "BackupDone",
+        WorkerResponse::BackupFailed(_) => "BackupFailed",
+        WorkerResponse::FileDeleted { .. } => "FileDeleted",
+        WorkerResponse::DeleteFailed(_) => "DeleteFailed",
+        WorkerResponse::FileUploaded { .. } => "FileUploaded",
+        WorkerResponse::UploadFailed(_) => "UploadFailed",
+        WorkerResponse::CommandOutput(_) => "CommandOutput",
+        WorkerResponse::ConnectionLost(_) => "ConnectionLost",
+        WorkerResponse::Reconnecting { .. } => "Reconnecting",
+        WorkerResponse::Reconnected { .. } => "Reconnected",
     }
 }
 
@@ -447,9 +479,10 @@ fn handle_response(
             if let Some(id) = ros_domain_id {
                 session.login.ros_domain_id = id;
             }
-            browser.set_files(file_list);
             status.set(format!("已连接到 {}", session.login.host));
             session.save_login();
+            // 连接成功但列不出文件（多半是远程目录写错），错误要盖过连接成功的提示
+            apply_file_list(browser, status, file_list);
         }
 
         WorkerResponse::ConnectFailed(e) => {
@@ -581,8 +614,8 @@ fn handle_response(
             if let Some(id) = ros_domain_id {
                 session.login.ros_domain_id = id;
             }
-            browser.set_files(file_list);
             status.set(format!("已重新连接到 {}", session.login.host));
+            apply_file_list(browser, status, file_list);
         }
 
         WorkerResponse::CommandOutput(result) => {
@@ -675,6 +708,7 @@ fn poll_worker(
         .unwrap_or_default();
 
     for response in responses {
+        debug!(kind = response_kind(&response), "收到后台响应");
         handle_response(
             response,
             &mut session,
