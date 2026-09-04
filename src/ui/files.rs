@@ -7,9 +7,11 @@
 use bevy::feathers::controls::FeathersListRow;
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemeTextColor, ThemedText};
 use bevy::feathers::tokens;
+use bevy::picking::hover::Hovered;
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
-use bevy::ui::{Selected, UiScale};
+use bevy::ui::{Interaction, Selected, UiScale};
+use bevy::window::PrimaryWindow;
 
 use super::shell::{ContextMenuRoot, FileListSlot};
 use super::theme;
@@ -218,78 +220,82 @@ fn sync_row_selection(
     }
 }
 
-/// 文件行按下：左键加载，右键弹菜单
+/// 文件行左键：加载该文件
 fn on_row_press(
     mut press: On<Pointer<Press>>,
     rows: Query<&FileRow>,
+    parents: Query<&ChildOf>,
     session: Res<Session>,
-    ui_scale: Res<UiScale>,
-    mut menu: ResMut<ContextMenu>,
     mut writer: MessageWriter<AppAction>,
 ) {
-    let Ok(row) = rows.get(press.entity) else {
+    // 点中的可能是行内的文字节点，往上找到挂了 FileRow 的那层
+    let Some(entity) = widgets::self_or_ancestor(press.entity, &parents, |e| rows.contains(e))
+    else {
+        return;
+    };
+    if press.button != PointerButton::Primary {
+        return;
+    }
+    let Ok(row) = rows.get(entity) else {
         return;
     };
     press.propagate(false);
-
-    match press.button {
-        PointerButton::Secondary => {
-            menu.open_at(
-                press.pointer_location.position / ui_scale.0,
-                Some(row.0.clone()),
-            );
-        }
-        PointerButton::Primary => {
-            menu.close();
-            // 忙碌时忽略点击，避免打断进行中的请求
-            if session.interactive() {
-                writer.write(AppAction::LoadFile(row.0.clone()));
-            }
-        }
-        PointerButton::Middle => {}
+    // 忙碌时忽略点击，避免打断进行中的请求
+    if session.interactive() {
+        writer.write(AppAction::LoadFile(row.0.clone()));
     }
 }
 
-/// 空白区右键：只提供上传
-fn on_blank_press(
-    mut press: On<Pointer<Press>>,
-    blanks: Query<(), With<FileListBlank>>,
+/// 右键打开菜单
+///
+/// 不走 picking 的 `Pointer<Press>`：那条路命中的是最内层的文字节点，
+/// 还得依赖事件冒泡。这里直接读鼠标输入，再从悬停状态找目标——
+/// `Hovered` 只挂在行本身，不会跑到子节点上去。
+fn open_context_menu(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    rows: Query<(&FileRow, &Hovered)>,
+    blanks: Query<&Hovered, With<FileListBlank>>,
     ui_scale: Res<UiScale>,
     mut menu: ResMut<ContextMenu>,
 ) {
-    if blanks.get(press.entity).is_err() {
+    if !mouse.just_pressed(MouseButton::Right) {
         return;
     }
-    press.propagate(false);
-    match press.button {
-        PointerButton::Secondary => {
-            menu.open_at(press.pointer_location.position / ui_scale.0, None);
-        }
-        _ => menu.close(),
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let position = cursor / ui_scale.0;
+
+    // 先看是否落在某个文件行上，其次看列表空白区
+    if let Some((row, _)) = rows.iter().find(|(_, hovered)| hovered.get()) {
+        menu.open_at(position, Some(row.0.clone()));
+    } else if blanks.iter().any(Hovered::get) {
+        menu.open_at(position, None);
+    } else {
+        menu.close();
     }
 }
 
-/// 点在菜单以外的任何地方都关闭菜单
-fn on_press_anywhere(
-    press: On<Pointer<Press>>,
-    menu_roots: Query<Entity, With<ContextMenuRoot>>,
-    parents: Query<&ChildOf>,
+/// 点在菜单以外的地方就关闭
+///
+/// 只认左键：右键由 [`open_context_menu`] 负责，那里会直接覆盖或关闭。
+fn close_menu_on_outside_click(
+    mouse: Res<ButtonInput<MouseButton>>,
+    items: Query<&Interaction, With<MenuAction>>,
     mut menu: ResMut<ContextMenu>,
 ) {
-    if !menu.open {
+    if !menu.open || !mouse.just_pressed(MouseButton::Left) {
         return;
     }
-    let Ok(root) = menu_roots.single() else {
+    // 有菜单项正被悬停或按下，说明点的是菜单内部，交给菜单项自己处理
+    if items.iter().any(|state| *state != Interaction::None) {
         return;
-    };
-    // 点在菜单自身或其子孙上时不关闭，交给菜单项的处理
-    let in_menu = press.entity == root
-        || parents
-            .iter_ancestors(press.entity)
-            .any(|ancestor| ancestor == root);
-    if !in_menu {
-        menu.close();
     }
+    menu.close();
 }
 
 /// 菜单项：点击后发出操作并关闭菜单
@@ -394,48 +400,42 @@ fn rebuild_context_menu(
     widgets::replace_slot_children(&mut commands, root, items);
 }
 
-/// 菜单项点击
-fn on_menu_item_click(
-    mut click: On<Pointer<Click>>,
-    items: Query<&MenuAction>,
+/// 菜单项被按下：发出操作并关闭菜单
+///
+/// 用 `Interaction` 而不是 `Pointer<Click>`：后者命中的是菜单项里的文字节点，
+/// 标记组件挂在外层，查不到就成了"点了没反应"。`Interaction` 只在挂了它的
+/// 节点（这里是带 `Button` 的菜单项）上更新，没有这个问题。
+fn handle_menu_item_press(
+    items: Query<(&Interaction, &MenuAction), Changed<Interaction>>,
     session: Res<Session>,
     mut menu: ResMut<ContextMenu>,
     mut writer: MessageWriter<AppAction>,
 ) {
-    let Ok(item) = items.get(click.entity) else {
-        return;
-    };
-    click.propagate(false);
-    menu.close();
-    // 忙碌时不下发，行为与旧版的禁用态一致
-    if session.interactive() {
-        writer.write(item.0.clone());
+    for (state, item) in &items {
+        if *state != Interaction::Pressed {
+            continue;
+        }
+        debug!(action = ?item.0, "菜单项被按下");
+        menu.close();
+        // 忙碌时不下发，行为与旧版的禁用态一致
+        if session.interactive() {
+            writer.write(item.0.clone());
+        }
     }
 }
+
+/// 交互状态刚变化的菜单项
+type ChangedMenuItems<'w, 's> =
+    Query<'w, 's, (Entity, &'static Interaction), (Changed<Interaction>, With<MenuAction>)>;
 
 /// 菜单项悬停高亮
-fn on_menu_item_hover(
-    over: On<Pointer<Over>>,
-    items: Query<(), With<MenuAction>>,
-    mut commands: Commands,
-) {
-    if items.get(over.entity).is_ok() {
-        commands
-            .entity(over.entity)
-            .insert(ThemeBackgroundColor(tokens::MENUITEM_BG_HOVER));
-    }
-}
-
-/// 菜单项移出恢复
-fn on_menu_item_out(
-    out: On<Pointer<Out>>,
-    items: Query<(), With<MenuAction>>,
-    mut commands: Commands,
-) {
-    if items.get(out.entity).is_ok() {
-        commands
-            .entity(out.entity)
-            .insert(ThemeBackgroundColor(tokens::MENU_BG));
+fn sync_menu_item_style(items: ChangedMenuItems, mut commands: Commands) {
+    for (entity, state) in &items {
+        let token = match state {
+            Interaction::Hovered | Interaction::Pressed => tokens::MENUITEM_BG_HOVER,
+            Interaction::None => tokens::MENU_BG,
+        };
+        commands.entity(entity).insert(ThemeBackgroundColor(token));
     }
 }
 
@@ -447,11 +447,15 @@ impl Plugin for FileListPlugin {
         app.init_resource::<ContextMenu>()
             .init_resource::<RenderedList>()
             .add_observer(on_row_press)
-            .add_observer(on_blank_press)
-            .add_observer(on_press_anywhere)
-            .add_observer(on_menu_item_click)
-            .add_observer(on_menu_item_hover)
-            .add_observer(on_menu_item_out)
+            .add_systems(
+                Update,
+                (
+                    open_context_menu,
+                    close_menu_on_outside_click,
+                    handle_menu_item_press,
+                )
+                    .in_set(UiSet::Input),
+            )
             .add_systems(
                 Update,
                 (
@@ -460,6 +464,7 @@ impl Plugin for FileListPlugin {
                     sync_list_title,
                     sync_row_selection,
                     rebuild_context_menu,
+                    sync_menu_item_style,
                 )
                     .in_set(UiSet::Rebuild),
             );

@@ -100,8 +100,9 @@ impl Session {
 
     /// 发送请求到后台线程
     pub fn send(&self, request: crate::worker::WorkerRequest) {
-        if let Some(worker) = &self.worker {
-            worker.send(request);
+        match &self.worker {
+            Some(worker) => worker.send(request),
+            None => tracing::warn!("未连接，请求被丢弃"),
         }
     }
 
@@ -212,10 +213,16 @@ impl Editor {
     }
 }
 
-/// 系统集：UI 重建在响应处理之后运行，保证同一帧内看到最新状态
+/// 系统集：一帧内按 采集输入 → 处理 → 重建 的顺序推进
+///
+/// 三段必须分开：产生 `AppAction` 的 system 若排在处理它的 system 之后，
+/// 消息就要等下一帧才被读到——而窗口是 reactive 刷新的，没有新输入时
+/// 下一帧可能是 5 秒之后，表现就是"点了半天没反应"。
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UiSet {
-    /// 处理后台线程响应、输入事件，更新状态资源
+    /// 采集鼠标/键盘输入，产生 `AppAction`
+    Input,
+    /// 处理 `AppAction` 与后台线程响应，更新状态资源
     Update,
     /// 按状态重建/刷新控件树
     Rebuild,
@@ -230,7 +237,10 @@ impl Plugin for EditorUiPlugin {
             .init_resource::<StatusLine>()
             .init_resource::<FileBrowser>()
             .init_resource::<Editor>()
-            .configure_sets(Update, (UiSet::Update, UiSet::Rebuild).chain())
+            .configure_sets(
+                Update,
+                (UiSet::Input, UiSet::Update, UiSet::Rebuild).chain(),
+            )
             .add_plugins((
                 theme::ThemePlugin,
                 widgets::WidgetsPlugin,

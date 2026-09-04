@@ -390,7 +390,10 @@ impl Plugin for ShellPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, shell.spawn()).add_systems(
             Update,
-            (sync_status_bar, sync_current_file, handle_ui_scale).in_set(UiSet::Rebuild),
+            (
+                handle_ui_scale.in_set(UiSet::Input),
+                (sync_status_bar, sync_current_file).in_set(UiSet::Rebuild),
+            ),
         );
     }
 }

@@ -82,10 +82,15 @@ const CHEVRON_CLOSED: &str = "▸";
 /// 点击头部：切换所属折叠区块的展开状态
 fn on_header_click(
     click: On<Pointer<Click>>,
-    headers: Query<&ChildOf, With<CollapseHeader>>,
+    headers: Query<(), With<CollapseHeader>>,
+    parents: Query<&ChildOf>,
     mut sections: Query<&mut Collapsible>,
 ) {
-    let Ok(parent) = headers.get(click.entity) else {
+    // 点中的多半是标题里的文字，往上找到头部那一层
+    let Some(header) = self_or_ancestor(click.entity, &parents, |e| headers.contains(e)) else {
+        return;
+    };
+    let Ok(parent) = parents.get(header) else {
         return;
     };
     if let Ok(mut section) = sections.get_mut(parent.parent()) {
@@ -583,6 +588,21 @@ fn sync_button_gates(
             _ => {}
         }
     }
+}
+
+/// 从命中实体向上找到带标记的那一层
+///
+/// UI 事件命中的往往是最内层的文字节点，而标记组件（`MenuAction`、`FileRow`、
+/// `PoseCard` 之类）挂在外层容器上。直接拿命中实体去查会查不到，
+/// observer 一 return 就成了"点了没反应"。
+pub fn self_or_ancestor(
+    entity: Entity,
+    parents: &Query<&ChildOf>,
+    has_marker: impl Fn(Entity) -> bool,
+) -> Option<Entity> {
+    core::iter::once(entity)
+        .chain(parents.iter_ancestors(entity))
+        .find(|&candidate| has_marker(candidate))
 }
 
 // ============================================================

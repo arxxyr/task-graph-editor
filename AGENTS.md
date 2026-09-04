@@ -130,6 +130,15 @@ Bevy 是保留模式 UI，控件是实体而非每帧重绘的立即模式绘制
   - **`despawn_related` 删不掉排队中的那批**。上一批还没落地时又提交一批，两批都会挂上去，
     表现就是按钮、列表项凭空多出一份。所有插槽重建统一走 `widgets::replace_slot_children`，
     配合 `SlotPending` 保证同一时刻只有一批在飞；跳过时**不要**推进已渲染版本号，下一帧会自动重试
+- **一帧内按 采集输入 → 处理 → 重建 三段推进**（`UiSet::Input/Update/Rebuild`）。
+  产生 `AppAction` 的 system 若排在处理它的 system 之后，消息要等下一帧才被读到；
+  而窗口是 reactive 刷新的，没有新输入时下一帧可能是 5 秒后，表现就是"点了没反应"
+- **点击命中的是最内层节点**：标记组件（`MenuAction`、`FileRow`、`PoseCard`）挂在外层容器上，
+  直接拿 `On<Pointer<_>>` 的实体去查会查不到，observer 一 return 就成了点不动。
+  统一用 `widgets::self_or_ancestor` 从命中处往上找
+- **右键菜单不要走 picking 事件**：改读 `ButtonInput<MouseButton>` 判断右键、
+  用 `Hovered`/`Interaction` 定位目标、`window.cursor_position()` 取位置。
+  `Interaction` 只在挂了它的节点上更新，天然避开"命中子节点"的问题
 - **属性变化不要当重建条件**。按钮的禁用态、选中高亮这类是属性，改组件即可
   （`widgets::ButtonGate` → `InteractionDisabled`）。把它们塞进重建条件会让状态一翻转就重建整块，
   正好撞上上面那个竞态——"点一下刷新列表冒出六个按钮"就是这么来的

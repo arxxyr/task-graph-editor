@@ -81,7 +81,7 @@ pub struct ScreenshotPlugin;
 
 impl Plugin for ScreenshotPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, capture_on_key.in_set(UiSet::Update));
+        app.add_systems(Update, capture_on_key.in_set(UiSet::Input));
 
         if let Ok(path) = std::env::var("TGE_SCREENSHOT") {
             app.insert_resource(AutoCapture {

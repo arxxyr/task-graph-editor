@@ -1036,9 +1036,15 @@ fn on_bool_change(
 fn on_pose_card_click(
     mut click: On<Pointer<Click>>,
     cards: Query<&PoseCard>,
+    parents: Query<&ChildOf>,
     mut writer: MessageWriter<AppAction>,
 ) {
-    let Ok(card) = cards.get(click.entity) else {
+    // 点中的多半是卡片标题或里面的控件，往上找到挂了 PoseCard 的那层
+    let Some(entity) = widgets::self_or_ancestor(click.entity, &parents, |e| cards.contains(e))
+    else {
+        return;
+    };
+    let Ok(card) = cards.get(entity) else {
         return;
     };
     click.propagate(false);
