@@ -216,6 +216,7 @@ fn handle_actions(
         debug!(?action, "处理界面操作");
         match action {
             AppAction::Connect => {
+                status.set("");
                 let port = session.login.port.parse::<u16>().unwrap_or(22);
                 // 每次连接创建新的 worker 线程
                 let worker = WorkerHandle::spawn(make_wake_fn(&proxy));
@@ -228,7 +229,6 @@ fn handle_actions(
                 });
                 session.worker = Some(worker);
                 session.busy = BusyState::Connecting;
-                status.set("正在连接...");
             }
 
             AppAction::Disconnect => {
@@ -253,7 +253,7 @@ fn handle_actions(
 
             AppAction::LoadFile(filename) => {
                 session.busy = BusyState::Loading(filename.clone());
-                status.set(format!("正在加载: {filename}"));
+                status.set("");
                 browser.selected = Some(filename.clone());
                 session.send(WorkerRequest::LoadFile {
                     remote_dir: session.login.remote_dir.clone(),
@@ -262,8 +262,8 @@ fn handle_actions(
             }
 
             AppAction::BackupFile(filename) => {
-                session.busy = BusyState::Saving;
-                status.set(format!("正在备份: {filename}"));
+                session.busy = BusyState::Working(format!("正在备份 {filename}"));
+                status.set("");
                 session.send(WorkerRequest::BackupFile {
                     remote_dir: session.login.remote_dir.clone(),
                     filename: filename.clone(),
@@ -272,8 +272,8 @@ fn handle_actions(
             }
 
             AppAction::DeleteFile(filename) => {
-                session.busy = BusyState::Saving;
-                status.set(format!("正在删除: {filename}"));
+                session.busy = BusyState::Working(format!("正在删除 {filename}"));
+                status.set("");
                 session.send(WorkerRequest::DeleteFile {
                     remote_dir: session.login.remote_dir.clone(),
                     filename: filename.clone(),
@@ -294,8 +294,8 @@ fn handle_actions(
                     .unwrap_or_default();
                 match std::fs::read_to_string(&path) {
                     Ok(content) => {
-                        session.busy = BusyState::Saving;
-                        status.set(format!("正在上传: {filename}"));
+                        session.busy = BusyState::Working(format!("正在上传 {filename}"));
+                        status.set("");
                         session.send(WorkerRequest::UploadFile {
                             remote_dir: session.login.remote_dir.clone(),
                             filename,
@@ -326,8 +326,8 @@ fn handle_actions(
                 let new_name = format!("{}.json", data.task_id);
                 let new_filename = (new_name != current_filename).then_some(new_name);
 
-                session.busy = BusyState::Saving;
-                status.set("正在保存...");
+                session.busy = BusyState::Working("正在保存".into());
+                status.set("");
                 session.send(WorkerRequest::SaveFile {
                     remote_dir: session.login.remote_dir.clone(),
                     current_filename,
@@ -341,7 +341,7 @@ fn handle_actions(
                     continue;
                 };
                 session.busy = BusyState::Fetching("底盘位姿".into());
-                status.set("正在获取底盘位姿...");
+                status.set("");
                 session.pending_command = Some(PendingCommand::ChassisPose { field_path: path });
                 let command = ros_cmd(
                     &session,
@@ -355,7 +355,7 @@ fn handle_actions(
                     continue;
                 };
                 session.busy = BusyState::Fetching("头部关节角".into());
-                status.set("正在获取头部关节角...");
+                status.set("");
                 session.pending_command = Some(PendingCommand::HeadJoints { field_path: path });
                 let command = ros_cmd(&session, "timeout 15 python3 -");
                 session.send(WorkerRequest::ExecCommandWithStdin {
@@ -369,7 +369,7 @@ fn handle_actions(
                     continue;
                 };
                 session.busy = BusyState::Fetching("腰部关节角".into());
-                status.set("正在获取腰部关节角...");
+                status.set("");
                 session.pending_command = Some(PendingCommand::WaistJoints { field_path: path });
                 let command = ros_cmd(&session, "timeout 15 python3 -");
                 session.send(WorkerRequest::ExecCommandWithStdin {

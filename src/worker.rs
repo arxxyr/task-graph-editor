@@ -22,8 +22,10 @@ pub enum BusyState {
     Refreshing,
     /// 正在加载指定文件
     Loading(String),
-    /// 正在保存
-    Saving,
+    /// 正在执行远程写操作，附带动作描述（如"正在备份 a.json"）
+    ///
+    /// 保存、备份、删除、上传共用；只说"正在保存"会让备份和删除看着像保存。
+    Working(String),
     /// 正在获取指定数据（如"底盘位姿"）
     Fetching(String),
 }

@@ -88,7 +88,7 @@ impl Session {
             BusyState::Connecting => "正在连接...".into(),
             BusyState::Refreshing => "正在刷新文件列表...".into(),
             BusyState::Loading(name) => format!("正在加载 {name}..."),
-            BusyState::Saving => "正在保存...".into(),
+            BusyState::Working(what) => format!("{what}..."),
             BusyState::Fetching(what) => format!("正在获取{what}..."),
         }
     }

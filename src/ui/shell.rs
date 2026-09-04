@@ -52,9 +52,9 @@ pub struct CurrentFileText;
 #[derive(Component, Default, Clone)]
 pub struct StatusText;
 
-/// 状态栏右侧的忙碌 / 重连提示
+/// 状态栏右侧的连接目标
 #[derive(Component, Default, Clone)]
-pub struct BusyText;
+pub struct ConnectionTargetText;
 
 /// 右键菜单浮层的根节点
 #[derive(Component, Default, Clone)]
@@ -258,8 +258,8 @@ fn status_bar() -> impl Scene {
             widgets::spacer(),
             (
                 Text("")
-                BusyText
-                ThemeTextColor({theme::STATUS_WARN})
+                ConnectionTargetText
+                ThemeTextColor({theme::READONLY_TEXT})
                 TextFont { font_size: px(12.0) }
             )
         ]
@@ -267,11 +267,15 @@ fn status_bar() -> impl Scene {
 }
 
 /// 状态栏文字与配色跟随状态资源
+///
+/// 左侧永远只显示一条：重连 > 忙碌 > 最近一条结果。三者本来说的就是同一件事的
+/// 不同阶段，各占一边会变成"左下角和右下角都在说正在加载"。
+/// 右侧改放连接目标，忙时也能一眼看出连的是哪台机器。
 fn sync_status_bar(
     status: Res<StatusLine>,
     session: Res<Session>,
     texts: Query<Entity, With<StatusText>>,
-    busy_texts: Query<Entity, With<BusyText>>,
+    targets: Query<Entity, With<ConnectionTargetText>>,
     dots: Query<Entity, With<ConnectionDot>>,
     mut all_text: Query<&mut Text>,
     mut commands: Commands,
@@ -280,11 +284,14 @@ fn sync_status_bar(
         return;
     }
 
-    // 状态消息：文字 + 语义色
-    let token = theme::status_token(status.level());
+    let (message, token) = match (&session.reconnect_status, session.is_busy()) {
+        (Some(reconnect), _) => (reconnect.clone(), theme::STATUS_WARN),
+        (None, true) => (session.busy_text(), theme::STATUS_WARN),
+        (None, false) => (status.text.clone(), theme::status_token(status.level())),
+    };
     for entity in &texts {
         if let Ok(mut text) = all_text.get_mut(entity) {
-            text.0.clone_from(&status.text);
+            text.0.clone_from(&message);
         }
         // ThemeTextColor 是不可变组件，改色要整体替换
         commands
@@ -292,19 +299,19 @@ fn sync_status_bar(
             .insert(ThemeTextColor(token.clone()));
     }
 
-    // 忙碌 / 重连提示：重连优先显示
-    let busy_label = match (&session.reconnect_status, session.is_busy()) {
-        (Some(reconnect), _) => reconnect.clone(),
-        (None, true) => session.busy_text(),
-        (None, false) => String::new(),
+    let target = match session.is_connected {
+        true => format!(
+            "{}@{}:{}",
+            session.login.username, session.login.host, session.login.port
+        ),
+        false => String::new(),
     };
-    for entity in &busy_texts {
+    for entity in &targets {
         if let Ok(mut text) = all_text.get_mut(entity) {
-            text.0.clone_from(&busy_label);
+            text.0.clone_from(&target);
         }
     }
 
-    // 连接指示灯
     let dot_token = connection_dot_token(&session);
     for entity in &dots {
         commands
