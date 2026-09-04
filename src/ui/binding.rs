@@ -364,6 +364,7 @@ mod tests {
                     }]),
                 },
             ],
+            graph: crate::model::SubGraph::default(),
             raw_json: serde_json::json!({}),
         }
     }

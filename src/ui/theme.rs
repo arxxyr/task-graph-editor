@@ -130,6 +130,23 @@ pub const FIELD_LABEL: ThemeToken = ThemeToken::new_static("app.field.label");
 /// 只读值文字
 pub const READONLY_TEXT: ThemeToken = ThemeToken::new_static("app.readonly.text");
 
+// ── 流程图的节点类别色（编码"这一步在做什么"，不是装饰）──
+
+/// 控制流：sequence / parallel / loop / condition / delay
+pub const GRAPH_FLOW: ThemeToken = ThemeToken::new_static("app.graph.flow");
+/// 执行：ros2_action / behavior_tree / 导航 / 检漏
+pub const GRAPH_ACT: ThemeToken = ThemeToken::new_static("app.graph.act");
+/// 数据：赋值、取值、比较
+pub const GRAPH_DATA: ThemeToken = ThemeToken::new_static("app.graph.data");
+/// 日志与通知
+pub const GRAPH_LOG: ThemeToken = ThemeToken::new_static("app.graph.log");
+/// 领域专用节点
+pub const GRAPH_DOMAIN: ThemeToken = ThemeToken::new_static("app.graph.domain");
+/// 循环回边
+pub const GRAPH_BACK: ThemeToken = ThemeToken::new_static("app.graph.back");
+/// checkpoint 标记点
+pub const CHECKPOINT_DOT: ThemeToken = ThemeToken::new_static("app.graph.checkpoint");
+
 // ============================================================
 // 尺寸常量
 // ============================================================
@@ -366,6 +383,14 @@ pub fn create_app_theme() -> UiTheme {
     set(&mut theme, SECTION_TEXT, TEXT);
     set(&mut theme, FIELD_LABEL, TEXT_DIM);
     set(&mut theme, READONLY_TEXT, TEXT_FAINT);
+
+    set(&mut theme, GRAPH_FLOW, Color::oklch(0.680, 0.132, 250.0));
+    set(&mut theme, GRAPH_ACT, Color::oklch(0.720, 0.130, 165.0));
+    set(&mut theme, GRAPH_DATA, Color::oklch(0.760, 0.130, 85.0));
+    set(&mut theme, GRAPH_LOG, Color::oklch(0.620, 0.015, 265.0));
+    set(&mut theme, GRAPH_DOMAIN, Color::oklch(0.700, 0.140, 330.0));
+    set(&mut theme, GRAPH_BACK, Color::oklch(0.660, 0.150, 330.0));
+    set(&mut theme, CHECKPOINT_DOT, HIGHLIGHT);
 
     theme
 }

@@ -40,6 +40,22 @@ pub struct FileListSlot;
 #[derive(Component, Default, Clone)]
 pub struct EditorSlot;
 
+/// 参数编辑视图的外层容器（与流程图视图互斥显示）
+#[derive(Component, Default, Clone)]
+pub struct ParamsPane;
+
+/// 流程图视图的外层容器
+#[derive(Component, Default, Clone)]
+pub struct GraphPane;
+
+/// 流程图内容插槽
+#[derive(Component, Default, Clone)]
+pub struct GraphSlot;
+
+/// 顶栏的视图切换按钮插槽
+#[derive(Component, Default, Clone)]
+pub struct ViewSwitchSlot;
+
 /// 顶栏的连接状态指示灯
 #[derive(Component, Default, Clone)]
 pub struct ConnectionDot;
@@ -150,6 +166,15 @@ fn app_bar() -> impl Scene {
                 Node {
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::Center,
+                    column_gap: px(4),
+                    margin: {UiRect::right(px(4.0))},
+                }
+                ViewSwitchSlot
+            ),
+            (
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
                     column_gap: px(6),
                 }
                 ActionBarSlot
@@ -216,20 +241,42 @@ fn content() -> impl Scene {
             flex_grow: 1.0,
             height: percent(100),
             flex_direction: FlexDirection::Column,
-            row_gap: px(10),
-            padding: {UiRect::all(px(theme::PAD + 2.0))},
-            overflow: {Overflow::scroll_y()},
+            min_width: px(0),
         }
-        ScrollArea
         ThemeBackgroundColor({theme::CONTENT_BG})
-        Children [(
-            Node {
-                width: percent(100),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(10),
-            }
-            EditorSlot
-        )]
+        Children [
+            (
+                Node {
+                    width: percent(100),
+                    height: percent(100),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(10),
+                    padding: {UiRect::all(px(theme::PAD + 2.0))},
+                    overflow: {Overflow::scroll_y()},
+                }
+                ScrollArea
+                ParamsPane
+                Children [(
+                    Node {
+                        width: percent(100),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(10),
+                    }
+                    EditorSlot
+                )]
+            ),
+            (
+                Node {
+                    display: {Display::None},
+                    width: percent(100),
+                    height: percent(100),
+                    flex_direction: FlexDirection::Column,
+                    min_height: px(0),
+                }
+                GraphPane
+                GraphSlot
+            )
+        ]
     }
 }
 

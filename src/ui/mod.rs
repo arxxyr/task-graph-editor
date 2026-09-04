@@ -15,6 +15,8 @@ pub mod connect;
 pub mod editor;
 pub mod files;
 pub mod fonts;
+pub mod graph_layout;
+pub mod graph_view;
 pub mod password;
 pub mod screenshot;
 pub mod shell;
@@ -252,6 +254,7 @@ impl Plugin for EditorUiPlugin {
                 connect::ConnectPanelPlugin,
                 files::FileListPlugin,
                 editor::EditorPanelPlugin,
+                graph_view::GraphViewPlugin,
             ));
     }
 }

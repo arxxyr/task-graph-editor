@@ -122,6 +122,85 @@ pub struct ContextField {
     pub value: ContextValue,
 }
 
+/// 任务图中的一个节点
+///
+/// 只读：本工具编辑的是 context 参数，流程本身由机器人端定义。
+/// 序列化时 `config.nodes` / `config.edges` 原样从 `raw_json` 带回去。
+#[derive(Debug, Clone)]
+pub struct TaskNode {
+    /// 节点 id，同层内唯一
+    pub id: String,
+    /// 节点类型，如 `sequence`、`ros2_action`、`condition`
+    pub node_type: String,
+    /// 输入参数，原样保留用于展示
+    pub inputs: serde_json::Value,
+    /// 是否为断点续跑的检查点
+    pub checkpoint: bool,
+    /// 复合节点的子图（`sequence`、`loop`、`parallel` 等会有）
+    pub children: Option<SubGraph>,
+}
+
+/// 一层图：节点加它们之间的连接
+#[derive(Debug, Clone, Default)]
+pub struct SubGraph {
+    /// 本层节点
+    pub nodes: Vec<TaskNode>,
+    /// 本层的边，端点可能是虚拟的 `_entry` / `_exit`
+    pub edges: Vec<GraphEdge>,
+}
+
+/// 一条有向边
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEdge {
+    /// 起点节点 id
+    pub from: String,
+    /// 终点节点 id
+    pub to: String,
+}
+
+/// 虚拟入口节点的 id
+pub const ENTRY_ID: &str = "_entry";
+
+/// 虚拟出口节点的 id
+pub const EXIT_ID: &str = "_exit";
+
+impl SubGraph {
+    /// 按 id 找节点
+    pub fn node(&self, id: &str) -> Option<&TaskNode> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// 递归统计节点总数
+    pub fn total_nodes(&self) -> usize {
+        self.nodes.len()
+            + self
+                .nodes
+                .iter()
+                .filter_map(|n| n.children.as_ref())
+                .map(SubGraph::total_nodes)
+                .sum::<usize>()
+    }
+
+    /// 递归求最大嵌套深度（本层为 1）
+    pub fn depth(&self) -> usize {
+        1 + self
+            .nodes
+            .iter()
+            .filter_map(|n| n.children.as_ref())
+            .map(SubGraph::depth)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 沿 id 路径逐层下钻
+    pub fn subgraph_at(&self, path: &[String]) -> Option<&SubGraph> {
+        let Some((first, rest)) = path.split_first() else {
+            return Some(self);
+        };
+        self.node(first)?.children.as_ref()?.subgraph_at(rest)
+    }
+}
+
 /// GUI 编辑用的任务图数据
 #[derive(Debug, Clone)]
 pub struct TaskGraphData {
@@ -129,6 +208,8 @@ pub struct TaskGraphData {
     pub task_id: String,
     /// 所有 context 字段（按 key 排序）
     pub context_fields: Vec<ContextField>,
+    /// 任务流程图（只读展示）
+    pub graph: SubGraph,
     /// 原始 JSON（用于合并回写时保留未编辑字段）
     pub raw_json: serde_json::Value,
 }
@@ -252,6 +333,53 @@ fn classify_context_value(key: &str, value: &serde_json::Value) -> ContextValue 
 // 解析与序列化
 // ============================================================
 
+/// 解析一层图的节点与边
+fn parse_subgraph(container: &serde_json::Value) -> SubGraph {
+    let nodes = container
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(parse_node).collect())
+        .unwrap_or_default();
+    let edges = container
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    Some(GraphEdge {
+                        from: e.get("from")?.as_str()?.to_string(),
+                        to: e.get("to")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SubGraph { nodes, edges }
+}
+
+/// 解析单个节点；没有 id 的条目直接跳过
+fn parse_node(value: &serde_json::Value) -> Option<TaskNode> {
+    let id = value.get("id")?.as_str()?.to_string();
+    let children = value.get("nodes").is_some().then(|| parse_subgraph(value));
+    Some(TaskNode {
+        id,
+        node_type: value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        inputs: value
+            .get("inputs")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        checkpoint: value
+            .get("checkpoint")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        children,
+    })
+}
+
 /// 从 JSON 字符串解析任务图数据
 ///
 /// 提取 map_id、task_id，并遍历 config.context 中所有字段，
@@ -288,10 +416,13 @@ pub fn parse_task_graph(json_str: &str) -> Result<TaskGraphData, ParseError> {
         }
     }
 
+    let graph = raw.get("config").map(parse_subgraph).unwrap_or_default();
+
     Ok(TaskGraphData {
         map_id,
         task_id,
         context_fields,
+        graph,
         raw_json: raw,
     })
 }
