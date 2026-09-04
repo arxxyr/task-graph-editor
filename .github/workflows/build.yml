@@ -50,8 +50,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libssl-dev pkg-config \
-            libxkbcommon-dev libgl1-mesa-dev \
-            libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+            libxkbcommon-dev libgl1-mesa-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -75,8 +75,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libssl-dev pkg-config \
-            libxkbcommon-dev libgl1-mesa-dev \
-            libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+            libxkbcommon-dev libgl1-mesa-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -161,8 +161,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libssl-dev pkg-config \
-            libxkbcommon-dev libgl1-mesa-dev \
-            libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+            libxkbcommon-dev libgl1-mesa-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
       # macOS 系统依赖（vendored OpenSSL 仍需 pkg-config）
       - name: Install macOS dependencies

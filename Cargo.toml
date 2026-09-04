@@ -1,17 +1,52 @@
 [package]
 name = "task-graph-editor"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.33.3"
+# Bevy：按需挑选 feature，不用现成的 "ui" 组合
+# —— 后者会连带 bevy_gilrs（手柄，Linux 上要 libudev-dev）、sysinfo_plugin、webgl2，
+# 本工具都用不到。去掉后 Linux CI 不再需要额外系统依赖，产物也更小。
+bevy = { version = "0.19.1", default-features = false, features = [
+    # 平台与窗口
+    "std",
+    "bevy_winit",
+    "x11",
+    "wayland",
+    "custom_cursor",
+    "multi_threaded",
+    "bevy_clipboard",
+    "system_clipboard",  # 文本框的复制/粘贴
+    "default_font",
+    # 核心框架
+    "async_executor",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_state",
+    "reflect_auto_register",
+    # UI 与场景
+    "ui_api",
+    "ui_bevy_render",
+    "scene",            # BSN（bsn! 宏、Scene/SceneList）
+    "picking",
+    "bevy_ui_widgets",
+    "bevy_feathers",    # Feathers 控件集
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ssh2 = "0.9"
 thiserror = "2"
 mimalloc = { version = "0.1", default-features = false }
-rfd = "0.17.2"
+rfd = "0.17"
 chrono = "0.4"
+
+# 仅为开启 icu_provider 的 logging feature，本项目不直接使用它：
+# 该 feature 关闭时，icu_provider 把 log::warn! 别名成 std::eprintln!
+# （见其 lib.rs 的 cfg(not(feature = "logging")) 分支），直接写 stderr。
+# parley 的分段器不加载 CJK 词典，中文界面每次文本布局都会触发一条警告，
+# debug 构建下会刷屏且绕过 Bevy 的日志过滤器。开启后归入 log 门面，
+# 由 LogPlugin 的 filter 统一屏蔽（见 main.rs）。
+icu_provider = { version = "2.1", features = ["logging"] }
 
 # vendored OpenSSL（ssh2 依赖链需要，全平台免安装）
 [dependencies.openssl]
@@ -23,3 +58,11 @@ strip = true
 lto = true
 codegen-units = 1
 opt-level = "z"
+
+# 依赖用 opt-level 3 编译：Bevy 在 opt-level="z" 下渲染与布局性能损失明显
+[profile.release.package."*"]
+opt-level = 3
+
+# Bevy 官方推荐：dev 下把依赖优化到 3，冷启动与交互流畅度差别巨大
+[profile.dev.package."*"]
+opt-level = 3

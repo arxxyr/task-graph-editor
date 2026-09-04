@@ -25,7 +25,7 @@ variables:
       - target/
     policy: pull-push
 
-# 基础镜像配置（含 egui/eframe 系统依赖）
+# 基础镜像配置（含 Bevy 的窗口/图形系统依赖）
 .rust-base: &rust-base
   image: rust:latest
   before_script:
@@ -33,8 +33,8 @@ variables:
     - rustup component add rustfmt clippy
     - apt-get update && apt-get install -y
         libssl-dev pkg-config
-        libxkbcommon-dev libgl1-mesa-dev
-        libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+        libx11-dev libxcursor-dev libxrandr-dev libxi-dev
     - rustc --version && cargo --version
 
 # 版本号计算脚本（各 job 复用）
@@ -91,8 +91,8 @@ build:linux-x64:
     - rustup default ${RUST_TOOLCHAIN}
     - apt-get update && apt-get install -y
         libssl-dev pkg-config
-        libxkbcommon-dev libgl1-mesa-dev
-        libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+        libx11-dev libxcursor-dev libxrandr-dev libxi-dev
         upx-ucl
     - rustc --version && cargo --version
   script:

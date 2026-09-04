@@ -1,11 +1,16 @@
 //! 后台工作线程 — 所有 SSH/SFTP 操作在此线程执行，不阻塞 UI
 
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui;
-
 use crate::ssh::{AuthMethod, SshConfig, SshConnection};
+
+/// UI 唤醒回调：后台线程产生响应后调用，通知 UI 层尽快处理
+///
+/// 与 GUI 框架解耦——Bevy 侧传入 winit 的 `EventLoopProxy` 唤醒，
+/// 测试等无窗口场景可传空闭包。
+pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
 
 /// UI 忙碌状态
 pub enum BusyState {
@@ -134,25 +139,28 @@ pub enum WorkerResponse {
 }
 
 /// App 持有的句柄，用于与后台线程通信
+///
+/// `Receiver` 本身不是 `Sync`，而 Bevy 的 `Resource` 要求 `Send + Sync`，
+/// 故用 `Mutex` 包一层；接收只发生在 UI 线程，锁没有竞争。
 pub struct WorkerHandle {
     tx: mpsc::Sender<WorkerRequest>,
-    rx: mpsc::Receiver<WorkerResponse>,
+    rx: Mutex<mpsc::Receiver<WorkerResponse>>,
 }
 
 impl WorkerHandle {
     /// 启动后台工作线程，返回通信句柄
-    pub fn spawn(ctx: egui::Context) -> Self {
+    pub fn spawn(wake: WakeFn) -> Self {
         let (req_tx, req_rx) = mpsc::channel::<WorkerRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<WorkerResponse>();
 
         std::thread::Builder::new()
             .name("ssh-worker".into())
-            .spawn(move || worker_loop(req_rx, resp_tx, ctx))
+            .spawn(move || worker_loop(req_rx, resp_tx, wake))
             .expect("启动后台工作线程失败");
 
         Self {
             tx: req_tx,
-            rx: resp_rx,
+            rx: Mutex::new(resp_rx),
         }
     }
 
@@ -162,9 +170,9 @@ impl WorkerHandle {
         let _ = self.tx.send(request);
     }
 
-    /// 非阻塞接收一个响应（update() 中调用）
+    /// 非阻塞接收一个响应（UI 轮询时调用）
     pub fn try_recv(&self) -> Option<WorkerResponse> {
-        self.rx.try_recv().ok()
+        self.rx.lock().ok()?.try_recv().ok()
     }
 }
 
@@ -219,21 +227,17 @@ fn read_ros_domain_id(conn: &SshConnection) -> Option<String> {
 /// 1. **已连接**：处理请求，空闲时发送 keepalive 心跳
 /// 2. **重连中**：指数退避自动重连，期间仍响应 Disconnect 等请求
 /// 3. **未连接**：阻塞等待 Connect 请求
-fn worker_loop(
-    rx: mpsc::Receiver<WorkerRequest>,
-    tx: mpsc::Sender<WorkerResponse>,
-    ctx: egui::Context,
-) {
+fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResponse>, wake: WakeFn) {
     let mut connection: Option<SshConnection> = None;
     // 保存连接参数，用于自动重连时重建连接
     let mut connect_params: Option<(SshConfig, String)> = None;
     let mut reconnect: Option<ReconnectState> = None;
 
-    /// 发送响应并请求 UI 重绘
+    /// 发送响应并唤醒 UI
     macro_rules! respond {
         ($resp:expr) => {
             let _ = tx.send($resp);
-            ctx.request_repaint();
+            (wake)();
         };
     }
 
