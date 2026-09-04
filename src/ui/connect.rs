@@ -125,6 +125,7 @@ fn host_row(host: &str) -> impl Scene {
                     width: px(76),
                     flex_shrink: 0.0,
                     align_items: AlignItems::Center,
+                    overflow: {Overflow::clip()},
                 }
                 Children [(
                     Text("主机")

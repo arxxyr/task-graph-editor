@@ -156,8 +156,34 @@ fn action_bar(has_data: bool, connected: bool) -> Vec<BoxedScene> {
             ActionButton(action),
         )));
     }
-    items.push(boxed(widgets::hint("位姿相关按钮需先在下方选中一个点位")));
+    // 提示只在没选中位姿时露出，显隐由 sync_pose_hint 控制——
+    // 选中与否是属性，塞进重建条件会让整条操作栏跟着重建
+    items.push(boxed(bsn! {
+        Node { display: {Display::None} }
+        PoseHintText
+        Children [(widgets::hint("← 位姿相关按钮需先在下方选中一个点位"))]
+    }));
     items
+}
+
+/// 顶栏那句"需先选中位姿"的提示
+#[derive(Component, Clone, Default)]
+struct PoseHintText;
+
+/// 选中位姿后收起提示，取消选中再露出来
+fn sync_pose_hint(editor: Res<Editor>, mut hints: Query<&mut Node, With<PoseHintText>>) {
+    if !editor.is_changed() {
+        return;
+    }
+    let display = match editor.has_pose_selection() {
+        true => Display::None,
+        false => Display::Flex,
+    };
+    for mut node in &mut hints {
+        if node.display != display {
+            node.display = display;
+        }
+    }
 }
 
 // ============================================================
@@ -1037,6 +1063,7 @@ impl Plugin for EditorPanelPlugin {
                     rebuild_editor,
                     rebuild_action_bar,
                     sync_pose_selection,
+                    sync_pose_hint,
                     fill_lazy_bodies,
                     push_initial_values,
                     push_refreshed_values,

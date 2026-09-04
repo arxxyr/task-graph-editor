@@ -12,10 +12,16 @@ use bevy::feathers::theme::{
 };
 use bevy::feathers::tokens;
 use bevy::prelude::*;
-use bevy::text::{EditableText, FontWeight};
+use bevy::text::{EditableText, FontWeight, LineBreak};
 use bevy::ui::{Checked, InteractionDisabled};
 
 use super::theme;
+
+/// 表单行的标签列宽（连接面板，中文短标签）
+const FORM_LABEL_WIDTH: f32 = 76.0;
+
+/// 字段行的标签列宽（context 字段名，常见 20~30 个字符的标识符）
+const FIELD_LABEL_WIDTH: f32 = 190.0;
 
 /// 装箱后的场景
 ///
@@ -296,14 +302,16 @@ pub fn form_row(label: impl Into<String>, control: impl Scene) -> impl Scene {
         Children [
             (
                 Node {
-                    width: px(76),
+                    width: {px(FORM_LABEL_WIDTH)},
                     flex_shrink: 0.0,
                     align_items: AlignItems::Center,
+                    overflow: {Overflow::clip()},
                 }
                 Children [(
                     Text({label.into()})
                     ThemeTextColor({theme::FIELD_LABEL})
                     TextFont { font_size: px(12.0) }
+                    TextLayout { linebreak: {LineBreak::AnyCharacter} }
                 )]
             ),
             (control)
@@ -324,14 +332,18 @@ pub fn field_row(label: impl Into<String>, control: impl Scene) -> impl Scene {
         Children [
             (
                 Node {
-                    width: px(120),
+                    width: {px(FIELD_LABEL_WIDTH)},
                     flex_shrink: 0.0,
                     align_items: AlignItems::Center,
+                    overflow: {Overflow::clip()},
                 }
                 Children [(
                     Text({label.into()})
                     ThemeTextColor({theme::FIELD_LABEL})
                     TextFont { font_size: px(12.0) }
+                    // context 字段名是不含空格的标识符，按词换行等于不换行，
+                    // min-content 会顶破标签列宽把文字压到控件上；允许逐字符断行
+                    TextLayout { linebreak: {LineBreak::AnyCharacter} }
                 )]
             ),
             (control)
