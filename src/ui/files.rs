@@ -145,12 +145,17 @@ fn rebuild_file_rows(
     browser: Res<FileBrowser>,
     mut rendered: ResMut<RenderedList>,
     slots: Query<Entity, With<FileRowsSlot>>,
+    pending: Query<(), With<widgets::SlotPending>>,
     mut commands: Commands,
 ) {
     let Ok(slot) = slots.single() else {
         return;
     };
     if rendered.files == Some(browser.list_version) {
+        return;
+    }
+    // 上一批还没落地就等着，不推进版本号，下一帧自动重试
+    if pending.contains(slot) {
         return;
     }
     debug!(
@@ -177,10 +182,7 @@ fn rebuild_file_rows(
     };
     rows.push(boxed(file_list_blank()));
 
-    commands
-        .entity(slot)
-        .despawn_related::<Children>()
-        .queue_spawn_related_scenes::<Children>(rows);
+    widgets::replace_slot_children(&mut commands, slot, rows);
 }
 
 /// 卡片标题里的计数跟随文件数
@@ -389,10 +391,7 @@ fn rebuild_context_menu(
         ))],
     };
 
-    commands
-        .entity(root)
-        .despawn_related::<Children>()
-        .queue_spawn_related_scenes::<Children>(items);
+    widgets::replace_slot_children(&mut commands, root, items);
 }
 
 /// 菜单项点击

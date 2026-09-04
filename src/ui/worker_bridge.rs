@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 
 use crate::model::{self, ContextValue, RobotPose};
-use crate::ssh::AuthMethod;
+use crate::ssh::{AuthMethod, DirListing};
 use crate::ssh_config;
 use crate::worker::{BusyState, WakeFn, WorkerHandle, WorkerRequest, WorkerResponse};
 
@@ -416,24 +416,51 @@ fn handle_actions(
 fn apply_file_list(
     browser: &mut FileBrowser,
     status: &mut StatusLine,
-    result: Result<Vec<String>, String>,
+    result: Result<DirListing, String>,
 ) {
     match result {
-        Ok(files) => {
-            let empty = files.is_empty();
-            browser.set_files(files);
+        Ok(listing) => {
             debug!(
-                count = browser.files.len(),
-                version = browser.list_version,
+                dir = %listing.resolved_dir,
+                json = listing.json_files.len(),
+                entries = listing.total_entries,
                 "文件列表已更新"
             );
-            if empty {
-                status.set("远程目录下无 JSON 文件");
+            if listing.json_files.is_empty() {
+                status.set(empty_dir_hint(&listing));
             }
+            browser.set_files(listing.json_files);
         }
         Err(e) => {
             warn!(error = %e, "获取文件列表失败");
             status.set(format!("获取文件列表失败: {e}"));
+        }
+    }
+}
+
+/// 目录里没有 JSON 时给出可操作的提示
+///
+/// 光说"无 JSON 文件"看不出是路径写错、目录为空、还是文件在下一层，
+/// 所以把实际扫描的绝对路径和子目录一并说清楚。
+fn empty_dir_hint(listing: &DirListing) -> String {
+    let dir = &listing.resolved_dir;
+    match (listing.total_entries, listing.subdirs.as_slice()) {
+        (0, _) => format!("注意：{dir} 是空目录"),
+        (_, []) => format!(
+            "注意：{dir} 下无 JSON 文件（共 {} 个条目）",
+            listing.total_entries
+        ),
+        (_, subdirs) => {
+            // 子目录可能很多，只列前几个够提示就行
+            let shown: Vec<&str> = subdirs.iter().take(5).map(String::as_str).collect();
+            let more = match subdirs.len() > shown.len() {
+                true => format!(" 等 {} 个", subdirs.len()),
+                false => String::new(),
+            };
+            format!(
+                "注意：{dir} 下无 JSON 文件，但有子目录 {}{more}——要找的是不是在下一层？",
+                shown.join("、")
+            )
         }
     }
 }

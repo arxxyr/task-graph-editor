@@ -505,27 +505,109 @@ pub fn checkbox(checked: bool, marker: impl Marker) -> impl Scene {
 
 /// 按钮
 pub fn button(label: impl Into<String>, variant: ButtonVariant, marker: impl Marker) -> impl Scene {
-    button_enabled(label, variant, true, marker)
+    button_gated(label, variant, ButtonGate::Always, marker)
 }
 
-/// 按钮，可指定是否可用
+/// 按钮的可用条件
 ///
-/// 禁用时挂 `InteractionDisabled`：Feathers 会切到灰显样式并拦掉交互，
-/// 与旧版 `add_enabled(false, ..)` 的观感一致。
-pub fn button_enabled(
+/// 禁用态是**属性**变化，不能拿它当重建条件——忙碌状态一翻转就重建整组按钮，
+/// 会撞上场景排队落地的竞态，凭空多出一份。这里只挂条件，由
+/// [`sync_button_gates`] 增删 `InteractionDisabled`。
+#[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ButtonGate {
+    /// 始终可用
+    #[default]
+    Always,
+    /// 空闲时可用（忙碌则灰显）
+    WhenIdle,
+    /// 空闲且已选中位姿时可用
+    WhenIdleAndPose,
+}
+
+/// 按钮，带可用条件
+pub fn button_gated(
     label: impl Into<String>,
     variant: ButtonVariant,
-    enabled: bool,
+    gate: ButtonGate,
     marker: impl Marker,
 ) -> impl Scene {
-    let disabled = (!enabled).then(|| template_value(InteractionDisabled));
     bsn! {
         @FeathersButton {
             @caption: {bsn! { Text({label.into()}) ThemedText }},
             @variant: variant
         }
         template_value(marker)
-        {disabled}
+        template_value(gate)
+    }
+}
+
+/// 按可用条件增删 `InteractionDisabled`
+///
+/// Feathers 见到该组件会切灰显样式并拦掉交互，与旧版 `add_enabled(false, ..)` 一致。
+fn sync_button_gates(
+    session: Res<super::Session>,
+    editor: Res<super::Editor>,
+    buttons: Query<(Entity, &ButtonGate, Has<InteractionDisabled>)>,
+    mut commands: Commands,
+) {
+    if !session.is_changed() && !editor.is_changed() {
+        return;
+    }
+    let idle = !session.is_busy();
+    let has_pose = editor.has_pose_selection();
+    for (entity, gate, disabled) in &buttons {
+        let enabled = match gate {
+            ButtonGate::Always => true,
+            ButtonGate::WhenIdle => idle,
+            ButtonGate::WhenIdleAndPose => idle && has_pose,
+        };
+        match (enabled, disabled) {
+            (true, true) => {
+                commands.entity(entity).remove::<InteractionDisabled>();
+            }
+            (false, false) => {
+                commands.entity(entity).insert(InteractionDisabled);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ============================================================
+// 插槽内容替换
+// ============================================================
+
+/// 插槽有一批内容正在等待 spawn
+///
+/// BSN 场景要等 asset 依赖加载完才落地，`queue_spawn_related_scenes` 因此可能跨帧。
+/// 其间若再提交一批，`despawn_related` 只能删掉已挂上的子节点，删不掉排队中的那批，
+/// 结果两批都挂上去——表现就是按钮、列表项凭空多出一份。
+#[derive(Component)]
+pub struct SlotPending;
+
+/// 把插槽的子节点整体换成新内容
+///
+/// 保证同一时刻只有一批在飞：调用方先用 [`slot_is_pending`] 判断，
+/// 上一批没落地就跳过本次重建（并且不要推进"已渲染版本号"，下一帧会自动重试）。
+pub fn replace_slot_children(commands: &mut Commands, slot: Entity, scenes: Vec<BoxedScene>) {
+    let mut entity = commands.entity(slot);
+    entity.despawn_related::<Children>();
+    // 空内容不会产生 Children 变化，挂上标记就没人来摘了
+    if scenes.is_empty() {
+        return;
+    }
+    entity
+        .insert(SlotPending)
+        .queue_spawn_related_scenes::<Children>(scenes);
+}
+
+/// 内容落地后摘掉等待标记
+fn clear_slot_pending(
+    slots: Query<Entity, (With<SlotPending>, Changed<Children>)>,
+    mut commands: Commands,
+) {
+    for slot in &slots {
+        commands.entity(slot).remove::<SlotPending>();
     }
 }
 
@@ -534,7 +616,9 @@ pub struct WidgetsPlugin;
 
 impl Plugin for WidgetsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(on_header_click)
-            .add_systems(Update, sync_collapse_state);
+        app.add_observer(on_header_click).add_systems(
+            Update,
+            (sync_collapse_state, clear_slot_pending, sync_button_gates),
+        );
     }
 }

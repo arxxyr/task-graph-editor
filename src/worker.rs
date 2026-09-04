@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::ssh::{AuthMethod, SshConfig, SshConnection};
+use crate::ssh::{AuthMethod, DirListing, SshConfig, SshConnection};
 
 /// UI 唤醒回调：后台线程产生响应后调用，通知 UI 层尽快处理
 ///
@@ -82,14 +82,14 @@ pub enum WorkerResponse {
     /// 连接成功（文件列表可能单独失败，如远程目录写错）
     Connected {
         ros_domain_id: Option<String>,
-        file_list: Result<Vec<String>, String>,
+        file_list: Result<DirListing, String>,
     },
     /// 连接失败
     ConnectFailed(String),
     /// 已断开
     Disconnected,
     /// 文件列表
-    FileList(Result<Vec<String>, String>),
+    FileList(Result<DirListing, String>),
     /// 文件内容加载完成
     FileLoaded {
         filename: String,
@@ -99,7 +99,7 @@ pub enum WorkerResponse {
     FileSaved {
         old_filename: String,
         new_filename: Option<String>,
-        file_list: Result<Vec<String>, String>,
+        file_list: Result<DirListing, String>,
     },
     /// 保存失败
     SaveFailed(String),
@@ -107,21 +107,21 @@ pub enum WorkerResponse {
     BackupDone {
         original: String,
         backup_name: String,
-        file_list: Result<Vec<String>, String>,
+        file_list: Result<DirListing, String>,
     },
     /// 备份失败
     BackupFailed(String),
     /// 删除完成
     FileDeleted {
         filename: String,
-        file_list: Result<Vec<String>, String>,
+        file_list: Result<DirListing, String>,
     },
     /// 删除失败
     DeleteFailed(String),
     /// 上传完成
     FileUploaded {
         filename: String,
-        file_list: Result<Vec<String>, String>,
+        file_list: Result<DirListing, String>,
     },
     /// 上传失败
     UploadFailed(String),
@@ -134,7 +134,7 @@ pub enum WorkerResponse {
     /// 自动重连成功（文件列表可能单独失败）
     Reconnected {
         ros_domain_id: Option<String>,
-        file_list: Result<Vec<String>, String>,
+        file_list: Result<DirListing, String>,
     },
 }
 
@@ -218,11 +218,16 @@ impl ReconnectState {
 /// 连接流程不因列不出文件而中止（连接本身是成功的），但错误必须留痕——
 /// 早先这里是 `unwrap_or_default()`，目录写错时界面只显示"已连接"、
 /// 列表空空如也且没有任何提示。
-fn list_files_logged(conn: &SshConnection, remote_dir: &str) -> Result<Vec<String>, String> {
+fn list_files_logged(conn: &SshConnection, remote_dir: &str) -> Result<DirListing, String> {
     match conn.list_json_files(remote_dir) {
-        Ok(files) => {
-            tracing::info!(dir = %remote_dir, count = files.len(), "已获取文件列表");
-            Ok(files)
+        Ok(listing) => {
+            tracing::info!(
+                dir = %listing.resolved_dir,
+                json = listing.json_files.len(),
+                entries = listing.total_entries,
+                "已获取文件列表"
+            );
+            Ok(listing)
         }
         Err(e) => {
             tracing::warn!(dir = %remote_dir, error = %e, "获取文件列表失败");
@@ -380,7 +385,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                     respond!(WorkerResponse::FileList(Err("未连接".into())));
                     continue;
                 };
-                let result = conn.list_json_files(&remote_dir).map_err(|e| e.to_string());
+                let result = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileList(result));
             }
 
@@ -431,7 +436,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 }
 
                 // 刷新文件列表
-                let file_list = conn.list_json_files(&remote_dir).map_err(|e| e.to_string());
+                let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileSaved {
                     old_filename: current_filename,
                     new_filename,
@@ -488,7 +493,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 }
 
                 // 刷新文件列表
-                let file_list = conn.list_json_files(&remote_dir).map_err(|e| e.to_string());
+                let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::BackupDone {
                     original: filename,
                     backup_name,
@@ -512,7 +517,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 }
 
                 // 刷新文件列表
-                let file_list = conn.list_json_files(&remote_dir).map_err(|e| e.to_string());
+                let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileDeleted {
                     filename,
                     file_list,
@@ -536,7 +541,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 }
 
                 // 刷新文件列表
-                let file_list = conn.list_json_files(&remote_dir).map_err(|e| e.to_string());
+                let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileUploaded {
                     filename,
                     file_list,

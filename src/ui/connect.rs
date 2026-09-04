@@ -18,7 +18,7 @@ use crate::ssh_config::SshHostEntry;
 use super::password::PasswordInput;
 use super::shell::ConnectSlot;
 use super::theme;
-use super::widgets::{self, BoxedScene, boxed};
+use super::widgets::{self, BoxedScene, ButtonGate, boxed};
 use super::worker_bridge::AppAction;
 use super::{Session, UiSet};
 
@@ -58,8 +58,8 @@ struct RenderedVersions {
     hosts: Option<u64>,
     /// 已刷回输入框的表单版本
     form: Option<u64>,
-    /// 已渲染的按钮状态（已连接、重连中、忙碌）
-    buttons: Option<(bool, bool, bool)>,
+    /// 已渲染的按钮状态（已连接、重连中）
+    buttons: Option<(bool, bool)>,
 }
 
 /// 构建连接面板
@@ -234,48 +234,43 @@ fn host_menu_item(index: usize, entry: &SshHostEntry) -> impl Scene {
 }
 
 /// 连接 / 断开 / 刷新 / 上传按钮组
-fn connect_buttons(connected: bool, reconnecting: bool, busy: bool) -> Vec<BoxedScene> {
-    // 重连中只保留断开；已连接给出全套远程操作；未连接只有连接按钮
-    let idle = !busy;
+///
+/// 只按"连接状态"决定按钮有哪些；忙碌与否是属性，交给 [`ButtonGate`]。
+fn connect_buttons(connected: bool, reconnecting: bool) -> Vec<BoxedScene> {
     match (connected, reconnecting) {
         (true, _) => vec![
-            boxed(widgets::button_enabled(
+            boxed(widgets::button_gated(
                 "断开",
                 ButtonVariant::Normal,
-                idle,
+                ButtonGate::WhenIdle,
                 ActionButton(AppAction::Disconnect),
             )),
-            boxed(widgets::button_enabled(
+            boxed(widgets::button_gated(
                 "刷新列表",
                 ButtonVariant::Normal,
-                idle,
+                ButtonGate::WhenIdle,
                 ActionButton(AppAction::RefreshFiles),
             )),
-            boxed(widgets::button_enabled(
+            boxed(widgets::button_gated(
                 "上传文件",
                 ButtonVariant::Normal,
-                idle,
+                ButtonGate::WhenIdle,
                 ActionButton(AppAction::UploadFile),
             )),
         ],
         // 重连过程中「断开」始终可用，否则无法中止自动重连
-        (false, true) => vec![boxed(widgets::button(
+        (false, true) => vec![boxed(widgets::button_gated(
             "断开",
             ButtonVariant::Normal,
+            ButtonGate::Always,
             ActionButton(AppAction::Disconnect),
         ))],
-        (false, false) => {
-            let label = match busy {
-                true => "连接中...",
-                false => "连接",
-            };
-            vec![boxed(widgets::button_enabled(
-                label,
-                ButtonVariant::Primary,
-                idle,
-                ActionButton(AppAction::Connect),
-            ))]
-        }
+        (false, false) => vec![boxed(widgets::button_gated(
+            "连接",
+            ButtonVariant::Primary,
+            ButtonGate::WhenIdle,
+            ActionButton(AppAction::Connect),
+        ))],
     }
 }
 
@@ -318,24 +313,22 @@ fn rebuild_buttons(
     session: Res<Session>,
     mut rendered: ResMut<RenderedVersions>,
     slots: Query<Entity, With<ConnectButtonsSlot>>,
+    pending: Query<(), With<widgets::SlotPending>>,
     mut commands: Commands,
 ) {
-    let state = (
-        session.is_connected,
-        session.reconnect_status.is_some(),
-        session.is_busy(),
-    );
+    let state = (session.is_connected, session.reconnect_status.is_some());
     if rendered.buttons == Some(state) {
         return;
     }
     let Ok(slot) = slots.single() else {
         return;
     };
+    // 上一批还没落地就先等着，不要推进版本号，下一帧自动重试
+    if pending.contains(slot) {
+        return;
+    }
     rendered.buttons = Some(state);
-    commands
-        .entity(slot)
-        .despawn_related::<Children>()
-        .queue_spawn_related_scenes::<Children>(connect_buttons(state.0, state.1, state.2));
+    widgets::replace_slot_children(&mut commands, slot, connect_buttons(state.0, state.1));
 }
 
 /// ssh config 重新解析后重建菜单项
@@ -343,6 +336,7 @@ fn rebuild_host_menu(
     session: Res<Session>,
     mut rendered: ResMut<RenderedVersions>,
     slots: Query<Entity, With<HostMenuSlot>>,
+    pending: Query<(), With<widgets::SlotPending>>,
     mut commands: Commands,
 ) {
     if rendered.hosts == Some(session.hosts_version) {
@@ -351,6 +345,9 @@ fn rebuild_host_menu(
     let Ok(slot) = slots.single() else {
         return;
     };
+    if pending.contains(slot) {
+        return;
+    }
     rendered.hosts = Some(session.hosts_version);
 
     let items: Vec<BoxedScene> = match session.ssh_hosts.is_empty() {
@@ -366,10 +363,7 @@ fn rebuild_host_menu(
             .collect(),
     };
 
-    commands
-        .entity(slot)
-        .despawn_related::<Children>()
-        .queue_spawn_related_scenes::<Children>(items);
+    widgets::replace_slot_children(&mut commands, slot, items);
 }
 
 /// 文本框内容 → 会话表单

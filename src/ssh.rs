@@ -123,6 +123,22 @@ fn expand_home(path: &str, home: Option<&str>) -> String {
     }
 }
 
+/// 一次目录扫描的结果
+///
+/// 只返回文件名列表的话，"没找到文件"就分不清是路径写错、目录为空、
+/// 还是 JSON 在子目录里。把这些线索一并带回来，界面才能给出可操作的提示。
+#[derive(Debug, Clone, Default)]
+pub struct DirListing {
+    /// 展开 `~` 之后实际扫描的路径
+    pub resolved_dir: String,
+    /// 目录下的 `.json` 文件名（已排序）
+    pub json_files: Vec<String>,
+    /// 目录下的条目总数，含非 JSON 文件与子目录
+    pub total_entries: usize,
+    /// 子目录名（已排序），用于提示"是不是要找的在下一层"
+    pub subdirs: Vec<String>,
+}
+
 /// 封装 SSH 会话，提供文件操作接口
 pub struct SshConnection {
     session: Session,
@@ -193,8 +209,8 @@ impl SshConnection {
         Ok(self.session.keepalive_send()?)
     }
 
-    /// 列出远程目录下所有 .json 文件名
-    pub fn list_json_files(&self, dir: &str) -> Result<Vec<String>, SshError> {
+    /// 扫描远程目录，列出 `.json` 文件并附带排查线索
+    pub fn list_json_files(&self, dir: &str) -> Result<DirListing, SshError> {
         let resolved = self.resolve_path(dir);
         tracing::debug!(input = dir, resolved = %resolved, "SFTP readdir");
         let sftp = self.session.sftp()?;
@@ -203,21 +219,35 @@ impl SshConnection {
             e
         })?;
 
-        let mut files: Vec<String> = entries
-            .into_iter()
-            .filter_map(|(path, _stat)| {
-                let name = path.file_name()?.to_string_lossy().into_owned();
-                if name.ends_with(".json") {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let total_entries = entries.len();
+        let mut json_files = Vec::new();
+        let mut subdirs = Vec::new();
+        for (path, stat) in entries {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            match (stat.is_dir(), name.ends_with(".json")) {
+                (true, _) => subdirs.push(name),
+                (false, true) => json_files.push(name),
+                (false, false) => {}
+            }
+        }
+        json_files.sort();
+        subdirs.sort();
 
-        files.sort();
-        tracing::debug!(dir = %resolved, count = files.len(), "远程 JSON 文件");
-        Ok(files)
+        tracing::debug!(
+            dir = %resolved,
+            json = json_files.len(),
+            entries = total_entries,
+            subdirs = subdirs.len(),
+            "远程目录扫描完成"
+        );
+        Ok(DirListing {
+            resolved_dir: resolved,
+            json_files,
+            total_entries,
+            subdirs,
+        })
     }
 
     /// 读取远程文件内容

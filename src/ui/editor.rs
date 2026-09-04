@@ -28,7 +28,9 @@ use super::binding::{
 use super::connect::ActionButton;
 use super::shell::{ActionBarSlot, EditorSlot};
 use super::theme;
-use super::widgets::{self, BoxedScene, Collapsible, NumberFieldInit, NumberInitValue, boxed};
+use super::widgets::{
+    self, BoxedScene, ButtonGate, Collapsible, NumberFieldInit, NumberInitValue, boxed,
+};
 use super::worker_bridge::AppAction;
 use super::{Editor, Session, UiSet};
 
@@ -94,8 +96,8 @@ struct RenderedEditor {
     structure: Option<u64>,
     /// 已渲染的数值版本
     values: u64,
-    /// 已渲染的操作栏状态（有数据、已连接、忙碌、选中位姿）
-    action_bar: Option<(bool, bool, bool, bool)>,
+    /// 已渲染的操作栏状态（有数据、已连接）
+    action_bar: Option<(bool, bool)>,
     /// 已渲染的选中路径
     selection: Option<Vec<usize>>,
 }
@@ -125,38 +127,36 @@ fn axis_of(comp: PoseComp) -> Option<(ThemeToken, &'static str)> {
 // ============================================================
 
 /// 远程操作按钮组
-fn action_bar(has_data: bool, connected: bool, busy: bool, has_pose: bool) -> Vec<BoxedScene> {
+///
+/// 只按"有没有数据、连没连上"决定按钮存不存在；忙碌与选中位姿是属性，交给
+/// [`ButtonGate`]，否则每次忙碌翻转都重建一次，会撞上场景排队落地的竞态。
+fn action_bar(has_data: bool, connected: bool) -> Vec<BoxedScene> {
     if !has_data || !connected {
         return Vec::new();
     }
 
-    let idle = !busy;
-    let mut items: Vec<BoxedScene> = vec![boxed(widgets::button_enabled(
+    let mut items: Vec<BoxedScene> = vec![boxed(widgets::button_gated(
         "应用到远程文件",
         ButtonVariant::Primary,
-        idle,
+        ButtonGate::WhenIdle,
         ActionButton(AppAction::SaveToRemote),
     ))];
 
     // 三个 ROS2 取数按钮还要求先选中一个位姿点位
-    let can_fetch = idle && has_pose;
     let fetches = [
         ("获取底盘位姿", AppAction::FetchChassisPose),
         ("获取头部关节", AppAction::FetchHeadJoints),
         ("获取腰部关节", AppAction::FetchWaistJoints),
     ];
     for (label, action) in fetches {
-        items.push(boxed(widgets::button_enabled(
+        items.push(boxed(widgets::button_gated(
             label,
             ButtonVariant::Normal,
-            can_fetch,
+            ButtonGate::WhenIdleAndPose,
             ActionButton(action),
         )));
     }
-
-    if !has_pose {
-        items.push(boxed(widgets::hint("← 需先选中一个位姿点位")));
-    }
+    items.push(boxed(widgets::hint("位姿相关按钮需先在下方选中一个点位")));
     items
 }
 
@@ -773,12 +773,16 @@ fn rebuild_editor(
     editor: Res<Editor>,
     mut rendered: ResMut<RenderedEditor>,
     slots: Query<Entity, With<EditorSlot>>,
+    pending: Query<(), With<widgets::SlotPending>>,
     mut commands: Commands,
 ) {
     let Ok(slot) = slots.single() else {
         return;
     };
     if rendered.structure == Some(editor.structure_version) {
+        return;
+    }
+    if pending.contains(slot) {
         return;
     }
     debug!(
@@ -812,10 +816,7 @@ fn rebuild_editor(
         })],
     };
 
-    commands
-        .entity(slot)
-        .despawn_related::<Children>()
-        .queue_spawn_related_scenes::<Children>(content);
+    widgets::replace_slot_children(&mut commands, slot, content);
 }
 
 /// 操作栏按状态重建
@@ -824,25 +825,21 @@ fn rebuild_action_bar(
     session: Res<Session>,
     mut rendered: ResMut<RenderedEditor>,
     slots: Query<Entity, With<ActionBarSlot>>,
+    pending: Query<(), With<widgets::SlotPending>>,
     mut commands: Commands,
 ) {
-    let state = (
-        editor.data.is_some(),
-        session.is_connected,
-        session.is_busy(),
-        editor.has_pose_selection(),
-    );
+    let state = (editor.data.is_some(), session.is_connected);
     if rendered.action_bar == Some(state) {
         return;
     }
     let Ok(slot) = slots.single() else {
         return;
     };
+    if pending.contains(slot) {
+        return;
+    }
     rendered.action_bar = Some(state);
-    commands
-        .entity(slot)
-        .despawn_related::<Children>()
-        .queue_spawn_related_scenes::<Children>(action_bar(state.0, state.1, state.2, state.3));
+    widgets::replace_slot_children(&mut commands, slot, action_bar(state.0, state.1));
 }
 
 /// 选中位姿变化：只换配色，不重建控件
