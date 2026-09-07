@@ -136,17 +136,17 @@ src/
 推送 `v*` 标签自动触发 CI 构建和发布：
 
 ```bash
-git tag v0.9.0
-git push origin v0.9.0
+git tag v0.8.1
+git push origin v0.8.1
 ```
 
 产物格式：
 
 | 平台 | 文件名 |
 |------|--------|
-| Linux x64 | `task-graph-editor-v0.9.0+{commit}-linux-x64.tar.gz` |
-| macOS ARM64 | `task-graph-editor-v0.9.0+{commit}-macos-arm64.zip`（应用包） |
-| Windows x64 | `task-graph-editor-v0.9.0+{commit}-windows-x64.zip` |
+| Linux x64 | `task-graph-editor-v0.8.1+{commit}-linux-x64.tar.gz` |
+| macOS ARM64 | `task-graph-editor-v0.8.1+{commit}-macos-arm64.zip`（应用包） |
+| Windows x64 | `task-graph-editor-v0.8.1+{commit}-windows-x64.zip` |
 
 ## 许可证
 
