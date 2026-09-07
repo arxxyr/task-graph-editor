@@ -37,7 +37,8 @@ serde = { version = "1", features = ["derive"] }
 # （实测 0.9216510910864573 会被解析成 ...572），位姿坐标读一遍再存回去就变了。
 # 开启后用精确算法解析，保证 bit-for-bit 往返
 serde_json = { version = "1", features = ["float_roundtrip"] }
-ssh2 = "0.9"
+# 通过 ssh2 自带的 feature 启用内置 OpenSSL，避免额外声明未直接使用的 openssl 依赖。
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 # ssh-agent 的可取消 Unix I/O，以及 libssh2 自定义签名回调的 C 分配器边界。
 libc = "0.2.189"
 thiserror = "2"
@@ -55,11 +56,6 @@ tracing = "0.1"
 # debug 构建下会刷屏且绕过 Bevy 的日志过滤器。开启后归入 log 门面，
 # 由 LogPlugin 的 filter 统一屏蔽（见 main.rs）。
 icu_provider = { version = "2.1", features = ["logging"] }
-
-# vendored OpenSSL（ssh2 依赖链需要，全平台免安装）
-[dependencies.openssl]
-version = "0.10"
-features = ["vendored"]
 
 # Windows ssh-agent：Pageant 有界消息调用与 OpenSSH 管道的可取消 Overlapped I/O。
 [target.'cfg(windows)'.dependencies]
