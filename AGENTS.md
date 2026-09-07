@@ -106,7 +106,8 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
     （字符串化的 `"[0.01,0.17]"` 与原生 JSON 数组），`stringified` 记住原样，
     序列化按原形式写回，否则会悄悄改掉远程文件的数据格式
   - `JointTrajectory` — 原生 JSON 数组（positions + time_from_start）
-  - `PoseArray` — 原生位姿数组
+  - `PoseArray` — 原生数组，元素支持位姿对象或字符串化位姿（如 `pick_poses`）。
+    保存按原始元素各自的形式回写，未编辑的字符串逐字保留，编辑元素仍保留未知扩展字段
   - `NestedGroup` — 原生 JSON 对象，成员递归分类（如 `station_profiles.station_1.*`），支持任意层级嵌套
   - `Text` / `Null` / `RawJson` — 其他
 - 未改的数组元素保留整数/浮点类型；字符串化数组修改后的整数仍写整数格式，原生数组的
@@ -118,6 +119,9 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
   （实测 `0.9216510910864573` 会被读成 `...572`），位姿坐标读一遍存回去就变了
 - 解析覆盖率可用 `TGE_ANALYZE=<文件> cargo test 分析 -- --ignored --nocapture` 检查，
   会列出未能识别的字段并输出往返结果供比对
+- 真实字符串位姿数组可用 `TASK_GRAPH_REAL_FILE=<本地副本> TGE_POSE_ARRAY_FIELD=pick_poses
+  cargo test 真实文件位姿数组解析与绑定往返 -- --ignored --nocapture` 核验：逐项比对全部分量的
+  f64 精度，并通过 UI 数值绑定逐个修改、往返解析，只操作内存副本，不回写原文件
 - `config.nodes` / `config.edges` 另外解析成 `SubGraph`/`TaskNode` 供流程图展示，
   纯增量、不参与序列化（见 [流程图视图](#流程图视图)）
 - 修改 `task_id` 后远程文件自动重命名为 `{task_id}.json`，拒绝路径分隔符与同名覆盖

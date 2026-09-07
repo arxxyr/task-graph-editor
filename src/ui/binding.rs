@@ -544,6 +544,123 @@ mod tests {
         assert_eq!(poses[0].waist_pose.position.y, 1.25);
     }
 
+    /// 逐分量核验实际编辑入口；所有写入只发生在内存副本中。
+    fn 核验字符串位姿数组绑定(content: &str, key: &str) -> usize {
+        use crate::model::{parse_task_graph, serialize_task_graph};
+        use serde_json::{Value, json};
+
+        let original: Value = serde_json::from_str(content).unwrap();
+        let data = parse_task_graph(content).unwrap();
+        let field_index = data
+            .context_fields
+            .iter()
+            .position(|f| f.key == key)
+            .unwrap();
+        let ContextValue::PoseArray(poses) = &data.context_fields[field_index].value else {
+            panic!("{key} 必须识别成可编辑的位姿数组");
+        };
+        let raw = original["config"]["context"][key].as_array().unwrap();
+        assert!(!raw.is_empty());
+        assert_eq!(poses.len(), raw.len());
+        let unchanged: Value = serde_json::from_str(&serialize_task_graph(&data).unwrap()).unwrap();
+        assert_eq!(
+            unchanged, original,
+            "未编辑时整份文件及内层字符串必须保持原样"
+        );
+
+        let parts = [
+            (PosePart::Chassis, "chassis_pose"),
+            (PosePart::Head, "head_pose"),
+            (PosePart::Waist, "waist_pose"),
+        ];
+        let components = [
+            (PoseComp::PosX, "position", "x"),
+            (PoseComp::PosY, "position", "y"),
+            (PoseComp::PosZ, "position", "z"),
+            (PoseComp::OriW, "orientation", "w"),
+            (PoseComp::OriX, "orientation", "x"),
+            (PoseComp::OriY, "orientation", "y"),
+            (PoseComp::OriZ, "orientation", "z"),
+        ];
+        let mut checked = 0;
+        for (index, raw_pose) in raw.iter().enumerate() {
+            let source: Value = serde_json::from_str(raw_pose.as_str().unwrap()).unwrap();
+            for (part, part_key) in parts {
+                for (comp, group_key, comp_key) in components {
+                    let binding = ValueBinding::new(
+                        vec![field_index],
+                        ValueSlot::PoseArray(index, part, comp),
+                    );
+                    let expected = source[part_key][group_key][comp_key].as_f64().unwrap();
+                    assert_eq!(
+                        read_f64(&data, &binding).unwrap().to_bits(),
+                        expected.to_bits()
+                    );
+
+                    let replacement = match expected == 0.125 {
+                        true => 0.375,
+                        false => 0.125,
+                    };
+                    let mut edited = data.clone();
+                    assert!(apply_f64(&mut edited, &binding, replacement));
+                    let output = serialize_task_graph(&edited).unwrap();
+                    let reparsed = parse_task_graph(&output).unwrap();
+                    assert_eq!(read_f64(&reparsed, &binding), Some(replacement));
+
+                    let mut saved: Value = serde_json::from_str(&output).unwrap();
+                    let saved_pose = &mut saved["config"]["context"][key][index];
+                    let decoded: Value =
+                        serde_json::from_str(saved_pose.as_str().unwrap()).unwrap();
+                    let mut expected_pose = source.clone();
+                    expected_pose[part_key][group_key][comp_key] = json!(replacement);
+                    assert_eq!(
+                        decoded, expected_pose,
+                        "编辑一个分量不能改变其他分量或扩展字段"
+                    );
+                    *saved_pose = raw_pose.clone();
+                    assert_eq!(
+                        saved, original,
+                        "其他元素、context 字段和流程图必须原样保留"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        checked
+    }
+
+    #[test]
+    fn 字符串位姿数组通过数值绑定编辑后保留原格式() {
+        use serde_json::json;
+
+        let mut pose = serde_json::to_value(RobotPose::default()).unwrap();
+        pose["chassis_pose"]["position"]["x"] = json!(0.9216510910864573);
+        pose["chassis_pose"]["position"]["accuracy"] = json!(0.01);
+        pose["vendor"] = json!({"frame": "map"});
+        let content = json!({
+            "map_id": "m", "task_id": "t",
+            "config": {"context": {
+                "pick_poses": [pose.to_string(), serde_json::to_string_pretty(&pose).unwrap()],
+                "enabled": false
+            }, "nodes": [{"id": "保留流程"}]}
+        })
+        .to_string();
+        assert_eq!(核验字符串位姿数组绑定(&content, "pick_poses"), 42);
+    }
+
+    #[test]
+    #[ignore = "需设置 TASK_GRAPH_REAL_FILE，可用 TGE_POSE_ARRAY_FIELD 指定位姿数组字段"]
+    fn 真实文件位姿数组解析与绑定往返() {
+        let path = std::env::var("TASK_GRAPH_REAL_FILE").expect("需要 TASK_GRAPH_REAL_FILE");
+        let key = std::env::var("TGE_POSE_ARRAY_FIELD").unwrap_or_else(|_| "pick_poses".into());
+        let content = std::fs::read_to_string(path).expect("读取真实文件失败");
+        let checked = 核验字符串位姿数组绑定(&content, &key);
+        println!(
+            "{key}：{} 个位姿、{checked} 个分量解析和独立编辑往返通过",
+            checked / 21
+        );
+    }
+
     #[test]
     fn 嵌套分组下钻写回() {
         let mut data = sample_data();

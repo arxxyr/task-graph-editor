@@ -100,7 +100,9 @@ pub enum ContextValue {
     },
     /// 关节轨迹（原生 JSON 数组，每个元素含 positions 和 time_from_start）
     JointTrajectory(Vec<TrajectoryPoint>),
-    /// 位姿数组（原生 JSON 数组，可以为空）
+    /// 位姿数组（原生 JSON 数组，元素可为位姿对象或字符串化位姿，可以为空）
+    ///
+    /// 每个元素的原始形式由 raw_json 保留，编辑时逐项合并，不改变其他元素的字符串原文。
     PoseArray(Vec<RobotPose>),
     /// 嵌套分组（原生 JSON 对象，成员递归分类，如 station_profiles.station_1.*）
     NestedGroup(Vec<ContextField>),
@@ -226,9 +228,10 @@ pub enum ParseError {
 // Context 值类型识别
 // ============================================================
 
+const MAX_EXACT_INTEGER: u64 = 1_u64 << 53;
+
 /// f64 控件只编辑能精确表示的整数；超出安全范围的整块结构保留原始 JSON。
 fn numbers_are_lossless(value: &serde_json::Value) -> bool {
-    const MAX_EXACT_INTEGER: u64 = 1_u64 << 53;
     match value {
         serde_json::Value::Number(number) => match (number.as_i64(), number.as_u64()) {
             (Some(integer), _) => integer.unsigned_abs() <= MAX_EXACT_INTEGER,
@@ -239,6 +242,83 @@ fn numbers_are_lossless(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(fields) => fields.values().all(numbers_are_lossless),
         _ => true,
     }
+}
+
+/// 检查已通过 JSON 语法解析的原文，防止超出 u64 的整数字面量先被 Value 降为 f64。
+/// 带小数点或指数的浮点字面量仍按 f64 编辑；字符串内容（包括转义引号）不参与数字检查。
+fn json_integer_literals_are_lossless(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index += 2,
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    index += 1;
+                }
+                let number = &text[start..index];
+                if !number.contains(['.', 'e', 'E'])
+                    && !number
+                        .parse::<i64>()
+                        .is_ok_and(|value| value.unsigned_abs() <= MAX_EXACT_INTEGER)
+                {
+                    return false;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    true
+}
+
+/// serde 也接受按字段顺序排列的数组形式；编辑字符串位姿前必须确认已知结构均为具名对象。
+fn pose_uses_named_objects(value: &serde_json::Value) -> bool {
+    value.is_object()
+        && ["chassis_pose", "head_pose", "waist_pose"]
+            .into_iter()
+            .all(|part| {
+                value.get(part).is_some_and(|pose| {
+                    pose.is_object()
+                        && ["position", "orientation"]
+                            .into_iter()
+                            .all(|key| pose.get(key).is_some_and(serde_json::Value::is_object))
+                })
+            })
+}
+
+/// 位姿数组允许逐元素混用对象和字符串；任意一项失败都必须让整个数组回退只读。
+fn parse_pose_array_element(value: &serde_json::Value) -> Option<RobotPose> {
+    let decoded = match value {
+        serde_json::Value::String(text) => {
+            let decoded = serde_json::from_str::<serde_json::Value>(text).ok()?;
+            if !pose_uses_named_objects(&decoded) || !json_integer_literals_are_lossless(text) {
+                return None;
+            }
+            decoded
+        }
+        serde_json::Value::Object(_) => value.clone(),
+        _ => return None,
+    };
+    if !numbers_are_lossless(&decoded) {
+        return None;
+    }
+    serde_json::from_value(decoded).ok()
 }
 
 /// 分类字符串类型的 context 值
@@ -294,8 +374,8 @@ fn classify_array_value(
     if let Ok(traj) = serde_json::from_value::<Vec<TrajectoryPoint>>(value.clone()) {
         return ContextValue::JointTrajectory(traj);
     }
-    // 尝试解析为位姿数组
-    if let Ok(poses) = serde_json::from_value::<Vec<RobotPose>>(value.clone()) {
+    // 必须收集全部合法元素，不能过滤坏字符串或不完整位姿后悄悄缩短数组。
+    if let Some(poses) = arr.iter().map(parse_pose_array_element).collect() {
         return ContextValue::PoseArray(poses);
     }
     // 原生 JSON 数值数组（不是字符串化的），如偏移配置 [[0.0,0.05,0.25],...]
@@ -643,6 +723,41 @@ impl Serialize for OrderedPoseJson<'_> {
     }
 }
 
+/// 按原始数组索引合并位姿，保持每一项原有的对象/字符串形式。
+fn merge_pose_array(
+    original: &[serde_json::Value],
+    before: &[RobotPose],
+    after: &[RobotPose],
+) -> Result<serde_json::Value, serde_json::Error> {
+    let values = after
+        .iter()
+        .enumerate()
+        .map(|(index, pose)| {
+            let (Some(raw), Some(old)) = (original.get(index), before.get(index)) else {
+                return serde_json::to_value(pose);
+            };
+            if old == pose {
+                return Ok(raw.clone());
+            }
+            let old = serde_json::to_value(old)?;
+            let new = serde_json::to_value(pose)?;
+            match raw {
+                serde_json::Value::String(text) => {
+                    let decoded = serde_json::from_str(text)?;
+                    let merged = merge_edited_json(&decoded, &old, &new);
+                    serde_json::to_string(&OrderedPoseJson {
+                        value: &merged,
+                        kind: PoseJsonKind::Robot,
+                    })
+                    .map(serde_json::Value::String)
+                }
+                _ => Ok(merge_edited_json(raw, &old, &new)),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(serde_json::Value::Array(values))
+}
+
 fn merge_context_value(
     key: &str,
     value: &ContextValue,
@@ -667,6 +782,11 @@ fn merge_context_value(
     // 类型切换（如 null 转位姿）没有同形的旧模型，直接序列化新值。
     if std::mem::discriminant(&before) != std::mem::discriminant(value) {
         return serialize_context_value(value);
+    }
+    if let (ContextValue::PoseArray(old), ContextValue::PoseArray(new), Some(raw)) =
+        (&before, value, original.as_array())
+    {
+        return merge_pose_array(raw, old, new);
     }
     let old = serialize_context_value(&before)?;
     let new = serialize_context_value(value)?;
@@ -1800,6 +1920,255 @@ mod 保存完整性测试 {
             .find(|field| field.key == key)
             .unwrap()
             .value
+    }
+
+    fn pose_array_fixture() -> Value {
+        let mut pose = serde_json::to_value(RobotPose::default()).unwrap();
+        pose["chassis_pose"]["position"]["x"] = json!(1);
+        pose["chassis_pose"]["position"]["y"] = json!(2.0);
+        pose["chassis_pose"]["orientation"]["w"] = json!(1);
+        pose["chassis_pose"]["frame_id"] = json!("map");
+        pose["chassis_pose"]["position"]["accuracy"] = json!(0.01);
+        pose["chassis_pose"]["orientation"]["source"] = json!("calibrated");
+        pose["vendor"] = json!({"mode": "precise", "revision": 7});
+        pose
+    }
+
+    #[test]
+    fn 位姿数组识别全字符串全对象及混合元素() {
+        let pose = pose_array_fixture();
+        let text = format!(" \n{}\n ", serde_json::to_string_pretty(&pose).unwrap());
+        for values in [
+            json!([text, text, text]),
+            json!([pose, pose]),
+            json!([text, pose, text]),
+        ] {
+            let data = document(json!({"pick_poses": values}));
+            let ContextValue::PoseArray(poses) = &data.context_fields[0].value else {
+                panic!("全部合法的位姿必须进入数组编辑器")
+            };
+            assert_eq!(poses.len(), values.as_array().unwrap().len());
+            assert!(poses.iter().all(|pose| pose.chassis_pose.position.x == 1.0));
+        }
+    }
+
+    #[test]
+    fn 位姿数组无编辑及修改无关字段保留所有字符串原文() {
+        let pose = pose_array_fixture();
+        let pretty = format!("\n{}\n", serde_json::to_string_pretty(&pose).unwrap());
+        let context = json!({"pick_poses": [pretty, pose.to_string(), pose], "enabled": false});
+        let mut data = document(context.clone());
+        assert_eq!(saved_context(&data), context);
+        *field_mut(&mut data, "enabled") = ContextValue::Bool(true);
+        let out = saved_context(&data);
+        assert_eq!(out["pick_poses"], context["pick_poses"]);
+        assert_eq!(out["enabled"], true);
+    }
+
+    #[test]
+    fn 修改字符串位姿只合并该元素叶子并保持数字类型与成员顺序() {
+        let raw = pose_array_fixture();
+        let pretty = format!(" \n{}\n ", serde_json::to_string_pretty(&raw).unwrap());
+        let context = json!({"pick_poses": [pretty, raw.to_string(), raw]});
+        let mut data = document(context.clone());
+        let ContextValue::PoseArray(poses) = field_mut(&mut data, "pick_poses") else {
+            panic!("未识别位姿数组")
+        };
+        poses[0].chassis_pose.position.x = 8.0;
+        poses[0].chassis_pose.position.y = 9.0;
+        let out = saved_context(&data);
+        assert_eq!(out["pick_poses"][1], context["pick_poses"][1]);
+        assert_eq!(out["pick_poses"][2], context["pick_poses"][2]);
+        let text = out["pick_poses"][0].as_str().unwrap();
+        for part in ["chassis_pose", "head_pose", "waist_pose"] {
+            assert!(text.contains(&format!("\"{part}\":{{\"position\":")));
+        }
+        assert!(text.contains("\"orientation\":{\"w\":1,\"x\":0.0,\"y\":0.0,\"z\":0.0"));
+        let edited: Value = serde_json::from_str(text).unwrap();
+        let mut expected = raw;
+        expected["chassis_pose"]["position"]["x"] = json!(8);
+        expected["chassis_pose"]["position"]["y"] = json!(9.0);
+        assert_eq!(edited, expected);
+        assert!(edited["chassis_pose"]["position"]["x"].is_i64());
+        assert!(edited["chassis_pose"]["position"]["y"].is_f64());
+        assert!(edited["chassis_pose"]["orientation"]["w"].is_i64());
+    }
+
+    #[test]
+    fn 混合位姿数组修改对象元素保持对象形式及其他字符串原文() {
+        let raw = pose_array_fixture();
+        let pretty = format!("\n{}\n", serde_json::to_string_pretty(&raw).unwrap());
+        let context = json!({"pick_poses": [pretty, raw, raw.to_string()]});
+        let mut data = document(context.clone());
+        let ContextValue::PoseArray(poses) = field_mut(&mut data, "pick_poses") else {
+            panic!("未识别位姿数组")
+        };
+        poses[1].chassis_pose.position.x = 3.5;
+        let out = saved_context(&data);
+        let mut expected = context;
+        expected["pick_poses"][1]["chassis_pose"]["position"]["x"] = json!(3.5);
+        assert_eq!(out, expected);
+        assert!(out["pick_poses"][1].is_object());
+    }
+
+    #[test]
+    fn 位姿数组任意坏元素都整体回退而不丢失元素() {
+        let raw = pose_array_fixture();
+        let mut incomplete = raw.clone();
+        incomplete.as_object_mut().unwrap().remove("waist_pose");
+        let invalid_values = [
+            json!("{broken"),
+            json!(incomplete.to_string()),
+            incomplete,
+            Value::Null,
+            json!(true),
+            json!(42),
+            json!("42"),
+            json!(serde_json::to_string(&raw.to_string()).unwrap()),
+            json!(raw.to_string().replace("\"x\":1", "\"x\":1e400")),
+        ];
+        for invalid in invalid_values {
+            let context = json!({"pick_poses": [raw.to_string(), invalid, raw]});
+            let data = document(context.clone());
+            assert!(matches!(
+                data.context_fields[0].value,
+                ContextValue::RawJson(_)
+            ));
+            assert_eq!(saved_context(&data), context);
+        }
+    }
+
+    #[test]
+    fn 字符串位姿已知结构使用数组时整体回退并保留原文() {
+        let raw = pose_array_fixture();
+        let mut invalid_values = vec![json!([
+            [[1, 2, 3], [1, 0, 0, 0]],
+            [[4, 5, 6], [1, 0, 0, 0]],
+            [[7, 8, 9], [1, 0, 0, 0]],
+        ])];
+        for part in ["chassis_pose", "head_pose", "waist_pose"] {
+            let mut part_array = raw.clone();
+            part_array[part] = json!([raw[part]["position"], raw[part]["orientation"]]);
+            invalid_values.push(part_array);
+            let mut position_array = raw.clone();
+            position_array[part]["position"] = json!([1, 2, 3]);
+            invalid_values.push(position_array);
+            let mut orientation_array = raw.clone();
+            orientation_array[part]["orientation"] = json!([1, 0, 0, 0]);
+            invalid_values.push(orientation_array);
+        }
+        for invalid in invalid_values {
+            // 这些数组可以被 serde 转为结构体，但写回对象会改变原始 JSON 的结构。
+            assert!(serde_json::from_value::<RobotPose>(invalid.clone()).is_ok());
+            let text = format!(" \n{}\n ", serde_json::to_string_pretty(&invalid).unwrap());
+            let context = json!({"pick_poses": [raw.to_string(), text, raw], "enabled": false});
+            let mut data = document(context.clone());
+            assert!(matches!(
+                field_mut(&mut data, "pick_poses"),
+                ContextValue::RawJson(_)
+            ));
+            assert_eq!(saved_context(&data), context);
+            *field_mut(&mut data, "enabled") = ContextValue::Bool(true);
+            assert_eq!(saved_context(&data)["pick_poses"], context["pick_poses"]);
+        }
+    }
+
+    #[test]
+    fn 字符串位姿内已知和扩展成员的大整数都阻止浮点编辑() {
+        for literal in [
+            "9007199254740993",
+            "-9007199254740993",
+            "9223372036854775807",
+            "18446744073709551615",
+            "18446744073709551617",
+            "-18446744073709551617",
+        ] {
+            for extension in [false, true] {
+                let mut raw = pose_array_fixture();
+                match extension {
+                    true => raw["vendor"]["revision"] = json!("INTEGER_LITERAL"),
+                    false => raw["chassis_pose"]["position"]["x"] = json!("INTEGER_LITERAL"),
+                }
+                let text = raw.to_string().replace("\"INTEGER_LITERAL\"", literal);
+                let context = json!({"pick_poses": [pose_array_fixture(), text]});
+                let data = document(context.clone());
+                assert!(
+                    matches!(data.context_fields[0].value, ContextValue::RawJson(_)),
+                    "必须保留原始整数：{literal}，扩展成员：{extension}"
+                );
+                assert_eq!(saved_context(&data), context);
+            }
+        }
+    }
+
+    #[test]
+    fn 字符串位姿支持安全整数边界及完整浮点精度() {
+        let numbers = [
+            json!(MAX_EXACT_INTEGER),
+            json!(-(MAX_EXACT_INTEGER as i64)),
+            json!(f64::MAX),
+            json!(f64::MIN),
+            json!(f64::MIN_POSITIVE),
+            json!(f64::from_bits(1)),
+            json!(0.9216510910864573),
+            json!(-0.0),
+        ];
+        let values: Vec<_> = numbers
+            .iter()
+            .map(|number| {
+                let mut raw = pose_array_fixture();
+                raw["chassis_pose"]["position"]["x"] = number.clone();
+                raw["vendor"]["note"] = json!("中文转义引号：\"18446744073709551617\"，反斜杠：\\");
+                raw.to_string()
+            })
+            .collect();
+        let mut data = document(json!({"pick_poses": values}));
+        let ContextValue::PoseArray(poses) = field_mut(&mut data, "pick_poses") else {
+            panic!("可精确表示的位姿应保持可编辑")
+        };
+        for (pose, number) in poses.iter_mut().zip(&numbers) {
+            assert_eq!(
+                pose.chassis_pose.position.x.to_bits(),
+                number.as_f64().unwrap().to_bits()
+            );
+            pose.head_pose.position.y = 17.25;
+        }
+        let out = saved_context(&data);
+        for (index, number) in numbers.iter().enumerate() {
+            let edited: Value =
+                serde_json::from_str(out["pick_poses"][index].as_str().unwrap()).unwrap();
+            let original: Value = serde_json::from_str(&values[index]).unwrap();
+            assert_eq!(edited["chassis_pose"]["position"]["x"], *number);
+            assert_eq!(
+                edited["chassis_pose"]["position"]["x"]
+                    .as_f64()
+                    .unwrap()
+                    .to_bits(),
+                number.as_f64().unwrap().to_bits()
+            );
+            assert_eq!(edited["vendor"], original["vendor"]);
+            assert_eq!(edited["head_pose"]["position"]["y"], json!(17.25));
+        }
+    }
+
+    #[test]
+    fn 嵌套分组中的字符串位姿数组按原始元素形式回写() {
+        let raw = pose_array_fixture();
+        let text = format!("\n{}\n", serde_json::to_string_pretty(&raw).unwrap());
+        let mut data = document(json!({"group": {"pick_poses": [text]}}));
+        let ContextValue::NestedGroup(fields) = field_mut(&mut data, "group") else {
+            panic!("未识别分组")
+        };
+        let ContextValue::PoseArray(poses) = &mut fields[0].value else {
+            panic!("未识别嵌套位姿数组")
+        };
+        poses[0].waist_pose.orientation.z = 0.25;
+        let out = saved_context(&data);
+        let edited: Value =
+            serde_json::from_str(out["group"]["pick_poses"][0].as_str().unwrap()).unwrap();
+        let mut expected = raw;
+        expected["waist_pose"]["orientation"]["z"] = json!(0.25);
+        assert_eq!(edited, expected);
     }
 
     #[test]
