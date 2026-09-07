@@ -58,7 +58,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Clippy
-        run: cargo clippy --all --all-targets -- -D warnings
+        run: cargo clippy --locked --all --all-targets -- -D warnings
 
   # ============ 测试 ============
   test:
@@ -83,7 +83,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --all
+        run: cargo test --locked --all
 
       - name: Verify deployment failure handling
         run: python3 scripts/test_deploy_remote.py
@@ -179,7 +179,7 @@ jobs:
         run: choco install nasm -y
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Verify build artifacts
         shell: bash

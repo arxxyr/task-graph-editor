@@ -363,6 +363,9 @@ shell 同样不会展开其中的 `~`。
 4. **Build**（三平台并行）：Linux x64 / macOS ARM64 / Windows x64
 
 - 工具链：Rust nightly
+- CI 的 Clippy、测试与构建使用 `--locked`，严格复用已提交的依赖组合。
+  升级 Bevy/wgpu 后需检查 Windows 依赖树：`wgpu-hal` 和 `gpu-allocator` 之间共享 DX12 类型，
+  必须解析到同一版 `windows`。当前统一为 0.62.2；保留旧的 0.61.x 会导致跨 crate 类型不匹配
 - 用 `CARGO_BUILD_WARNINGS=deny` 拦截构建警告，保持编译指纹不变；CI 关闭增量编译
 - GitLab 的 MR、分支和标签质量任务条件一致，构建 `needs` 不能指向缺失的测试任务
 - GitHub 的开发构建、PR 和发布构建都上传产物，开发摘要指向本次运行的下载入口
