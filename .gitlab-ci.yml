@@ -2,6 +2,7 @@
 # 任务图编辑器 - 持续集成
 
 stages:
+  - format
   - check
   - test
   - build
@@ -9,9 +10,30 @@ stages:
 variables:
   CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  CARGO_BUILD_WARNINGS: deny
   CARGO_INCREMENTAL: "0"
   RUST_TOOLCHAIN: nightly
+
+# 全部质量任务与构建使用一致的 MR / 分支 / 标签条件，避免 needs 指向不存在的任务。
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+
+.pipeline-rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+    - if: '$CI_COMMIT_BRANCH'
+
+.release-rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|master|develop|dev)$/'
 
 # 缓存 cargo 依赖和构建产物（按 Cargo.lock 哈希）
 .rust-cache: &rust-cache
@@ -25,16 +47,16 @@ variables:
       - target/
     policy: pull-push
 
-# 基础镜像配置（含 egui/eframe 系统依赖）
+# 基础镜像配置（含 Bevy 的窗口/图形系统依赖）
 .rust-base: &rust-base
   image: rust:latest
   before_script:
     - rustup default ${RUST_TOOLCHAIN}
     - rustup component add rustfmt clippy
     - apt-get update && apt-get install -y
-        libssl-dev pkg-config
-        libxkbcommon-dev libgl1-mesa-dev
-        libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        libssl-dev pkg-config python3
+        libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+        libx11-dev libxcursor-dev libxrandr-dev libxi-dev
     - rustc --version && cargo --version
 
 # 版本号计算脚本（各 job 复用）
@@ -53,16 +75,17 @@ variables:
 # ============ Check 阶段 ============
 
 fmt:
-  <<: *rust-base
-  <<: *rust-cache
-  stage: check
+  extends: .pipeline-rules
+  <<: [*rust-base, *rust-cache]
+  stage: format
   script:
     - cargo fmt --all -- --check
   allow_failure: false
 
 clippy:
-  <<: *rust-base
-  <<: *rust-cache
+  extends: .pipeline-rules
+  needs: [fmt]
+  <<: [*rust-base, *rust-cache]
   stage: check
   script:
     - cargo clippy --all --all-targets -- -D warnings
@@ -71,28 +94,28 @@ clippy:
 # ============ Test 阶段 ============
 
 test:
-  <<: *rust-base
-  <<: *rust-cache
+  extends: .pipeline-rules
+  <<: [*rust-base, *rust-cache]
   stage: test
   script:
     - cargo test --all
+    - python3 scripts/test_deploy_remote.py
   needs:
-    - fmt
     - clippy
 
 # ============ Build 阶段 ============
 
 # Linux x64 Release
 build:linux-x64:
-  <<: *rust-base
-  <<: *rust-cache
+  extends: .release-rules
+  <<: [*rust-base, *rust-cache]
   stage: build
   before_script:
     - rustup default ${RUST_TOOLCHAIN}
     - apt-get update && apt-get install -y
         libssl-dev pkg-config
-        libxkbcommon-dev libgl1-mesa-dev
-        libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+        libx11-dev libxcursor-dev libxrandr-dev libxi-dev
         upx-ucl
     - rustc --version && cargo --version
   script:
@@ -123,14 +146,10 @@ build:linux-x64:
     expire_in: 30 days
   needs:
     - test
-  only:
-    - master
-    - dev
-    - tags
-    - merge_requests
 
 # macOS ARM64 Release（UPX 跳过）
 build:macos-arm64:
+  extends: .release-rules
   stage: build
   tags:
     - macos
@@ -196,14 +215,10 @@ build:macos-arm64:
     policy: pull-push
   needs:
     - test
-  only:
-    - master
-    - dev
-    - tags
-    - merge_requests
 
 # Windows x64 Release
 build:windows-x64:
+  extends: .release-rules
   stage: build
   tags:
     - windows
@@ -222,7 +237,7 @@ build:windows-x64:
       } else {
         $FullVersion = "v${Version}+${Date}.${Commit}"
       }
-    - Write-Host "版本号: ${FullVersion}"
+    - 'Write-Host "版本号: ${FullVersion}"'
     - cargo build --release --target x86_64-pc-windows-msvc
     # 不做 UPX 压缩：UPX 加壳的无签名 exe 会触发 Defender/SmartScreen 木马误报
     # 打包
@@ -244,23 +259,14 @@ build:windows-x64:
     policy: pull-push
   needs:
     - test
-  only:
-    - master
-    - dev
-    - tags
-    - merge_requests
 
-# Debug 构建（MR 快速验证）
+# 其他开发分支构建，同样经过完整测试闸门
 build-debug:
-  <<: *rust-base
-  <<: *rust-cache
+  <<: [*rust-base, *rust-cache]
   stage: build
   script:
     - cargo build
   needs:
-    - fmt
-    - clippy
-  except:
-    - master
-    - dev
-    - tags
+    - test
+  rules:
+    - if: '$CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH !~ /^(main|master|develop|dev)$/'

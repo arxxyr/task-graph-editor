@@ -22,6 +22,9 @@ pub struct Orientation {
 }
 
 /// 单个部位的位姿（位置 + 姿态）
+///
+/// 新建位姿按字段声明顺序输出；已有字段未编辑时保留原始字符串，
+/// 编辑时合并变动分量并保留扩展成员，避免无关数据发生变化。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Pose {
     pub position: Position,
@@ -67,7 +70,7 @@ pub struct TrajectoryPoint {
 }
 
 /// context 字段值类型
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ContextValue {
     /// 位姿点（字符串化 JSON，含 chassis_pose/head_pose/waist_pose）
     Pose(RobotPose),
@@ -77,10 +80,24 @@ pub enum ContextValue {
     Integer(i64),
     /// 浮点数
     Float(f64),
-    /// 字符串化的数值数组（如 "[0.01,0.17,0.34]"、"[4,3]"）
-    NumericArray(Vec<f64>),
-    /// 字符串化的二维数值数组（如 "[[0.30,0.34,0.45],...]"）
-    NumericArray2D(Vec<Vec<f64>>),
+    /// 一维数值数组
+    ///
+    /// 真实任务图里两种写法都有：偏移量之类是字符串化的 `"[0.01,0.17,0.34]"`，
+    /// 也有直接写成 JSON 数组的。`stringified` 记住原样，序列化时照原样写回，
+    /// 否则会悄悄改掉远程文件的数据格式。
+    NumericArray {
+        /// 元素
+        values: Vec<f64>,
+        /// 原文是否为字符串化形式
+        stringified: bool,
+    },
+    /// 二维数值数组（如 `"[[0.30,0.34,0.45],...]"` 或原生 `[[...],...]`）
+    NumericArray2D {
+        /// 行
+        rows: Vec<Vec<f64>>,
+        /// 原文是否为字符串化形式
+        stringified: bool,
+    },
     /// 关节轨迹（原生 JSON 数组，每个元素含 positions 和 time_from_start）
     JointTrajectory(Vec<TrajectoryPoint>),
     /// 位姿数组（原生 JSON 数组，可以为空）
@@ -96,12 +113,91 @@ pub enum ContextValue {
 }
 
 /// context 中的一个字段
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContextField {
     /// context 中的 key 名
     pub key: String,
     /// 值
     pub value: ContextValue,
+}
+
+/// 任务图中的一个节点
+///
+/// 只读：本工具编辑的是 context 参数，流程本身由机器人端定义。
+/// 序列化时 `config.nodes` / `config.edges` 原样从 `raw_json` 带回去。
+#[derive(Debug, Clone)]
+pub struct TaskNode {
+    /// 节点 id，同层内唯一
+    pub id: String,
+    /// 节点类型，如 `sequence`、`ros2_action`、`condition`
+    pub node_type: String,
+    /// 输入参数，原样保留用于展示
+    pub inputs: serde_json::Value,
+    /// 是否为断点续跑的检查点
+    pub checkpoint: bool,
+    /// 复合节点的子图（`sequence`、`loop`、`parallel` 等会有）
+    pub children: Option<SubGraph>,
+}
+
+/// 一层图：节点加它们之间的连接
+#[derive(Debug, Clone, Default)]
+pub struct SubGraph {
+    /// 本层节点
+    pub nodes: Vec<TaskNode>,
+    /// 本层的边，端点可能是虚拟的 `_entry` / `_exit`
+    pub edges: Vec<GraphEdge>,
+}
+
+/// 一条有向边
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEdge {
+    /// 起点节点 id
+    pub from: String,
+    /// 终点节点 id
+    pub to: String,
+}
+
+/// 虚拟入口节点的 id
+pub const ENTRY_ID: &str = "_entry";
+
+/// 虚拟出口节点的 id
+pub const EXIT_ID: &str = "_exit";
+
+impl SubGraph {
+    /// 按 id 找节点
+    pub fn node(&self, id: &str) -> Option<&TaskNode> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// 递归统计节点总数
+    pub fn total_nodes(&self) -> usize {
+        self.nodes.len()
+            + self
+                .nodes
+                .iter()
+                .filter_map(|n| n.children.as_ref())
+                .map(SubGraph::total_nodes)
+                .sum::<usize>()
+    }
+
+    /// 递归求最大嵌套深度（本层为 1）
+    pub fn depth(&self) -> usize {
+        1 + self
+            .nodes
+            .iter()
+            .filter_map(|n| n.children.as_ref())
+            .map(SubGraph::depth)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 沿 id 路径逐层下钻
+    pub fn subgraph_at(&self, path: &[String]) -> Option<&SubGraph> {
+        let Some((first, rest)) = path.split_first() else {
+            return Some(self);
+        };
+        self.node(first)?.children.as_ref()?.subgraph_at(rest)
+    }
 }
 
 /// GUI 编辑用的任务图数据
@@ -111,6 +207,8 @@ pub struct TaskGraphData {
     pub task_id: String,
     /// 所有 context 字段（按 key 排序）
     pub context_fields: Vec<ContextField>,
+    /// 任务流程图（只读展示）
+    pub graph: SubGraph,
     /// 原始 JSON（用于合并回写时保留未编辑字段）
     pub raw_json: serde_json::Value,
 }
@@ -128,8 +226,28 @@ pub enum ParseError {
 // Context 值类型识别
 // ============================================================
 
+/// f64 控件只编辑能精确表示的整数；超出安全范围的整块结构保留原始 JSON。
+fn numbers_are_lossless(value: &serde_json::Value) -> bool {
+    const MAX_EXACT_INTEGER: u64 = 1_u64 << 53;
+    match value {
+        serde_json::Value::Number(number) => match (number.as_i64(), number.as_u64()) {
+            (Some(integer), _) => integer.unsigned_abs() <= MAX_EXACT_INTEGER,
+            (_, Some(integer)) => integer <= MAX_EXACT_INTEGER,
+            _ => true,
+        },
+        serde_json::Value::Array(values) => values.iter().all(numbers_are_lossless),
+        serde_json::Value::Object(fields) => fields.values().all(numbers_are_lossless),
+        _ => true,
+    }
+}
+
 /// 分类字符串类型的 context 值
 fn classify_string_value(s: &str) -> ContextValue {
+    // 大整数不能经过 f64 编辑；保留字符串原文供只读展示与无损保存。
+    if serde_json::from_str::<serde_json::Value>(s).is_ok_and(|value| !numbers_are_lossless(&value))
+    {
+        return ContextValue::RawJson(serde_json::Value::String(s.to_owned()));
+    }
     // 尝试解析为 RobotPose
     if let Ok(pose) = serde_json::from_str::<RobotPose>(s) {
         return ContextValue::Pose(pose);
@@ -138,11 +256,17 @@ fn classify_string_value(s: &str) -> ContextValue {
     if let Ok(arr2d) = serde_json::from_str::<Vec<Vec<f64>>>(s)
         && !arr2d.is_empty()
     {
-        return ContextValue::NumericArray2D(arr2d);
+        return ContextValue::NumericArray2D {
+            rows: arr2d,
+            stringified: true,
+        };
     }
     // 尝试解析为一维数值数组
     if let Ok(arr) = serde_json::from_str::<Vec<f64>>(s) {
-        return ContextValue::NumericArray(arr);
+        return ContextValue::NumericArray {
+            values: arr,
+            stringified: true,
+        };
     }
     ContextValue::Text(s.to_string())
 }
@@ -163,6 +287,9 @@ fn classify_array_value(
         }
         return ContextValue::RawJson(value.clone());
     }
+    if !numbers_are_lossless(value) {
+        return ContextValue::RawJson(value.clone());
+    }
     // 尝试解析为轨迹点数组
     if let Ok(traj) = serde_json::from_value::<Vec<TrajectoryPoint>>(value.clone()) {
         return ContextValue::JointTrajectory(traj);
@@ -170,6 +297,19 @@ fn classify_array_value(
     // 尝试解析为位姿数组
     if let Ok(poses) = serde_json::from_value::<Vec<RobotPose>>(value.clone()) {
         return ContextValue::PoseArray(poses);
+    }
+    // 原生 JSON 数值数组（不是字符串化的），如偏移配置 [[0.0,0.05,0.25],...]
+    if let Ok(rows) = serde_json::from_value::<Vec<Vec<f64>>>(value.clone()) {
+        return ContextValue::NumericArray2D {
+            rows,
+            stringified: false,
+        };
+    }
+    if let Ok(values) = serde_json::from_value::<Vec<f64>>(value.clone()) {
+        return ContextValue::NumericArray {
+            values,
+            stringified: false,
+        };
     }
     ContextValue::RawJson(value.clone())
 }
@@ -199,7 +339,9 @@ fn classify_context_value(key: &str, value: &serde_json::Value) -> ContextValue 
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 ContextValue::Integer(i)
-            } else if let Some(f) = n.as_f64() {
+            } else if n.is_f64()
+                && let Some(f) = n.as_f64()
+            {
                 ContextValue::Float(f)
             } else {
                 ContextValue::RawJson(value.clone())
@@ -214,6 +356,53 @@ fn classify_context_value(key: &str, value: &serde_json::Value) -> ContextValue 
 // ============================================================
 // 解析与序列化
 // ============================================================
+
+/// 解析一层图的节点与边
+fn parse_subgraph(container: &serde_json::Value) -> SubGraph {
+    let nodes = container
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(parse_node).collect())
+        .unwrap_or_default();
+    let edges = container
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    Some(GraphEdge {
+                        from: e.get("from")?.as_str()?.to_string(),
+                        to: e.get("to")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    SubGraph { nodes, edges }
+}
+
+/// 解析单个节点；没有 id 的条目直接跳过
+fn parse_node(value: &serde_json::Value) -> Option<TaskNode> {
+    let id = value.get("id")?.as_str()?.to_string();
+    let children = value.get("nodes").is_some().then(|| parse_subgraph(value));
+    Some(TaskNode {
+        id,
+        node_type: value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        inputs: value
+            .get("inputs")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        checkpoint: value
+            .get("checkpoint")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        children,
+    })
+}
 
 /// 从 JSON 字符串解析任务图数据
 ///
@@ -251,10 +440,13 @@ pub fn parse_task_graph(json_str: &str) -> Result<TaskGraphData, ParseError> {
         }
     }
 
+    let graph = raw.get("config").map(parse_subgraph).unwrap_or_default();
+
     Ok(TaskGraphData {
         map_id,
         task_id,
         context_fields,
+        graph,
         raw_json: raw,
     })
 }
@@ -268,25 +460,76 @@ fn numeric_to_json_value(v: f64) -> serde_json::Value {
     }
 }
 
+/// 保存的最后一道数值防线：serde_json 会把非有限数静默转换为 null，必须提前拒绝。
+fn validate_finite(value: &ContextValue) -> Result<(), serde_json::Error> {
+    fn pose_is_finite(pose: &RobotPose) -> bool {
+        [&pose.chassis_pose, &pose.head_pose, &pose.waist_pose]
+            .into_iter()
+            .all(|part| {
+                let p = &part.position;
+                let q = &part.orientation;
+                [p.x, p.y, p.z, q.w, q.x, q.y, q.z]
+                    .into_iter()
+                    .all(f64::is_finite)
+            })
+    }
+    let finite = match value {
+        ContextValue::Pose(pose) => pose_is_finite(pose),
+        ContextValue::Float(number) => number.is_finite(),
+        ContextValue::NumericArray { values, .. } => values.iter().all(|v| v.is_finite()),
+        ContextValue::NumericArray2D { rows, .. } => rows.iter().flatten().all(|v| v.is_finite()),
+        ContextValue::JointTrajectory(points) => points.iter().all(|point| {
+            point.time_from_start.is_finite() && point.positions.iter().all(|v| v.is_finite())
+        }),
+        ContextValue::PoseArray(poses) => poses.iter().all(pose_is_finite),
+        ContextValue::NestedGroup(fields) => {
+            for field in fields {
+                validate_finite(&field.value)?;
+            }
+            true
+        }
+        _ => true,
+    };
+    match finite {
+        true => Ok(()),
+        false => Err(<serde_json::Error as serde::ser::Error>::custom(
+            "不能保存非有限数值（NaN 或无穷大），请修正对应数值",
+        )),
+    }
+}
+
 /// 将 ContextValue 序列化为 JSON 值
 fn serialize_context_value(value: &ContextValue) -> Result<serde_json::Value, serde_json::Error> {
+    validate_finite(value)?;
     Ok(match value {
         ContextValue::Pose(pose) => serde_json::Value::String(serde_json::to_string(pose)?),
         ContextValue::Bool(b) => serde_json::Value::Bool(*b),
         ContextValue::Integer(i) => serde_json::json!(*i),
         ContextValue::Float(f) => serde_json::json!(*f),
-        ContextValue::NumericArray(arr) => {
-            let json_arr: Vec<serde_json::Value> =
-                arr.iter().map(|&v| numeric_to_json_value(v)).collect();
-            serde_json::Value::String(serde_json::to_string(&json_arr)?)
-        }
-        ContextValue::NumericArray2D(arr2d) => {
-            let json_arr: Vec<Vec<serde_json::Value>> = arr2d
-                .iter()
-                .map(|row| row.iter().map(|&v| numeric_to_json_value(v)).collect())
-                .collect();
-            serde_json::Value::String(serde_json::to_string(&json_arr)?)
-        }
+        ContextValue::NumericArray {
+            values,
+            stringified,
+        } => match stringified {
+            // 字符串化的数组沿用既有规则：整数值写成整数，"[4,3]" 不会变成 "[4.0,3.0]"
+            true => {
+                let json_arr: Vec<serde_json::Value> =
+                    values.iter().map(|&v| numeric_to_json_value(v)).collect();
+                serde_json::Value::String(serde_json::to_string(&json_arr)?)
+            }
+            // 原生数组照 f64 写回：这里再做整数收敛会把原文的 0.0 改成 0，
+            // JSON 类型跟着变，属于悄悄改数据
+            false => serde_json::to_value(values)?,
+        },
+        ContextValue::NumericArray2D { rows, stringified } => match stringified {
+            true => {
+                let json_arr: Vec<Vec<serde_json::Value>> = rows
+                    .iter()
+                    .map(|row| row.iter().map(|&v| numeric_to_json_value(v)).collect())
+                    .collect();
+                serde_json::Value::String(serde_json::to_string(&json_arr)?)
+            }
+            false => serde_json::to_value(rows)?,
+        },
         ContextValue::JointTrajectory(traj) => serde_json::to_value(traj)?,
         ContextValue::PoseArray(poses) => serde_json::to_value(poses)?,
         ContextValue::NestedGroup(fields) => {
@@ -302,28 +545,182 @@ fn serialize_context_value(value: &ContextValue) -> Result<serde_json::Value, se
     })
 }
 
-/// 将编辑后的数据合并回原始 JSON 并输出格式化字符串
-///
-/// 修改 map_id、task_id，并将所有 context 字段重新序列化写回。
-pub fn serialize_task_graph(data: &TaskGraphData) -> Result<String, serde_json::Error> {
-    let mut json = data.raw_json.clone();
+/// 在原始结构上只覆盖变动的叶子；模型未识别的扩展成员以及未改数值的整数/浮点形式均保留。
+fn merge_edited_json(
+    original: &serde_json::Value,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> serde_json::Value {
+    if before == after {
+        return original.clone();
+    }
+    match (original, before, after) {
+        (
+            serde_json::Value::Object(raw),
+            serde_json::Value::Object(old),
+            serde_json::Value::Object(new),
+        ) => {
+            let mut merged = raw.clone();
+            for (key, value) in new {
+                let value = match (raw.get(key), old.get(key)) {
+                    (Some(original), Some(before)) => merge_edited_json(original, before, value),
+                    _ => value.clone(),
+                };
+                merged.insert(key.clone(), value);
+            }
+            serde_json::Value::Object(merged)
+        }
+        (
+            serde_json::Value::Array(raw),
+            serde_json::Value::Array(old),
+            serde_json::Value::Array(new),
+        ) => serde_json::Value::Array(
+            new.iter()
+                .enumerate()
+                .map(|(index, value)| match (raw.get(index), old.get(index)) {
+                    (Some(original), Some(before)) => merge_edited_json(original, before, value),
+                    _ => value.clone(),
+                })
+                .collect(),
+        ),
+        (serde_json::Value::Number(raw), _, serde_json::Value::Number(new)) => match new.as_f64() {
+            Some(number) if (raw.is_i64() || raw.is_u64()) && number.fract() == 0.0 => {
+                numeric_to_json_value(number)
+            }
+            _ => after.clone(),
+        },
+        _ => after.clone(),
+    }
+}
 
-    // 更新顶层字段
+/// 只对位姿的已知成员指定顺序，扩展成员仍完整输出。
+/// serde_json::Value 的对象是 BTreeMap，直接写出会把 orientation 排到 position 前面。
+struct OrderedPoseJson<'a> {
+    value: &'a serde_json::Value,
+    kind: PoseJsonKind,
+}
+
+#[derive(Clone, Copy)]
+enum PoseJsonKind {
+    Robot,
+    Part,
+    Position,
+    Orientation,
+    Extension,
+}
+
+impl Serialize for OrderedPoseJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let Some(object) = self.value.as_object() else {
+            return self.value.serialize(serializer);
+        };
+        let keys: &[&str] = match self.kind {
+            PoseJsonKind::Robot => &["chassis_pose", "head_pose", "waist_pose"],
+            PoseJsonKind::Part => &["position", "orientation"],
+            PoseJsonKind::Position => &["x", "y", "z"],
+            PoseJsonKind::Orientation => &["w", "x", "y", "z"],
+            PoseJsonKind::Extension => &[],
+        };
+        let mut map = serializer.serialize_map(Some(object.len()))?;
+        for key in keys {
+            if let Some(value) = object.get(*key) {
+                let kind = match (self.kind, *key) {
+                    (PoseJsonKind::Robot, _) => PoseJsonKind::Part,
+                    (PoseJsonKind::Part, "position") => PoseJsonKind::Position,
+                    (PoseJsonKind::Part, "orientation") => PoseJsonKind::Orientation,
+                    _ => PoseJsonKind::Extension,
+                };
+                map.serialize_entry(key, &OrderedPoseJson { value, kind })?;
+            }
+        }
+        for (key, value) in object {
+            if !keys.contains(&key.as_str()) {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+fn merge_context_value(
+    key: &str,
+    value: &ContextValue,
+    original: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    validate_finite(value)?;
+    let Some(original) = original else {
+        return serialize_context_value(value);
+    };
+    let before = classify_context_value(key, original);
+    if &before == value {
+        return Ok(original.clone());
+    }
+    if let ContextValue::NestedGroup(fields) = value {
+        let mut merged = original.as_object().cloned().unwrap_or_default();
+        for field in fields {
+            let next = merge_context_value(&field.key, &field.value, merged.get(&field.key))?;
+            merged.insert(field.key.clone(), next);
+        }
+        return Ok(serde_json::Value::Object(merged));
+    }
+    // 类型切换（如 null 转位姿）没有同形的旧模型，直接序列化新值。
+    if std::mem::discriminant(&before) != std::mem::discriminant(value) {
+        return serialize_context_value(value);
+    }
+    let old = serialize_context_value(&before)?;
+    let new = serialize_context_value(value)?;
+    match (original.as_str(), old.as_str(), new.as_str()) {
+        (Some(raw), Some(old), Some(new))
+            if matches!(
+                value,
+                ContextValue::Pose(_)
+                    | ContextValue::NumericArray {
+                        stringified: true,
+                        ..
+                    }
+                    | ContextValue::NumericArray2D {
+                        stringified: true,
+                        ..
+                    }
+            ) =>
+        {
+            let merged = merge_edited_json(
+                &serde_json::from_str(raw)?,
+                &serde_json::from_str(old)?,
+                &serde_json::from_str(new)?,
+            );
+            let text = match value {
+                ContextValue::Pose(_) => serde_json::to_string(&OrderedPoseJson {
+                    value: &merged,
+                    kind: PoseJsonKind::Robot,
+                })?,
+                _ => serde_json::to_string(&merged)?,
+            };
+            Ok(serde_json::Value::String(text))
+        }
+        _ => Ok(merge_edited_json(original, &old, &new)),
+    }
+}
+
+/// 将编辑后的数据合并回原始 JSON；未修改的 context 保留原始值及字符串文本。
+pub fn serialize_task_graph(data: &TaskGraphData) -> Result<String, serde_json::Error> {
+    for field in &data.context_fields {
+        validate_finite(&field.value)?;
+    }
+    let mut json = data.raw_json.clone();
     json["map_id"] = serde_json::Value::String(data.map_id.clone());
     json["task_id"] = serde_json::Value::String(data.task_id.clone());
-
-    // 更新 context 中的所有字段
     if let Some(context) = json
         .get_mut("config")
         .and_then(|c| c.get_mut("context"))
         .and_then(|c| c.as_object_mut())
     {
         for field in &data.context_fields {
-            let value = serialize_context_value(&field.value)?;
+            let value = merge_context_value(&field.key, &field.value, context.get(&field.key))?;
             context.insert(field.key.clone(), value);
         }
     }
-
     serde_json::to_string_pretty(&json)
 }
 
@@ -389,6 +786,9 @@ pub struct LoginConfig {
     pub port: String,
     pub username: String,
     pub password: String,
+    /// 私钥文件路径（密码为空时使用；空 = ssh-agent / 默认私钥）
+    #[serde(default)]
+    pub identity_file: String,
     /// ROS_DOMAIN_ID，不同机器人可能不同
     #[serde(default)]
     pub ros_domain_id: String,
@@ -408,6 +808,7 @@ impl Default for LoginConfig {
             port: "22".into(),
             username: "linux".into(),
             password: String::new(),
+            identity_file: String::new(),
             ros_domain_id: "11".into(),
             remote_dir: default_remote_dir(),
         }
@@ -416,10 +817,8 @@ impl Default for LoginConfig {
 
 /// 配置文件路径: ~/.config/task-graph-editor/login.json
 fn config_path() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
+    crate::ssh_config::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("task-graph-editor")
         .join("login.json")
@@ -692,9 +1091,13 @@ mod tests {
             .find(|f| f.key == "heights")
             .unwrap();
         match &field.value {
-            ContextValue::NumericArray(arr) => {
-                assert_eq!(arr.len(), 3);
-                assert!((arr[0] - 0.01).abs() < f64::EPSILON);
+            ContextValue::NumericArray {
+                values,
+                stringified,
+            } => {
+                assert_eq!(values.len(), 3);
+                assert!((values[0] - 0.01).abs() < f64::EPSILON);
+                assert!(stringified, "原文是字符串化的数组");
             }
             other => panic!("Expected NumericArray, got {other:?}"),
         }
@@ -709,9 +1112,10 @@ mod tests {
             .find(|f| f.key == "angles_2d")
             .unwrap();
         match &field.value {
-            ContextValue::NumericArray2D(arr) => {
-                assert_eq!(arr.len(), 2);
-                assert_eq!(arr[0].len(), 2);
+            ContextValue::NumericArray2D { rows, stringified } => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].len(), 2);
+                assert!(stringified, "原文是字符串化的数组");
             }
             other => panic!("Expected NumericArray2D, got {other:?}"),
         }
@@ -816,7 +1220,7 @@ mod tests {
 
         let heights = station_1.iter().find(|f| f.key == "put_heights").unwrap();
         match &heights.value {
-            ContextValue::NumericArray(arr) => assert_eq!(arr.len(), 3),
+            ContextValue::NumericArray { values, .. } => assert_eq!(values.len(), 3),
             other => panic!("Expected NumericArray, got {other:?}"),
         }
 
@@ -1145,5 +1549,384 @@ pose:
     fn test_numeric_to_json_value_float() {
         let v = numeric_to_json_value(0.01);
         assert_eq!(v, serde_json::json!(0.01));
+    }
+}
+
+#[cfg(test)]
+mod 数组形式保真 {
+    use super::*;
+
+    /// 原生 JSON 数组与字符串化数组混在同一份 context 里
+    const 混合数组: &str = r#"{
+        "map_id": "m",
+        "task_id": "t",
+        "config": {
+            "context": {
+                "原生二维": [[0.0, 0.05, 0.25], [0.2, 0.05, 0.25]],
+                "原生一维": [1.5, 2.5],
+                "字符串二维": "[[0.3,0.34],[0.5,0.54]]",
+                "字符串一维": "[0.01,0.17,0.34]",
+                "字符串整数": "[4,3]"
+            }
+        }
+    }"#;
+
+    fn 取(data: &TaskGraphData, key: &str) -> ContextValue {
+        data.context_fields
+            .iter()
+            .find(|f| f.key == key)
+            .unwrap_or_else(|| panic!("没有字段 {key}"))
+            .value
+            .clone()
+    }
+
+    #[test]
+    fn 原生数组被识别且标记为非字符串化() {
+        let data = parse_task_graph(混合数组).unwrap();
+        match 取(&data, "原生二维") {
+            ContextValue::NumericArray2D { rows, stringified } => {
+                assert_eq!(rows.len(), 2);
+                assert!(!stringified);
+            }
+            other => panic!("应为 NumericArray2D，实际 {other:?}"),
+        }
+        match 取(&data, "原生一维") {
+            ContextValue::NumericArray {
+                values,
+                stringified,
+            } => {
+                assert_eq!(values, vec![1.5, 2.5]);
+                assert!(!stringified);
+            }
+            other => panic!("应为 NumericArray，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 字符串化数组仍标记为字符串化() {
+        let data = parse_task_graph(混合数组).unwrap();
+        assert!(matches!(
+            取(&data, "字符串二维"),
+            ContextValue::NumericArray2D {
+                stringified: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            取(&data, "字符串一维"),
+            ContextValue::NumericArray {
+                stringified: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn 序列化按原样写回各自的形式() {
+        let data = parse_task_graph(混合数组).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&serialize_task_graph(&data).unwrap()).unwrap();
+        let ctx = &out["config"]["context"];
+
+        // 原生的仍是数组，不能变成字符串
+        assert!(ctx["原生二维"].is_array(), "原生二维应保持数组");
+        assert!(ctx["原生一维"].is_array(), "原生一维应保持数组");
+        // 字符串化的仍是字符串
+        assert!(ctx["字符串二维"].is_string(), "字符串二维应保持字符串");
+        assert!(ctx["字符串一维"].is_string(), "字符串一维应保持字符串");
+    }
+
+    #[test]
+    fn 原生数组里的零点零不会被写成整数() {
+        // 真实任务图里的 pose_offset_configs 首元素就是 0.0，
+        // 收敛成 0 会把 JSON 类型从 float 改成 int
+        let data = parse_task_graph(混合数组).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&serialize_task_graph(&data).unwrap()).unwrap();
+        let first = &out["config"]["context"]["原生二维"][0][0];
+        assert!(first.is_f64(), "原生数组的 0.0 应保持浮点，实际 {first}");
+    }
+
+    #[test]
+    fn 字符串化数组的整数仍保持整数写法() {
+        // 既有行为：位姿尺寸之类的 "[4,3]" 不应变成 "[4.0,3.0]"
+        let data = parse_task_graph(混合数组).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&serialize_task_graph(&data).unwrap()).unwrap();
+        assert_eq!(out["config"]["context"]["字符串整数"], "[4,3]");
+    }
+
+    #[test]
+    fn 未修改字符串化数组的文本完整保留() {
+        // 未编辑字段不重新序列化，尾随零与空白也保留。
+        let json = r#"{
+            "map_id": "m", "task_id": "t",
+            "config": { "context": { "带尾零": "[0.30,0.50]" } }
+        }"#;
+        let data = parse_task_graph(json).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&serialize_task_graph(&data).unwrap()).unwrap();
+        assert_eq!(out["config"]["context"]["带尾零"], "[0.30,0.50]");
+    }
+
+    #[test]
+    fn 混合数组往返后语义不变() {
+        let data = parse_task_graph(混合数组).unwrap();
+        let out = serialize_task_graph(&data).unwrap();
+        let a: serde_json::Value = serde_json::from_str(混合数组).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(a, b, "往返后 JSON 应完全一致");
+    }
+}
+
+/// 真实任务图的解析覆盖率诊断
+///
+/// 不进常规测试（`#[ignore]`），需要时手工跑：
+/// ```bash
+/// TGE_ANALYZE=/path/to/task.json cargo test 分析 -- --ignored --nocapture
+/// ```
+/// 输出每种类型的字段数、未能识别的字段（RawJson），并把往返序列化结果写到
+/// `<文件>.roundtrip.json`，便于和原文件比对是否丢数据。
+#[cfg(test)]
+mod 真实文件分析 {
+    use super::*;
+
+    /// 递归统计每种 ContextValue 变体，并记录可疑字段
+    fn 统计(
+        fields: &[ContextField],
+        prefix: &str,
+        counts: &mut BTreeMap<&'static str, usize>,
+        raw: &mut Vec<String>,
+        text: &mut Vec<(String, String)>,
+    ) {
+        for f in fields {
+            let path = match prefix.is_empty() {
+                true => f.key.clone(),
+                false => format!("{prefix}.{}", f.key),
+            };
+            let name = match &f.value {
+                ContextValue::Pose(_) => "Pose",
+                ContextValue::Bool(_) => "Bool",
+                ContextValue::Integer(_) => "Integer",
+                ContextValue::Float(_) => "Float",
+                ContextValue::NumericArray { .. } => "NumericArray",
+                ContextValue::NumericArray2D { .. } => "NumericArray2D",
+                ContextValue::JointTrajectory(_) => "JointTrajectory",
+                ContextValue::PoseArray(_) => "PoseArray",
+                ContextValue::NestedGroup(_) => "NestedGroup",
+                ContextValue::Text(_) => "Text",
+                ContextValue::Null => "Null",
+                ContextValue::RawJson(_) => "RawJson",
+            };
+            *counts.entry(name).or_insert(0) += 1;
+            match &f.value {
+                ContextValue::RawJson(v) => {
+                    let s = v.to_string();
+                    let head: String = s.chars().take(70).collect();
+                    raw.push(format!("{path}  =>  {head}"));
+                }
+                ContextValue::Text(t) => {
+                    let head: String = t.chars().take(50).collect();
+                    text.push((path.clone(), head));
+                }
+                ContextValue::NestedGroup(children) => {
+                    统计(children, &path, counts, raw, text);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要用 TGE_ANALYZE 指定真实文件"]
+    fn 分析() {
+        let path = std::env::var("TGE_ANALYZE").expect("需要 TGE_ANALYZE");
+        let text_in = std::fs::read_to_string(&path).expect("读取失败");
+        let data = parse_task_graph(&text_in).expect("解析失败");
+
+        let mut counts = BTreeMap::new();
+        let mut raw = Vec::new();
+        let mut texts = Vec::new();
+        统计(&data.context_fields, "", &mut counts, &mut raw, &mut texts);
+
+        println!(
+            "\n===== 顶层 context 字段：{} =====",
+            data.context_fields.len()
+        );
+        println!("map_id = {}  task_id = {}", data.map_id, data.task_id);
+        println!("\n----- 递归分类统计（含嵌套） -----");
+        for (k, v) in &counts {
+            println!("{k:<16} {v}");
+        }
+
+        println!("\n----- RawJson（未能识别的类型）：{} -----", raw.len());
+        for line in &raw {
+            println!("  {line}");
+        }
+
+        println!("\n----- Text（按纯文本处理）：{} -----", texts.len());
+        for (k, v) in texts.iter().take(30) {
+            println!("  {k}  =>  {v:?}");
+        }
+
+        // 往返一致性：解析后再序列化，与原文件做语义比对
+        let out = serialize_task_graph(&data).expect("序列化失败");
+        std::fs::write(format!("{path}.roundtrip.json"), &out).expect("写出失败");
+        println!("\n往返结果已写到 {path}.roundtrip.json");
+    }
+}
+
+#[cfg(test)]
+mod 保存完整性测试 {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn document(context: Value) -> TaskGraphData {
+        parse_task_graph(
+            &json!({"map_id": "m", "task_id": "t", "config": {"context": context}}).to_string(),
+        )
+        .unwrap()
+    }
+
+    fn saved_context(data: &TaskGraphData) -> Value {
+        let saved: Value = serde_json::from_str(&serialize_task_graph(data).unwrap()).unwrap();
+        saved["config"]["context"].clone()
+    }
+
+    fn field_mut<'a>(data: &'a mut TaskGraphData, key: &str) -> &'a mut ContextValue {
+        &mut data
+            .context_fields
+            .iter_mut()
+            .find(|field| field.key == key)
+            .unwrap()
+            .value
+    }
+
+    #[test]
+    fn 未编辑和修改无关字段都保留轨迹扩展及字符串原文() {
+        let context = json!({
+            "trajectory": [{"positions": [1, 2.0], "time_from_start": 0.5, "velocities": [2.0], "vendor": {"mode": "smooth"}}],
+            "numbers": "[ 0.30, 1e-20 ]", "enabled": false
+        });
+        let mut data = document(context.clone());
+        assert_eq!(saved_context(&data), context);
+        *field_mut(&mut data, "enabled") = ContextValue::Bool(true);
+        let out = saved_context(&data);
+        assert_eq!(out["trajectory"], context["trajectory"]);
+        assert_eq!(out["numbers"], context["numbers"]);
+        assert_eq!(out["enabled"], true);
+    }
+
+    #[test]
+    fn 只改轨迹关节仍保留未知成员和其他数字类型() {
+        let mut data = document(
+            json!({"trajectory": [{"positions": [1, 2.0], "time_from_start": 0.5, "velocities": [3], "vendor": {"keep": true}}]}),
+        );
+        let ContextValue::JointTrajectory(points) = field_mut(&mut data, "trajectory") else {
+            panic!("未识别轨迹")
+        };
+        points[0].positions[1] = 4.5;
+        let out = saved_context(&data);
+        assert_eq!(
+            out["trajectory"][0],
+            json!({"positions": [1, 4.5], "time_from_start": 0.5, "velocities": [3], "vendor": {"keep": true}})
+        );
+        assert!(out["trajectory"][0]["positions"][0].is_i64());
+    }
+
+    #[test]
+    fn 修改嵌套位姿分量不删除所有层级的扩展成员() {
+        let mut raw = serde_json::to_value(RobotPose::default()).unwrap();
+        raw["tag"] = json!("calibrated");
+        raw["chassis_pose"]["frame_id"] = json!("map");
+        raw["chassis_pose"]["position"]["accuracy"] = json!(0.01);
+        let mut data = document(json!({"group": {"pose": raw.to_string(), "other": " [1, 2] "}}));
+        let ContextValue::NestedGroup(fields) = field_mut(&mut data, "group") else {
+            panic!("未识别分组")
+        };
+        let ContextValue::Pose(pose) = &mut fields
+            .iter_mut()
+            .find(|field| field.key == "pose")
+            .unwrap()
+            .value
+        else {
+            panic!("未识别位姿")
+        };
+        pose.chassis_pose.position.x = 42.5;
+        let out = saved_context(&data);
+        let text = out["group"]["pose"].as_str().unwrap();
+        assert!(text.starts_with("{\"chassis_pose\":{\"position\":"));
+        for part in ["chassis_pose", "head_pose", "waist_pose"] {
+            assert!(text.contains(&format!("\"{part}\":{{\"position\":")));
+        }
+        assert!(text.contains("\"orientation\":{\"w\":"));
+        let pose: Value = serde_json::from_str(text).unwrap();
+        raw["chassis_pose"]["position"]["x"] = json!(42.5);
+        assert_eq!(pose, raw);
+        assert_eq!(out["group"]["other"], " [1, 2] ");
+    }
+
+    #[test]
+    fn 大整数不经过浮点分类并完整往返() {
+        let context = json!({"unsigned": u64::MAX, "native": [9007199254740993_u64],
+            "string": "[9007199254740993]", "matrix": [[9007199254740993_u64]],
+            "trajectory": [{"positions": [9007199254740993_u64], "time_from_start": 0.0}]});
+        let data = document(context.clone());
+        assert!(
+            data.context_fields
+                .iter()
+                .all(|field| matches!(field.value, ContextValue::RawJson(_)))
+        );
+        assert_eq!(saved_context(&data), context);
+    }
+
+    #[test]
+    fn 数组中修改一个数不改变其他整数浮点形式() {
+        let mut data = document(json!({"array": [1, 2.0, 3], "string": "[1,2.0,3]"}));
+        for key in ["array", "string"] {
+            let ContextValue::NumericArray { values, .. } = field_mut(&mut data, key) else {
+                panic!("未识别数值数组")
+            };
+            values[2] = 4.0;
+        }
+        let out = saved_context(&data);
+        assert_eq!(out["array"], json!([1, 2.0, 4]));
+        assert_eq!(out["string"], "[1,2.0,4]");
+    }
+
+    #[test]
+    fn 保存拒绝每一种浮点容器的非有限数值() {
+        let mut pose = RobotPose::default();
+        pose.head_pose.orientation.w = f64::INFINITY;
+        let values = vec![
+            ContextValue::Float(f64::INFINITY),
+            ContextValue::Pose(pose.clone()),
+            ContextValue::PoseArray(vec![pose]),
+            ContextValue::NumericArray {
+                values: vec![f64::NAN],
+                stringified: false,
+            },
+            ContextValue::NumericArray2D {
+                rows: vec![vec![f64::NEG_INFINITY]],
+                stringified: true,
+            },
+            ContextValue::JointTrajectory(vec![TrajectoryPoint {
+                positions: vec![0.0],
+                time_from_start: f64::NAN,
+            }]),
+            ContextValue::NestedGroup(vec![ContextField {
+                key: "nested".into(),
+                value: ContextValue::Float(f64::INFINITY),
+            }]),
+        ];
+        for value in values {
+            let mut data = document(json!({"invalid": null}));
+            *field_mut(&mut data, "invalid") = value;
+            assert!(
+                serialize_task_graph(&data).is_err(),
+                "必须拒绝 {}",
+                data.context_fields[0].key
+            );
+        }
     }
 }

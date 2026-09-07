@@ -8,3 +8,6 @@ bin
 *.tmp
 *.bak
 *.swp
+
+# 应用内截图（F12 手动 / TGE_SCREENSHOT 自动）
+/task-graph-editor-*.png

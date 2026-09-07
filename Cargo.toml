@@ -1,25 +1,84 @@
 [package]
 name = "task-graph-editor"
-version = "0.5.1"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.33.3"
+# Bevy：按需挑选 feature，不用现成的 "ui" 组合
+# —— 后者会连带 bevy_gilrs（手柄，Linux 上要 libudev-dev）、sysinfo_plugin、webgl2，
+# 本工具都用不到。去掉后 Linux CI 不再需要额外系统依赖，产物也更小。
+bevy = { version = "0.19.1", default-features = false, features = [
+    # 平台与窗口
+    "std",
+    "bevy_winit",
+    "x11",
+    "wayland",
+    "custom_cursor",
+    "multi_threaded",
+    "bevy_clipboard",
+    "system_clipboard",  # 文本框的复制/粘贴
+    "default_font",
+    # 核心框架
+    "async_executor",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_state",
+    "reflect_auto_register",
+    # UI 与场景
+    "ui_api",
+    "ui_bevy_render",
+    "scene",            # BSN（bsn! 宏、Scene/SceneList）
+    "picking",
+    "bevy_ui_widgets",
+    "bevy_feathers",    # Feathers 控件集
+] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip：serde_json 默认的快速浮点解析在某些值上有 1 ULP 误差
+# （实测 0.9216510910864573 会被解析成 ...572），位姿坐标读一遍再存回去就变了。
+# 开启后用精确算法解析，保证 bit-for-bit 往返
+serde_json = { version = "1", features = ["float_roundtrip"] }
 ssh2 = "0.9"
+# ssh-agent 的可取消 Unix I/O，以及 libssh2 自定义签名回调的 C 分配器边界。
+libc = "0.2.189"
 thiserror = "2"
 mimalloc = { version = "0.1", default-features = false }
-rfd = "0.17.2"
+rfd = "0.17"
 chrono = "0.4"
+# 日志门面：ssh.rs / worker.rs 要与 GUI 框架解耦，不能直接用 bevy::log；
+# Bevy 的 LogPlugin 会接管 tracing 的全局 subscriber，两边自然汇到一处
+tracing = "0.1"
+
+# 仅为开启 icu_provider 的 logging feature，本项目不直接使用它：
+# 该 feature 关闭时，icu_provider 把 log::warn! 别名成 std::eprintln!
+# （见其 lib.rs 的 cfg(not(feature = "logging")) 分支），直接写 stderr。
+# parley 的分段器不加载 CJK 词典，中文界面每次文本布局都会触发一条警告，
+# debug 构建下会刷屏且绕过 Bevy 的日志过滤器。开启后归入 log 门面，
+# 由 LogPlugin 的 filter 统一屏蔽（见 main.rs）。
+icu_provider = { version = "2.1", features = ["logging"] }
 
 # vendored OpenSSL（ssh2 依赖链需要，全平台免安装）
 [dependencies.openssl]
 version = "0.10"
 features = ["vendored"]
 
+# Windows ssh-agent：Pageant 有界消息调用与 OpenSSH 管道的可取消 Overlapped I/O。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem",
+    "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading",
+    "Win32_System_Memory", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging",
+] }
+
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
 opt-level = "z"
+
+# 依赖用 opt-level 3 编译：Bevy 在 opt-level="z" 下渲染与布局性能损失明显
+[profile.release.package."*"]
+opt-level = 3
+
+# Bevy 官方推荐：dev 下把依赖优化到 3，冷启动与交互流畅度差别巨大
+[profile.dev.package."*"]
+opt-level = 3

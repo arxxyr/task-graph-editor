@@ -56,7 +56,7 @@ echo -e "\n${YELLOW}[2/5] cargo clippy ...${NC}"
 cargo clippy --all --all-targets -- -D warnings
 
 echo -e "\n${YELLOW}[3/5] cargo test ...${NC}"
-cargo test --all
+CARGO_BUILD_WARNINGS=deny cargo test --all
 
 # ---- 构建 Release ----
 BUILD_ARGS=(--release)
@@ -69,7 +69,7 @@ else
 fi
 
 echo -e "\n${YELLOW}[4/5] cargo build --release (target: ${TARGET}) ...${NC}"
-cargo build "${BUILD_ARGS[@]}"
+CARGO_BUILD_WARNINGS=deny cargo build "${BUILD_ARGS[@]}"
 
 # 检测平台名称
 case "${TARGET}" in
@@ -98,7 +98,7 @@ echo -e "\n${YELLOW}[5/5] 打包产物 ...${NC}"
 
 DIST_DIR="${PROJECT_DIR}/dist"
 PACKAGE_NAME="task-graph-editor-v${VERSION}-${PLATFORM}"
-rm -rf "${DIST_DIR}/${PACKAGE_NAME}"* 2>/dev/null || true
+rm -rf "${DIST_DIR:?}/${PACKAGE_NAME:?}"* 2>/dev/null || true
 mkdir -p "${DIST_DIR}"
 
 if [[ "${TARGET}" == *"-apple-darwin"* ]]; then
