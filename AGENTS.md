@@ -369,11 +369,18 @@ shell 同样不会展开其中的 `~`。
 - 用 `CARGO_BUILD_WARNINGS=deny` 拦截构建警告，保持编译指纹不变；CI 关闭增量编译
 - GitLab 的 MR、分支和标签质量任务条件一致，构建 `needs` 不能指向缺失的测试任务
 - GitHub 的开发构建、PR 和发布构建都上传产物，开发摘要指向本次运行的下载入口
+- GitHub 分支推送只监听 `master`，开发分支通过 PR 检查，避免同步 `dev` 时重复构建。
+  `validate_ref` 在四阶段之前执行：普通分支和 PR 正常放行；`v*` 标签先通过
+  `scripts/check-release-tag.sh` 刷新远端 `master`，验证标签提交与本次构建一致且已包含于
+  `master` 历史。轻量与附注标签均支持；缺失分支、网络错误和未合入提交必须停止流水线。
+  此任务不能整体限定为仅标签运行，否则普通分支和 PR 会因 `needs` 依赖被跳过。
 - 缓存：Swatinem/rust-cache@v2
 - Linux 系统依赖：`libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev libxcursor-dev
   libxrandr-dev libxi-dev`（不需要 libasound2-dev / libudev-dev —— 音频与手柄 feature 都没开）
 - UPX 压缩：仅 Linux `--best --lzma`；macOS 不支持；Windows 跳过（UPX 加壳的无签名 exe 会触发 Defender/SmartScreen 木马误报）
 - 产物命名：`task-graph-editor-{版本}-{平台}.{扩展名}`
-- 推送 `v*` 标签自动创建 Release（含 prerelease 检测）
+- GitHub 仅允许通过上述门禁的 `v*` 标签创建 Release（含 prerelease 检测），普通分支和 PR 不发布。
+  Release 显式依赖门禁及三平台构建成功，发布前再次校验远端 `master`。
+  `python3 scripts/test_release_tag.py` 使用隔离临时仓库测试允许与拒绝场景，不创建真实远端标签。
 - Unix 本地原子提交测试和部署回归需要 `python3`；Windows 跳过 Unix 系统调用集成测试
 - 部署脚本远端启用严格错误退出，失败保留现有可执行文件和上传包；先在临时位置准备、校验，再替换

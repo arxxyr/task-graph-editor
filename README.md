@@ -133,12 +133,23 @@ src/
 
 ## 发布
 
-推送 `v*` 标签自动触发 CI 构建和发布：
+GitHub Actions 仅在推送 `master` 时执行分支 CI；`dev` 等开发分支通过 PR 执行合并前检查，
+同步推送 `master` 和 `dev` 不会重复触发两套分支构建。
+
+推送 `v*` 标签时，只有标签指向的提交已包含在 GitHub 远端 `master` 的历史中，才允许构建并发布
+Release。轻量标签、附注标签以及 `master` 历史提交上的标签均支持；未合入 `master` 的开发提交、
+无法读取远端 `master` 或标签提交不一致时，门禁失败并停止后续任务。发布前还会重新校验一次。
+标签本身不记录创建时所在分支，因此以提交是否已合入 `master` 为准。
+
+以下使用本仓库的 GitHub 远端名 `github`，打标签前先同步并通过 `master` 的 CI：
 
 ```bash
+git switch master
 git tag v0.8.1
-git push origin v0.8.1
+git push github v0.8.1
 ```
+
+发布门禁的本地隔离测试：`python3 scripts/test_release_tag.py`，只创建临时 Git 仓库。
 
 产物格式：
 
