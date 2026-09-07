@@ -384,6 +384,7 @@ fn strip_negation(token: &str) -> (bool, &str) {
 ///
 /// `host` / `originalhost` 的参数是逗号分隔的模式列表；需要运行期信息的条件
 /// （`user` / `localuser` / `exec` / `tagged` / `localnetwork` 等）一律视为不匹配。
+/// 本解析器不执行 OpenSSH 的 canonical/final 重解析阶段，相应块（含取反条件）整体跳过。
 fn eval_match(criteria: &[String], alias: &str) -> bool {
     if criteria.is_empty() {
         return false;
@@ -392,7 +393,10 @@ fn eval_match(criteria: &[String], alias: &str) -> bool {
     while index < criteria.len() {
         let (negated, name) = strip_negation(&criteria[index]);
         let matched = match name.to_ascii_lowercase().as_str() {
-            "all" | "canonical" | "final" => true,
+            "all" => true,
+            // 下拉配置解析只运行初始阶段；不猜测 OpenSSH 重解析条件。
+            // 即使带 ! 也整体跳过，避免将不支持的条件误解释为命中。
+            "canonical" | "final" => return false,
             "host" | "originalhost" => {
                 index += 1;
                 let Some(patterns) = criteria.get(index) else {
@@ -764,6 +768,30 @@ Match exec \"true\"
         // !host gamma 不匹配 gamma；user/exec 条件视为不匹配
         assert_eq!(gamma.port, DEFAULT_PORT);
         assert_eq!(gamma.host_name, "all.example.com");
+    }
+
+    #[test]
+    fn final_and_canonical_blocks_never_override_initial_identity() {
+        let config = "
+Match final
+    User final-user
+    Port 9999
+Match !canonical
+    IdentityFile ~/.ssh/wrong-key
+Host robot
+    HostName 127.0.0.1
+    User robot-user
+    Port 2222
+    IdentityFile ~/.ssh/robot-key
+";
+        let hosts = parse_hosts(config, &test_env());
+        let robot = find(&hosts, "robot");
+        assert_eq!(robot.user.as_deref(), Some("robot-user"));
+        assert_eq!(robot.port, 2222);
+        assert_eq!(
+            robot.identity_files,
+            vec![PathBuf::from("/home/tester/.ssh/robot-key")]
+        );
     }
 
     #[test]

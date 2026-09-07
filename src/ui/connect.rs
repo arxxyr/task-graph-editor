@@ -6,12 +6,17 @@
 //! 这样重建时不会打断正在输入的文本框。
 
 use bevy::feathers::controls::{
-    ButtonVariant, FeathersMenu, FeathersMenuButton, FeathersMenuItem, FeathersMenuPopup,
+    ButtonVariant, FeathersMenuButton, FeathersMenuItem, FeathersMenuPopup,
 };
 use bevy::feathers::theme::{ThemeTextColor, ThemedText};
+use bevy::input::ButtonState;
+use bevy::input::keyboard::KeyboardInput;
+use bevy::input_focus::tab_navigation::{NavAction, TabIndex, TabNavigation};
+use bevy::input_focus::{FocusCause, FocusedInput, InputFocus};
 use bevy::prelude::*;
 use bevy::text::{EditableText, FontWeight, TextEdit, TextEditChange};
-use bevy::ui_widgets::Activate;
+use bevy::ui_widgets::{Activate, MenuAction, MenuEvent, MenuFocusState};
+use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 
 use crate::ssh_config::SshHostEntry;
 
@@ -47,6 +52,16 @@ struct ConnectButtonsSlot;
 /// 主机下拉菜单弹层插槽（ssh config 重新解析后重建）
 #[derive(Component, Default, Clone)]
 struct HostMenuSlot;
+
+#[derive(Component, Default, Clone)]
+struct HostMenuRoot;
+
+/// 保留打开意图，等配置刷新、BSN 子项落地后再同时显示菜单并获取焦点。
+#[derive(Component, Default, Clone)]
+struct HostMenuState {
+    pending_open: Option<(NavAction, u64)>,
+    pending_scroll: Option<NavAction>,
+}
 
 /// 记录已渲染的版本号，避免重复重建
 ///
@@ -135,8 +150,16 @@ fn host_row(host: &str) -> impl Scene {
             ),
             (widgets::text_field(host, LoginField::Host)),
             (
-                @FeathersMenu
-                Node { flex_shrink: 0.0 }
+                // 菜单根自行管理打开时序；原生 FeathersMenu 会在子项重建前先获取旧焦点。
+                Node {
+                    height: {bevy::feathers::constants::size::ROW_HEIGHT},
+                    justify_content: JustifyContent::Stretch,
+                    align_items: AlignItems::Stretch,
+                    flex_shrink: 0.0,
+                }
+                HostMenuRoot
+                on(on_host_menu_event)
+                on(on_host_menu_key)
                 Children [
                     (
                         @FeathersMenuButton {
@@ -144,9 +167,6 @@ fn host_row(host: &str) -> impl Scene {
                         }
                         Node { flex_shrink: 0.0 }
                         AccessibleLabel("从 ~/.ssh/config 选择主机")
-                        on(|_: On<Activate>, mut writer: MessageWriter<AppAction>| {
-                            writer.write(AppAction::ReloadSshHosts);
-                        })
                     ),
                     (
                         @FeathersMenuPopup
@@ -157,10 +177,187 @@ fn host_row(host: &str) -> impl Scene {
                         }
                         bevy::ui_widgets::ScrollArea
                         HostMenuSlot
+                        HostMenuState
                     )
                 ]
             )
         ]
+    }
+}
+
+/// 等待期间焦点仍在按钮上，Escape 不会经过其兄弟弹层，需在菜单根取消意图。
+fn on_host_menu_key(
+    mut event: On<FocusedInput<KeyboardInput>>,
+    roots: Query<&Children, With<HostMenuRoot>>,
+    popups: Query<&HostMenuState, With<HostMenuSlot>>,
+    mut commands: Commands,
+) {
+    if event.input.key_code != KeyCode::Escape || event.input.state != ButtonState::Pressed {
+        return;
+    }
+    let Ok(children) = roots.get(event.focused_entity) else {
+        return;
+    };
+    if children.iter().any(|child| {
+        popups
+            .get(child)
+            .is_ok_and(|state| state.pending_open.is_some())
+    }) {
+        event.propagate(false);
+        commands.trigger(MenuEvent {
+            source: event.focused_entity,
+            action: MenuAction::CloseAll,
+        });
+    }
+}
+
+/// 菜单动作共享的会话、焦点及窗口唤醒资源。
+#[derive(bevy::ecs::system::SystemParam)]
+struct HostMenuContext<'w> {
+    focus: ResMut<'w, InputFocus>,
+    session: Res<'w, Session>,
+    actions: MessageWriter<'w, AppAction>,
+    proxy: Option<Res<'w, EventLoopProxyWrapper>>,
+}
+
+/// 鼠标、回车和方向键都经过 MenuEvent，保证每次打开都重新读取配置。
+fn on_host_menu_event(
+    mut event: On<MenuEvent>,
+    roots: Query<&Children, With<HostMenuRoot>>,
+    mut popups: Query<
+        (&mut HostMenuState, &mut Visibility, &mut MenuFocusState),
+        With<HostMenuSlot>,
+    >,
+    buttons: Query<(), With<FeathersMenuButton>>,
+    mut context: HostMenuContext,
+) {
+    let Ok(children) = roots.get(event.source) else {
+        return;
+    };
+    event.propagate(false);
+    let Some(button) = children.iter().find(|&child| buttons.contains(child)) else {
+        return;
+    };
+    let Some(popup) = children.iter().find(|&child| popups.contains(child)) else {
+        return;
+    };
+    let Ok((mut state, mut visibility, mut menu_focus)) = popups.get_mut(popup) else {
+        return;
+    };
+    let navigation = match event.action {
+        MenuAction::FocusRoot => {
+            context.focus.set(button, FocusCause::Navigated);
+            return;
+        }
+        MenuAction::CloseAll => None,
+        MenuAction::Toggle
+            if *visibility == Visibility::Visible || state.pending_open.is_some() =>
+        {
+            None
+        }
+        MenuAction::Toggle => Some(NavAction::First),
+        MenuAction::Open(navigation) => Some(navigation),
+    };
+    *visibility = Visibility::Hidden;
+    *menu_focus = MenuFocusState::Closed;
+    state.pending_scroll = None;
+    state.pending_open = navigation.map(|navigation| (navigation, context.session.hosts_version));
+    if navigation.is_some() {
+        context.focus.set(button, FocusCause::Navigated);
+        context.actions.write(AppAction::ReloadSshHosts);
+        debug!("主机菜单等待配置刷新与子项就绪");
+        // 无障碍激活可能晚于本帧动作处理，主动推进下一帧读取配置。
+        if let Some(proxy) = &context.proxy {
+            let _ = proxy.send_event(WinitUserEvent::WakeUp);
+        }
+    }
+}
+
+/// 等待打开的弹层及其焦点状态，按 BSN 就绪状态一起更新。
+type HostMenuPopups<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static ChildOf,
+        &'static mut HostMenuState,
+        &'static mut Visibility,
+        &'static mut MenuFocusState,
+        Has<widgets::SlotPending>,
+    ),
+    With<HostMenuSlot>,
+>;
+
+/// 子项就绪前保持隐藏；显示与焦点一起提交，避免 MenuPlugin 当帧因丢焦关闭。
+fn open_ready_host_menu(
+    session: Res<Session>,
+    rendered: Res<RenderedVersions>,
+    mut popups: HostMenuPopups,
+    buttons: Query<(Entity, &ChildOf), With<FeathersMenuButton>>,
+    tab_navigation: TabNavigation,
+    mut focus: ResMut<InputFocus>,
+    proxy: Option<Res<EventLoopProxyWrapper>>,
+) {
+    for (popup, parent, mut state, mut visibility, mut menu_focus, pending) in &mut popups {
+        let Some((navigation, previous_version)) = state.pending_open else {
+            continue;
+        };
+        let button = buttons
+            .iter()
+            .find_map(|(button, owner)| (owner.parent() == parent.parent()).then_some(button));
+        // 打开尚未完成时，用户已点击其他控件也应取消，不能稍后夺回焦点。
+        if button.is_none() || focus.get() != button {
+            state.pending_open = None;
+            continue;
+        }
+        if session.hosts_version == previous_version {
+            // ReloadSshHosts 可能正在等尚未完成的粘贴；桥接层负责短时轮询。
+            continue;
+        }
+        if rendered.hosts == Some(session.hosts_version)
+            && !pending
+            && let Ok(next) = tab_navigation.initialize(popup, navigation)
+        {
+            focus.set(next, FocusCause::Navigated);
+            *menu_focus = MenuFocusState::Open;
+            *visibility = Visibility::Visible;
+            state.pending_open = None;
+            state.pending_scroll = Some(navigation);
+            debug!(hosts = session.ssh_hosts.len(), "主机菜单已打开");
+            // 显示状态与焦点提交后，确保后续布局和渲染无需再等用户输入。
+            if let Some(proxy) = &proxy {
+                let _ = proxy.send_event(WinitUserEvent::WakeUp);
+            }
+        } else if let Some(proxy) = &proxy {
+            // BSN 可能跨帧；主动唤醒，不能等 reactive 的五秒空闲周期。
+            let _ = proxy.send_event(WinitUserEvent::WakeUp);
+        }
+    }
+}
+
+/// 使用本批子项的布局尺寸定位首尾，避免重新打开时保留上次滚动位置。
+fn position_open_host_menu(
+    mut popups: Query<(&mut HostMenuState, &ComputedNode, &mut ScrollPosition), With<HostMenuSlot>>,
+    proxy: Option<Res<EventLoopProxyWrapper>>,
+) {
+    for (mut state, computed, mut scroll) in &mut popups {
+        let Some(navigation) = state.pending_scroll.take() else {
+            continue;
+        };
+        let y = match navigation {
+            NavAction::Last => {
+                (computed.content_size().y - computed.size().y).max(0.0)
+                    * computed.inverse_scale_factor
+            }
+            _ => 0.0,
+        };
+        if scroll.y != y {
+            scroll.y = y;
+            // 滚动值在布局后计算，主动请求下一帧把位移应用到控件。
+            if let Some(proxy) = &proxy {
+                let _ = proxy.send_event(WinitUserEvent::WakeUp);
+            }
+        }
     }
 }
 
@@ -202,6 +399,7 @@ fn host_menu_item(index: usize, entry: &SshHostEntry) -> impl Scene {
                     row_gap: px(1),
                     width: percent(100),
                 }
+                ThemedText
                 Children [
                     (
                         Node {
@@ -210,6 +408,7 @@ fn host_menu_item(index: usize, entry: &SshHostEntry) -> impl Scene {
                             column_gap: px(8),
                             width: percent(100),
                         }
+                        ThemedText
                         Children [
                             (
                                 Text(alias)
@@ -228,6 +427,11 @@ fn host_menu_item(index: usize, entry: &SshHostEntry) -> impl Scene {
                 ]
             }}
         }
+        Node {
+            height: auto(),
+            min_height: {bevy::feathers::constants::size::ROW_HEIGHT},
+            flex_shrink: 0.0,
+        }
         on(move |_: On<Activate>, mut writer: MessageWriter<AppAction>| {
             writer.write(AppAction::ApplySshHost(index));
         })
@@ -243,7 +447,7 @@ fn connect_buttons(connected: bool, reconnecting: bool) -> Vec<BoxedScene> {
             boxed(widgets::button_gated(
                 "断开",
                 ButtonVariant::Normal,
-                ButtonGate::WhenIdle,
+                ButtonGate::Always,
                 ActionButton(AppAction::Disconnect),
             )),
             boxed(widgets::button_gated(
@@ -259,7 +463,7 @@ fn connect_buttons(connected: bool, reconnecting: bool) -> Vec<BoxedScene> {
                 ActionButton(AppAction::UploadFile),
             )),
         ],
-        // 重连过程中「断开」始终可用，否则无法中止自动重连
+        // 连接和重连过程中也能取消，后台通过套接字 shutdown 打断等待。
         (false, true) => vec![boxed(widgets::button_gated(
             "断开",
             ButtonVariant::Normal,
@@ -317,7 +521,11 @@ fn rebuild_buttons(
     pending: Query<(), With<widgets::SlotPending>>,
     mut commands: Commands,
 ) {
-    let state = (session.is_connected, session.reconnect_status.is_some());
+    let state = (
+        session.is_connected,
+        session.reconnect_status.is_some()
+            || matches!(session.busy, crate::worker::BusyState::Connecting),
+    );
     if rendered.buttons == Some(state) {
         return;
     }
@@ -354,6 +562,8 @@ fn rebuild_host_menu(
     let items: Vec<BoxedScene> = match session.ssh_hosts.is_empty() {
         true => vec![boxed(bsn! {
             Node { padding: {UiRect::all(px(8.0))} }
+            TabIndex(0)
+            AccessibleLabel("~/.ssh/config 中没有可用的 Host 条目")
             Children [(widgets::hint("~/.ssh/config 中没有可用的 Host 条目"))]
         })],
         false => session
@@ -394,7 +604,7 @@ fn on_login_field_edit(
 ///
 /// 密码的真实值由 [`PasswordInput`] 维护（文本框里只有遮罩），
 /// 用系统同步可以避开与遮罩 observer 的执行顺序问题。
-fn sync_password(
+pub(super) fn sync_password(
     inputs: Query<&PasswordInput, Changed<PasswordInput>>,
     mut session: ResMut<Session>,
 ) {
@@ -411,7 +621,7 @@ fn refresh_form_fields(
     mut rendered: ResMut<RenderedVersions>,
     mut fields: Query<(&LoginField, &mut EditableText)>,
 ) {
-    if rendered.form == Some(session.form_version) {
+    if rendered.form == Some(session.form_version) || fields.is_empty() {
         return;
     }
     for (field, mut editable) in &mut fields {
@@ -446,10 +656,410 @@ impl Plugin for ConnectPanelPlugin {
                     spawn_connect_panel,
                     rebuild_buttons,
                     rebuild_host_menu,
-                    sync_password,
+                    open_ready_host_menu.after(rebuild_host_menu),
                     refresh_form_fields,
                 )
                     .in_set(UiSet::Rebuild),
+            )
+            .add_systems(
+                PostUpdate,
+                position_open_host_menu.after(bevy::ui::UiSystems::Layout),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::LoginConfig;
+    use crate::ui::{Editor, StatusLine};
+    use bevy::input::InputPlugin;
+    use bevy::input::keyboard::Key;
+    use bevy::input_focus::InputDispatchPlugin;
+    use bevy::scene::ScenePlugin;
+    use bevy::text::{FontCx, LayoutCx};
+    use bevy::ui_widgets::{MenuItem, MenuPlugin};
+    use bevy::window::PrimaryWindow;
+
+    /// 只替代读取磁盘的动作；其余菜单、场景、焦点和表单更新使用实际实现。
+    #[derive(Resource)]
+    struct TestHosts {
+        entries: Vec<SshHostEntry>,
+        reloads: usize,
+        selections: usize,
+        delay_reload: bool,
+        pending_reloads: u64,
+    }
+
+    fn process_test_actions(
+        mut actions: MessageReader<AppAction>,
+        mut source: ResMut<TestHosts>,
+        mut session: ResMut<Session>,
+        mut status: ResMut<StatusLine>,
+    ) {
+        for action in actions.read() {
+            match action {
+                AppAction::ReloadSshHosts => {
+                    source.reloads += 1;
+                    source.pending_reloads += 1;
+                }
+                AppAction::ApplySshHost(index) => {
+                    source.selections += 1;
+                    super::super::worker_bridge::apply_ssh_host(&mut session, &mut status, *index);
+                }
+                _ => panic!("菜单测试收到了无关动作"),
+            }
+        }
+        if !source.delay_reload && source.pending_reloads > 0 {
+            session.ssh_hosts = source.entries.clone();
+            session.hosts_version += source.pending_reloads;
+            source.pending_reloads = 0;
+        }
+    }
+
+    fn entry(alias: &str) -> SshHostEntry {
+        SshHostEntry {
+            alias: alias.into(),
+            host_name: format!("{alias}.example"),
+            port: 2222,
+            user: Some("robot".into()),
+            identity_files: Vec::new(),
+            proxy_jump: None,
+            proxy_command: None,
+        }
+    }
+
+    fn menu_app(entries: Vec<SshHostEntry>) -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            ScenePlugin,
+            InputPlugin,
+            InputDispatchPlugin,
+            MenuPlugin,
+        ))
+        .init_asset::<Font>()
+        .init_asset::<Image>()
+        .init_resource::<InputFocus>()
+        .init_resource::<FontCx>()
+        .init_resource::<LayoutCx>()
+        .init_resource::<bevy::clipboard::Clipboard>()
+        .init_resource::<Editor>()
+        .init_resource::<StatusLine>()
+        .insert_resource(Session::new(LoginConfig::default(), entries.clone()))
+        .insert_resource(TestHosts {
+            entries,
+            reloads: 0,
+            selections: 0,
+            delay_reload: false,
+            pending_reloads: 0,
+        })
+        .add_message::<AppAction>()
+        .configure_sets(
+            Update,
+            (UiSet::Input, UiSet::Update, UiSet::Rebuild).chain(),
+        )
+        .add_plugins((widgets::WidgetsPlugin, ConnectPanelPlugin))
+        .add_systems(Update, process_test_actions.in_set(UiSet::Update))
+        .add_systems(PostUpdate, bevy::text::apply_text_edits);
+        let font = Font::from_bytes(
+            include_bytes!("../../assets/fonts/SarasaTermSCNerd-Regular.ttf").to_vec(),
+        );
+        let mut fonts = app.world_mut().resource_mut::<FontCx>();
+        let registered = fonts.collection.register_fonts(font.data, None);
+        let family = fonts
+            .collection
+            .family_name(registered[0].0)
+            .unwrap()
+            .to_string();
+        fonts.set_sans_serif_family(&family).unwrap();
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app.world_mut().spawn_scene(host_row("")).unwrap();
+        for _ in 0..4 {
+            app.update();
+        }
+        app
+    }
+
+    fn entity_with<T: Component>(app: &mut App) -> Entity {
+        app.world_mut()
+            .query_filtered::<Entity, With<T>>()
+            .single(app.world())
+            .unwrap()
+    }
+
+    fn popup(app: &mut App) -> Entity {
+        entity_with::<HostMenuSlot>(app)
+    }
+
+    fn activate_button(app: &mut App) {
+        let entity = entity_with::<FeathersMenuButton>(app);
+        app.world_mut().trigger(Activate { entity });
+        app.world_mut().flush();
+    }
+
+    fn key(app: &mut App, key_code: KeyCode, logical_key: Key) {
+        let window = entity_with::<PrimaryWindow>(app);
+        app.world_mut().write_message(KeyboardInput {
+            key_code,
+            logical_key,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window,
+        });
+    }
+
+    fn open_and_settle(app: &mut App) {
+        let popup = popup(app);
+        for _ in 0..8 {
+            app.update();
+            if *app.world().get::<Visibility>(popup).unwrap() == Visibility::Visible {
+                // 再推进两帧，让真实 MenuPlugin 检查菜单焦点没有因重建而消失。
+                app.update();
+                app.update();
+                assert_eq!(
+                    app.world().get::<MenuFocusState>(popup),
+                    Some(&MenuFocusState::Open)
+                );
+                assert_eq!(
+                    app.world().get::<Visibility>(popup),
+                    Some(&Visibility::Visible)
+                );
+                return;
+            }
+        }
+        panic!("菜单没有在 BSN 子项就绪后打开");
+    }
+
+    fn items(app: &App, popup: Entity) -> Vec<Entity> {
+        app.world()
+            .get::<Children>(popup)
+            .unwrap()
+            .iter()
+            .filter(|&entity| app.world().get::<MenuItem>(entity).is_some())
+            .collect()
+    }
+
+    #[test]
+    fn 主机菜单刷新旧子项后保持打开且重复切换不产生重复项() {
+        let mut app = menu_app(vec![entry("old")]);
+        let popup = popup(&mut app);
+        let old_item = items(&app, popup)[0];
+        app.world_mut().resource_mut::<TestHosts>().entries = vec![entry("first"), entry("last")];
+        activate_button(&mut app);
+        assert!(
+            app.world()
+                .get::<HostMenuState>(popup)
+                .unwrap()
+                .pending_open
+                .is_some()
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(popup),
+            Some(&Visibility::Hidden)
+        );
+        open_and_settle(&mut app);
+        assert!(app.world().get_entity(old_item).is_err());
+        assert_eq!(items(&app, popup).len(), 2);
+        for item in items(&app, popup) {
+            let node = app.world().get::<Node>(item).unwrap();
+            assert_eq!(node.height, Val::Auto);
+            assert_eq!(node.flex_shrink, 0.0);
+        }
+        assert_eq!(app.world().resource::<TestHosts>().reloads, 1);
+        for expected_reloads in 2..5 {
+            activate_button(&mut app);
+            app.update();
+            assert_eq!(
+                app.world().get::<Visibility>(popup),
+                Some(&Visibility::Hidden)
+            );
+            activate_button(&mut app);
+            open_and_settle(&mut app);
+            assert_eq!(items(&app, popup).len(), 2);
+            assert_eq!(
+                app.world().resource::<TestHosts>().reloads,
+                expected_reloads
+            );
+        }
+    }
+
+    #[test]
+    fn 空主机菜单占位可聚焦并能用逃逸键关闭() {
+        let mut app = menu_app(Vec::new());
+        activate_button(&mut app);
+        open_and_settle(&mut app);
+        let popup = popup(&mut app);
+        let focus = app.world().resource::<InputFocus>().get().unwrap();
+        assert_eq!(app.world().get::<ChildOf>(focus).unwrap().parent(), popup);
+        assert!(app.world().get::<TabIndex>(focus).is_some());
+        key(&mut app, KeyCode::Escape, Key::Escape);
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(popup),
+            Some(&Visibility::Hidden)
+        );
+        let button = entity_with::<FeathersMenuButton>(&mut app);
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(button));
+    }
+
+    #[test]
+    fn 方向键打开时重读主机并聚焦首尾选择后同帧更新表单() {
+        let mut app = menu_app(vec![entry("first"), entry("last")]);
+        let button = entity_with::<FeathersMenuButton>(&mut app);
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(button, FocusCause::Navigated);
+        key(&mut app, KeyCode::ArrowUp, Key::ArrowUp);
+        open_and_settle(&mut app);
+        let popup = popup(&mut app);
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            items(&app, popup).last().copied()
+        );
+        key(&mut app, KeyCode::Enter, Key::Enter);
+        app.update();
+        assert_eq!(app.world().resource::<Session>().login.host, "last.example");
+        assert_eq!(app.world().resource::<TestHosts>().selections, 1);
+        assert_eq!(
+            app.world().get::<Visibility>(popup),
+            Some(&Visibility::Hidden)
+        );
+        let host_text = app
+            .world_mut()
+            .query::<(&LoginField, &EditableText)>()
+            .iter(app.world())
+            .find(|(field, _)| **field == LoginField::Host)
+            .unwrap()
+            .1
+            .value()
+            .to_string();
+        assert_eq!(host_text, "last.example");
+
+        app.world_mut().resource_mut::<TestHosts>().entries = vec![entry("replacement")];
+        key(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        open_and_settle(&mut app);
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            items(&app, popup).first().copied()
+        );
+        assert_eq!(app.world().resource::<TestHosts>().reloads, 2);
+        let window = entity_with::<PrimaryWindow>(&mut app);
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(window, FocusCause::Navigated);
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(popup),
+            Some(&Visibility::Hidden)
+        );
+    }
+
+    #[test]
+    fn 菜单等待子项时重复点击或转移焦点会取消打开意图() {
+        let mut app = menu_app(vec![entry("first")]);
+        let popup = popup(&mut app);
+        activate_button(&mut app);
+        activate_button(&mut app);
+        for _ in 0..4 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().get::<Visibility>(popup),
+            Some(&Visibility::Hidden)
+        );
+        activate_button(&mut app);
+        let window = entity_with::<PrimaryWindow>(&mut app);
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(window, FocusCause::Navigated);
+        for _ in 0..4 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().get::<Visibility>(popup),
+            Some(&Visibility::Hidden)
+        );
+        assert!(
+            app.world()
+                .get::<HostMenuState>(popup)
+                .unwrap()
+                .pending_open
+                .is_none()
+        );
+        assert_eq!(items(&app, popup).len(), 1);
+    }
+
+    #[test]
+    fn 菜单等待配置时逃逸键取消意图且延迟刷新完成后保持关闭() {
+        let mut app = menu_app(vec![entry("first")]);
+        let popup = popup(&mut app);
+        let version = app.world().resource::<Session>().hosts_version;
+        app.world_mut().resource_mut::<TestHosts>().delay_reload = true;
+        activate_button(&mut app);
+        app.update();
+        assert_eq!(app.world().resource::<Session>().hosts_version, version);
+        assert!(
+            app.world()
+                .get::<HostMenuState>(popup)
+                .unwrap()
+                .pending_open
+                .is_some()
+        );
+
+        key(&mut app, KeyCode::Escape, Key::Escape);
+        app.update();
+        let state = app.world().get::<HostMenuState>(popup).unwrap();
+        assert!(state.pending_open.is_none());
+        assert!(state.pending_scroll.is_none());
+        assert_eq!(
+            app.world().get::<Visibility>(popup),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<MenuFocusState>(popup),
+            Some(&MenuFocusState::Closed)
+        );
+
+        app.world_mut().resource_mut::<TestHosts>().delay_reload = false;
+        for _ in 0..4 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<Session>().hosts_version, version + 1);
+        assert_eq!(
+            app.world().get::<Visibility>(popup),
+            Some(&Visibility::Hidden)
+        );
+        let button = entity_with::<FeathersMenuButton>(&mut app);
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(button));
+        activate_button(&mut app);
+        open_and_settle(&mut app);
+        assert_eq!(app.world().resource::<TestHosts>().reloads, 2);
+    }
+
+    #[test]
+    fn 主机菜单每次打开按方向键重置逻辑像素滚动位置() {
+        let mut app = menu_app(vec![entry("first"), entry("last")]);
+        let popup = popup(&mut app);
+        app.world_mut().entity_mut(popup).insert(ComputedNode {
+            size: Vec2::new(600.0, 200.0),
+            content_size: Vec2::new(600.0, 1800.0),
+            inverse_scale_factor: 0.5,
+            ..default()
+        });
+        let button = entity_with::<FeathersMenuButton>(&mut app);
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(button, FocusCause::Navigated);
+        key(&mut app, KeyCode::ArrowUp, Key::ArrowUp);
+        open_and_settle(&mut app);
+        assert_eq!(app.world().get::<ScrollPosition>(popup).unwrap().y, 800.0);
+        key(&mut app, KeyCode::Escape, Key::Escape);
+        app.update();
+        activate_button(&mut app);
+        open_and_settle(&mut app);
+        assert_eq!(app.world().get::<ScrollPosition>(popup).unwrap().y, 0.0);
     }
 }

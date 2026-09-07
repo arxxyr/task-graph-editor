@@ -235,8 +235,11 @@ fn slot_in_value(value: &ContextValue, slot: ValueSlot) -> Option<f64> {
     }
 }
 
-/// 按绑定把 f64 写回数据；定位失败返回 `false`
+/// 按绑定把有限 f64 写回数据；非有限值或定位失败返回 `false`。
 pub fn apply_f64(data: &mut TaskGraphData, binding: &ValueBinding, value: f64) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
     let Some(field) = field_at_path_mut(&mut data.context_fields, &binding.field_path) else {
         return false;
     };
@@ -429,6 +432,35 @@ mod tests {
             data.context_fields[2].value,
             ContextValue::Integer(42)
         ));
+    }
+
+    #[test]
+    fn 所有浮点槽位拒绝非有限值并保持原数据() {
+        let mut data = sample_data();
+        let bindings = [
+            ValueBinding::new(vec![1], ValueSlot::Scalar),
+            ValueBinding::new(vec![0], ValueSlot::Pose(PosePart::Chassis, PoseComp::PosX)),
+            ValueBinding::new(vec![5], ValueSlot::Array1D(0)),
+            ValueBinding::new(vec![6], ValueSlot::Array2D(0, 0)),
+            ValueBinding::new(vec![7], ValueSlot::TrajTime(0)),
+            ValueBinding::new(vec![7], ValueSlot::TrajJoint(0, 0)),
+            ValueBinding::new(
+                vec![8],
+                ValueSlot::PoseArray(0, PosePart::Head, PoseComp::OriW),
+            ),
+            ValueBinding::new(
+                vec![9, 0, 0],
+                ValueSlot::Pose(PosePart::Waist, PoseComp::PosZ),
+            ),
+        ];
+        for binding in &bindings {
+            let original = read_f64(&data, binding);
+            assert!(original.is_some());
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(!apply_f64(&mut data, binding, invalid));
+                assert_eq!(read_f64(&data, binding), original);
+            }
+        }
     }
 
     #[test]

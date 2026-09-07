@@ -10,7 +10,7 @@ use bevy::feathers::controls::{
 use bevy::feathers::theme::{
     ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, ThemeToken, ThemedText,
 };
-use bevy::feathers::tokens;
+use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 use bevy::text::{EditableText, FontWeight, LineBreak};
 use bevy::ui::{Checked, InteractionDisabled};
@@ -81,11 +81,14 @@ const CHEVRON_CLOSED: &str = "▸";
 
 /// 点击头部：切换所属折叠区块的展开状态
 fn on_header_click(
-    click: On<Pointer<Click>>,
+    mut click: On<Pointer<Click>>,
     headers: Query<(), With<CollapseHeader>>,
     parents: Query<&ChildOf>,
     mut sections: Query<&mut Collapsible>,
 ) {
+    if click.button != PointerButton::Primary {
+        return;
+    }
     // 点中的多半是标题里的文字，往上找到头部那一层
     let Some(header) = self_or_ancestor(click.entity, &parents, |e| headers.contains(e)) else {
         return;
@@ -95,6 +98,8 @@ fn on_header_click(
     };
     if let Ok(mut section) = sections.get_mut(parent.parent()) {
         section.open = !section.open;
+        // 全局 observer 会随事件冒泡再次执行，处理后必须阻止父级重复切换。
+        click.propagate(false);
     }
 }
 
@@ -430,7 +435,8 @@ pub fn text_field(initial: impl Into<String>, marker: impl Marker) -> impl Scene
     let initial = initial.into();
     bsn! {
         @FeathersTextInputContainer
-        Node { flex_grow: 1.0 }
+        Node { flex_grow: 1.0, border: {UiRect::all(px(1.0))} }
+        ThemeBorderColor({theme::INPUT_BORDER})
         Children [(
             @FeathersTextInput
             template_value(EditableText::new(initial))
@@ -444,7 +450,8 @@ pub fn password_field(initial: impl Into<String>, marker: impl Marker) -> impl S
     let initial = initial.into();
     bsn! {
         @FeathersTextInputContainer
-        Node { flex_grow: 1.0 }
+        Node { flex_grow: 1.0, border: {UiRect::all(px(1.0))} }
+        ThemeBorderColor({theme::INPUT_BORDER})
         Children [(
             @FeathersTextInput
             template_value(super::password::PasswordInput::new(initial))
@@ -464,8 +471,9 @@ pub fn number_field(
 ) -> impl Scene {
     let (sigil, label) = match axis {
         Some((token, text)) => (token, Some(text)),
-        None => (tokens::TEXT_INPUT_BG, None),
+        None => (theme::INPUT_BORDER, None),
     };
+    let normal_border = NumberFieldBorder(sigil.clone());
     bsn! {
         @FeathersNumberInput {
             @sigil_color: sigil,
@@ -474,6 +482,7 @@ pub fn number_field(
         }
         Node { flex_grow: 1.0 }
         template_value(marker)
+        template_value(normal_border)
         template_value(NumberFieldInit(NumberInitValue::F64(value)))
     }
 }
@@ -482,10 +491,12 @@ pub fn number_field(
 pub fn int_field(value: i64, marker: impl Marker) -> impl Scene {
     bsn! {
         @FeathersNumberInput {
-            @number_format: {NumberFormat::I64}
+            @number_format: {NumberFormat::I64},
+            @sigil_color: {theme::INPUT_BORDER}
         }
         Node { flex_grow: 1.0 }
         template_value(marker)
+        template_value(NumberFieldBorder(theme::INPUT_BORDER))
         template_value(NumberFieldInit(NumberInitValue::I64(value)))
     }
 }
@@ -496,6 +507,13 @@ pub fn int_field(value: i64, marker: impl Marker) -> impl Scene {
 /// `UpdateNumberInput` 事件写入，这里用一个一次性组件记录待写入的值。
 #[derive(Component, Clone, Copy, Default)]
 pub struct NumberFieldInit(pub NumberInitValue);
+
+/// 数值输入的正常色条，输入错误修复后恢复轴色。
+#[derive(Component, Clone, Default)]
+pub struct NumberFieldBorder(pub ThemeToken);
+
+/// 完整十进制 f64（含负的最小次正规数）不超过 327 字符，预留编辑余量。
+pub const NUMBER_MAX_CHARACTERS: usize = 512;
 
 /// 数值输入初值的类型
 #[derive(Clone, Copy, Default)]
@@ -564,16 +582,18 @@ pub fn button_gated(
 fn sync_button_gates(
     session: Res<super::Session>,
     editor: Res<super::Editor>,
-    buttons: Query<(Entity, &ButtonGate, Has<InteractionDisabled>)>,
+    buttons: Query<(Entity, Ref<ButtonGate>, Has<InteractionDisabled>)>,
     mut commands: Commands,
 ) {
-    if !session.is_changed() && !editor.is_changed() {
-        return;
-    }
-    let idle = !session.is_busy();
+    let state_changed = session.is_changed() || editor.is_changed();
+    let idle = session.interactive();
     let has_pose = editor.has_pose_selection();
     for (entity, gate, disabled) in &buttons {
-        let enabled = match gate {
+        // BSN 可能在资源变化数帧后才落地，新控件仍须初始化禁用态。
+        if !state_changed && !gate.is_changed() {
+            continue;
+        }
+        let enabled = match *gate {
             ButtonGate::Always => true,
             ButtonGate::WhenIdle => idle,
             ButtonGate::WhenIdleAndPose => idle && has_pose,
@@ -650,7 +670,101 @@ impl Plugin for WidgetsPlugin {
     fn build(&self, app: &mut App) {
         app.add_observer(on_header_click).add_systems(
             Update,
-            (sync_collapse_state, clear_slot_pending, sync_button_gates),
+            (sync_collapse_state, clear_slot_pending, sync_button_gates)
+                .in_set(super::UiSet::Rebuild),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn click(entity: Entity, button: PointerButton) -> Pointer<Click> {
+        Pointer::new(
+            bevy::picking::pointer::PointerId::Mouse,
+            bevy::picking::pointer::Location {
+                target: bevy::camera::NormalizedRenderTarget::None {
+                    width: 1,
+                    height: 1,
+                },
+                position: Vec2::ZERO,
+            },
+            Click {
+                button,
+                hit: bevy::picking::backend::HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+                duration: std::time::Duration::ZERO,
+                count: 1,
+            },
+            entity,
+        )
+    }
+
+    #[test]
+    fn 标题文字和空白主键点击各只切换一次且右键不切换() {
+        let mut app = App::new();
+        app.add_observer(on_header_click);
+        // PointerTraversal 需要 Window 查询；使用真实层级验证事件冒泡。
+        app.world_mut().spawn(Window::default());
+        let outer = app.world_mut().spawn(Collapsible { open: false }).id();
+        let outer_header = app.world_mut().spawn((CollapseHeader, ChildOf(outer))).id();
+        let inner = app
+            .world_mut()
+            .spawn((Collapsible { open: false }, ChildOf(outer_header)))
+            .id();
+        let header = app.world_mut().spawn((CollapseHeader, ChildOf(inner))).id();
+        let text = app.world_mut().spawn(ChildOf(header)).id();
+
+        app.world_mut().trigger(click(text, PointerButton::Primary));
+        assert!(app.world().get::<Collapsible>(inner).unwrap().open);
+        assert!(!app.world().get::<Collapsible>(outer).unwrap().open);
+        app.world_mut()
+            .trigger(click(header, PointerButton::Primary));
+        assert!(!app.world().get::<Collapsible>(inner).unwrap().open);
+        app.world_mut()
+            .trigger(click(text, PointerButton::Secondary));
+        assert!(!app.world().get::<Collapsible>(inner).unwrap().open);
+        assert!(!app.world().get::<Collapsible>(outer).unwrap().open);
+    }
+
+    #[test]
+    fn 跨帧新按钮和门控变化均初始化禁用态() {
+        let mut app = App::new();
+        app.insert_resource(super::super::Session::new(
+            crate::model::LoginConfig::default(),
+            Vec::new(),
+        ))
+        .init_resource::<super::super::Editor>()
+        .add_systems(Update, sync_button_gates);
+        app.update();
+        let button = app.world_mut().spawn(ButtonGate::WhenIdleAndPose).id();
+        app.update();
+        assert!(app.world().get::<InteractionDisabled>(button).is_some());
+
+        app.world_mut()
+            .entity_mut(button)
+            .insert(ButtonGate::Always);
+        app.update();
+        assert!(app.world().get::<InteractionDisabled>(button).is_none());
+
+        app.world_mut()
+            .resource_mut::<super::super::Session>()
+            .reconnect_status = Some("重连中".into());
+        let reconnect_button = app.world_mut().spawn(ButtonGate::WhenIdle).id();
+        app.update();
+        assert!(
+            app.world()
+                .get::<InteractionDisabled>(reconnect_button)
+                .is_some()
+        );
+        app.world_mut()
+            .resource_mut::<super::super::Session>()
+            .reconnect_status = None;
+        app.update();
+        assert!(
+            app.world()
+                .get::<InteractionDisabled>(reconnect_button)
+                .is_none()
         );
     }
 }

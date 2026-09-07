@@ -4,29 +4,46 @@
 //! 布局：
 //! ```text
 //! ┌──────────────────────────────────────────────┐
-//! │ ● 任务图编辑器   当前文件      [远程操作按钮] │ 顶栏
-//! ├─────────────┬────────────────────────────────┤
+//! │ ● 标题      │ [参数 / 流程图] 文件 [编辑操作] │ 顶栏
+//! ├─────────────┼────────────────────────────────┤
 //! │ 连接卡片    │  元数据 + 字段分组编辑器        │
 //! │ 文件列表    │  （可滚动）                     │
 //! ├─────────────┴────────────────────────────────┤
-//! │ ● 状态消息                      忙碌/重连提示 │ 状态栏
+//! │ [复制提示] 状态消息                  连接目标 │ 状态栏
 //! └──────────────────────────────────────────────┘
 //! ```
 
-use bevy::feathers::theme::{ThemeBackgroundColor, ThemeTextColor, ThemeToken};
+use bevy::clipboard::{Clipboard, ClipboardError};
+use bevy::feathers::controls::{ButtonVariant, FeathersButton};
+use bevy::feathers::theme::{
+    InheritableThemeTextColor, ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, ThemeToken,
+    ThemedText,
+};
 use bevy::input::mouse::MouseWheel;
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::text::FontWeight;
-use bevy::ui::UiScale;
-use bevy::ui_widgets::ScrollArea;
+use bevy::text::{FontWeight, LineBreak};
+use bevy::ui::{InteractionDisabled, Pressed, UiScale};
+use bevy::ui_widgets::{Activate, ScrollArea};
 
 use super::theme;
 use super::widgets;
-use super::{Editor, FileBrowser, Session, StatusLine, UiSet};
+use super::{Editor, Session, StatusLine, UiSet};
 
 /// 顶栏右侧的远程操作按钮区
 #[derive(Component, Default, Clone)]
 pub struct ActionBarSlot;
+
+/// 窄窗口把编辑操作放到第二行，视图入口与主题选择仍保持在第一行两端。
+#[derive(Component, Clone, Default)]
+enum AppBarCell {
+    #[default]
+    Layout,
+    Filename,
+    Spacer,
+    Actions,
+    Theme,
+}
 
 /// 侧栏中的连接面板插槽
 #[derive(Component, Default, Clone)]
@@ -52,7 +69,7 @@ pub struct GraphPane;
 #[derive(Component, Default, Clone)]
 pub struct GraphSlot;
 
-/// 顶栏的视图切换按钮插槽
+/// 右侧功能区顶栏起始处的独立视图切换按钮组
 #[derive(Component, Default, Clone)]
 pub struct ViewSwitchSlot;
 
@@ -67,6 +84,49 @@ pub struct CurrentFileText;
 /// 状态栏的状态文字
 #[derive(Component, Default, Clone)]
 pub struct StatusText;
+
+/// 保存当前显示的完整提示，复制反馈只影响按钮，不覆盖原提示。
+#[derive(Component, Default, Clone)]
+struct StatusCopyButton {
+    text: String,
+    feedback: CopyFeedback,
+}
+
+#[derive(Default, Clone)]
+enum CopyFeedback {
+    #[default]
+    Ready,
+    Copied,
+    Failed,
+}
+
+impl CopyFeedback {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ready => "复制提示",
+            Self::Copied => "已复制",
+            Self::Failed => "复制失败",
+        }
+    }
+}
+
+impl StatusCopyButton {
+    fn copy_with(&mut self, write: impl FnOnce(&str) -> Result<(), ClipboardError>) {
+        if self.text.is_empty() {
+            return;
+        }
+        self.feedback = match write(&self.text) {
+            Ok(()) => CopyFeedback::Copied,
+            Err(error) => {
+                warn!(%error, "复制状态提示失败");
+                CopyFeedback::Failed
+            }
+        };
+    }
+}
+
+#[derive(Component, Default, Clone)]
+struct StatusCopyLabel;
 
 /// 状态栏右侧的连接目标
 #[derive(Component, Default, Clone)]
@@ -125,62 +185,163 @@ fn context_menu_layer() -> impl Scene {
         }
         ContextMenuRoot
         ThemeBackgroundColor({bevy::feathers::tokens::MENU_BG})
-        BorderColor::all(Color::NONE)
+        ThemeBorderColor({bevy::feathers::tokens::MENU_BORDER})
     }
 }
 
-/// 顶栏
+/// 顶栏与主体共用侧栏宽度，左侧是选择区标题，右侧是文档功能。
 fn app_bar() -> impl Scene {
     bsn! {
         Node {
             width: percent(100),
-            height: {px(theme::APPBAR_HEIGHT)},
+            min_height: {px(theme::APPBAR_HEIGHT)},
             flex_shrink: 0.0,
             flex_direction: FlexDirection::Row,
-            align_items: AlignItems::Center,
-            column_gap: px(10),
-            padding: {UiRect::horizontal(px(theme::PAD + 2.0))},
             border: {UiRect::bottom(px(1.0))},
         }
         ThemeBackgroundColor({theme::APPBAR_BG})
-        BorderColor::all(Color::NONE)
+        ThemeBorderColor({theme::DIVIDER})
         Children [
-            (widgets::status_dot(theme::DOT_DISCONNECTED) ConnectionDot),
-            (
-                Text("任务图编辑器")
-                ThemeTextColor({theme::SECTION_TEXT})
-                TextFont {
-                    font_size: px(15.0),
-                    weight: {FontWeight::BOLD}
-                }
-            ),
-            (
-                Node { margin: {UiRect::left(px(4.0))} }
-                Text("")
-                CurrentFileText
-                ThemeTextColor({theme::READONLY_TEXT})
-                TextFont { font_size: px(12.0) }
-            ),
-            widgets::spacer(),
             (
                 Node {
-                    flex_direction: FlexDirection::Row,
+                    width: {px(theme::SIDEBAR_WIDTH)},
+                    flex_shrink: 0.0,
                     align_items: AlignItems::Center,
-                    column_gap: px(4),
-                    margin: {UiRect::right(px(4.0))},
+                    column_gap: px(10),
+                    padding: {UiRect::horizontal(px(theme::PAD + 2.0))},
                 }
-                ViewSwitchSlot
+                Children [
+                    (widgets::status_dot(theme::DOT_DISCONNECTED) ConnectionDot),
+                    (
+                        Text("任务图编辑器")
+                        ThemeTextColor({theme::SECTION_TEXT})
+                        TextFont {
+                            font_size: px(15.0),
+                            weight: {FontWeight::BOLD}
+                        }
+                    ),
+                ]
             ),
             (
                 Node {
-                    flex_direction: FlexDirection::Row,
+                    flex_grow: 1.0,
+                    min_width: px(0),
+                    display: Display::Grid,
                     align_items: AlignItems::Center,
-                    column_gap: px(6),
+                    column_gap: px(10),
+                    row_gap: px(6),
+                    padding: {UiRect::axes(px(theme::PAD + 2.0), px(theme::PAD_SM))},
                 }
-                ActionBarSlot
-            )
+                template_value(AppBarCell::Layout)
+                Children [
+                    (
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::FlexStart,
+                            align_items: AlignItems::Center,
+                            flex_shrink: 0.0,
+                            column_gap: px(4),
+                            grid_row: {GridPlacement::start(1)},
+                            grid_column: {GridPlacement::start(1)},
+                        }
+                        ViewSwitchSlot
+                    ),
+                    (
+                        Node {
+                            min_width: px(0),
+                            overflow: {Overflow::clip()},
+                            grid_row: {GridPlacement::start(1)},
+                            grid_column: {GridPlacement::start(2)},
+                        }
+                        template_value(AppBarCell::Filename)
+                        Children [(
+                            Text("")
+                            TextLayout { linebreak: LineBreak::NoWrap }
+                            CurrentFileText
+                            ThemeTextColor({theme::READONLY_TEXT})
+                            TextFont { font_size: px(12.0) }
+                            Node { flex_shrink: 0.0 }
+                        )]
+                    ),
+                    (widgets::spacer() template_value(AppBarCell::Spacer)),
+                    (
+                        Node {
+                            min_width: px(0),
+                            flex_direction: FlexDirection::Row,
+                            flex_wrap: FlexWrap::Wrap,
+                            justify_content: JustifyContent::FlexEnd,
+                            align_items: AlignItems::Center,
+                            column_gap: px(6),
+                            row_gap: px(6),
+                        }
+                        ActionBarSlot
+                        template_value(AppBarCell::Actions)
+                    ),
+                    (
+                        Node { justify_self: JustifySelf::End }
+                        template_value(AppBarCell::Theme)
+                        Children [super::theme_picker::theme_picker()]
+                    ),
+                ]
+            ),
         ]
     }
+}
+
+fn sync_app_bar_layout(
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    scale: Res<UiScale>,
+    mut cells: Query<(&mut Node, Ref<AppBarCell>)>,
+    mut previous: Local<Option<bool>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let compact = window.width() / scale.0 < 1200.0;
+    for (mut node, cell) in &mut cells {
+        if *previous == Some(compact) && !cell.is_added() {
+            continue;
+        }
+        match *cell {
+            AppBarCell::Layout => {
+                node.display = match compact {
+                    true => Display::Grid,
+                    false => Display::Flex,
+                };
+                if compact {
+                    node.grid_template_columns = vec![
+                        RepeatedGridTrack::auto(1),
+                        RepeatedGridTrack::flex(1, 1.0),
+                        RepeatedGridTrack::auto(1),
+                    ];
+                }
+            }
+            AppBarCell::Filename => {
+                node.max_width = match compact {
+                    true => Val::Auto,
+                    false => percent(20),
+                };
+            }
+            AppBarCell::Spacer => {
+                node.display = match compact {
+                    true => Display::None,
+                    false => Display::Flex,
+                };
+            }
+            AppBarCell::Actions => {
+                node.grid_row = GridPlacement::start(if compact { 2 } else { 1 });
+                node.grid_column = match compact {
+                    true => GridPlacement::start_span(1, 3),
+                    false => GridPlacement::start(3),
+                };
+            }
+            AppBarCell::Theme => {
+                node.grid_row = GridPlacement::start(1);
+                node.grid_column = GridPlacement::start(if compact { 3 } else { 4 });
+            }
+        }
+    }
+    *previous = Some(compact);
 }
 
 /// 中部主体：侧栏 + 内容区
@@ -214,7 +375,7 @@ fn sidebar() -> impl Scene {
         }
         ScrollArea
         ThemeBackgroundColor({theme::SIDEBAR_BG})
-        BorderColor::all(Color::NONE)
+        ThemeBorderColor({theme::DIVIDER})
         Children [
             (
                 Node {
@@ -294,22 +455,142 @@ fn status_bar() -> impl Scene {
             border: {UiRect::top(px(1.0))},
         }
         ThemeBackgroundColor({theme::STATUSBAR_BG})
-        BorderColor::all(Color::NONE)
+        ThemeBorderColor({theme::DIVIDER})
         Children [
             (
-                Text("")
-                StatusText
-                ThemeTextColor({theme::STATUS_OK})
-                TextFont { font_size: px(12.0) }
+                @FeathersButton {
+                    @variant: ButtonVariant::Plain,
+                    @caption: {bsn! {
+                        Text("复制提示")
+                        StatusCopyLabel
+                        ThemedText
+                        TextFont { font_size: px(12.0) }
+                    }}
+                }
+                Node { height: px(24), width: px(78), flex_shrink: 0.0 }
+                StatusCopyButton
+                InteractionDisabled
+                AccessibleLabel("复制完整状态提示")
+                on(on_copy_status)
             ),
-            widgets::spacer(),
             (
-                Text("")
-                ConnectionTargetText
-                ThemeTextColor({theme::READONLY_TEXT})
-                TextFont { font_size: px(12.0) }
+                Node {
+                    flex_grow: 1.0,
+                    flex_basis: px(0),
+                    min_width: px(0),
+                    height: percent(100),
+                    align_items: AlignItems::Center,
+                    overflow: {Overflow::clip()},
+                }
+                Children [(
+                    Text("")
+                    TextLayout { linebreak: LineBreak::NoWrap }
+                    StatusText
+                    ThemeTextColor({theme::STATUS_OK})
+                    TextFont { font_size: px(12.0) }
+                    Node { flex_shrink: 0.0 }
+                )]
+            ),
+            (
+                Node { max_width: percent(30), min_width: px(0), overflow: {Overflow::clip()} }
+                Children [(
+                    Text("")
+                    TextLayout { linebreak: LineBreak::NoWrap }
+                    ConnectionTargetText
+                    ThemeTextColor({theme::READONLY_TEXT})
+                    TextFont { font_size: px(12.0) }
+                    Node { flex_shrink: 0.0 }
+                )]
             )
         ]
+    }
+}
+
+/// 从当前已经显示的提示复制，长文本的视觉裁剪不影响剪贴板内容。
+fn on_copy_status(
+    event: On<Activate>,
+    mut buttons: Query<&mut StatusCopyButton>,
+    mut clipboard: ResMut<Clipboard>,
+) {
+    if let Ok(mut button) = buttons.get_mut(event.entity) {
+        button.copy_with(|text| clipboard.set_text(text));
+    }
+}
+
+type CopyButtonStyles<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Hovered,
+        Has<Pressed>,
+        Has<InteractionDisabled>,
+        &'static ThemeBackgroundColor,
+        &'static InheritableThemeTextColor,
+    ),
+    With<StatusCopyButton>,
+>;
+
+/// 复制入口使用独立主题色；保留 Feathers 的键鼠与焦点行为，仅接管颜色样式。
+fn sync_copy_button_style(
+    new_buttons: Query<Entity, (With<StatusCopyButton>, With<ButtonVariant>)>,
+    buttons: CopyButtonStyles,
+    mut commands: Commands,
+) {
+    // 去掉通用样式分发标记，避免鼠标悬停时被普通按钮底色覆盖。
+    for entity in &new_buttons {
+        commands.entity(entity).remove::<ButtonVariant>();
+    }
+    for (entity, hovered, pressed, disabled, background, text) in &buttons {
+        let (bg, fg) = match (disabled, pressed || hovered.0) {
+            (true, _) => (
+                bevy::feathers::tokens::BUTTON_BG_DISABLED,
+                bevy::feathers::tokens::BUTTON_TEXT_DISABLED,
+            ),
+            (false, true) => (theme::COPY_BG_HOVER, theme::COPY_TEXT),
+            (false, false) => (theme::COPY_BG, theme::COPY_TEXT),
+        };
+        if background.0 != bg {
+            commands.entity(entity).insert(ThemeBackgroundColor(bg));
+        }
+        if text.0 != fg {
+            commands
+                .entity(entity)
+                .insert(InheritableThemeTextColor(fg));
+        }
+    }
+}
+
+/// 同步复制源、空提示禁用态及独立反馈，也覆盖跨帧生成的按钮。
+fn sync_status_copy(
+    messages: Query<&Text, With<StatusText>>,
+    mut buttons: Query<(Entity, &mut StatusCopyButton, Has<InteractionDisabled>)>,
+    mut labels: Query<&mut Text, (With<StatusCopyLabel>, Without<StatusText>)>,
+    mut commands: Commands,
+) {
+    let Ok(message) = messages.single() else {
+        return;
+    };
+    for (entity, mut button, disabled) in &mut buttons {
+        if button.text != message.0 {
+            button.text.clone_from(&message.0);
+            button.feedback = CopyFeedback::Ready;
+        }
+        match (button.text.is_empty(), disabled) {
+            (true, false) => {
+                commands.entity(entity).insert(InteractionDisabled);
+            }
+            (false, true) => {
+                commands.entity(entity).remove::<InteractionDisabled>();
+            }
+            _ => {}
+        }
+        for mut label in &mut labels {
+            let expected = button.feedback.label();
+            if label.0 != expected {
+                label.0 = expected.into();
+            }
+        }
     }
 }
 
@@ -321,13 +602,18 @@ fn status_bar() -> impl Scene {
 fn sync_status_bar(
     status: Res<StatusLine>,
     session: Res<Session>,
-    texts: Query<Entity, With<StatusText>>,
-    targets: Query<Entity, With<ConnectionTargetText>>,
-    dots: Query<Entity, With<ConnectionDot>>,
+    texts: Query<(Entity, Ref<StatusText>)>,
+    targets: Query<(Entity, Ref<ConnectionTargetText>)>,
+    dots: Query<(Entity, Ref<ConnectionDot>)>,
     mut all_text: Query<&mut Text>,
     mut commands: Commands,
 ) {
-    if !status.is_changed() && !session.is_changed() {
+    if !status.is_changed()
+        && !session.is_changed()
+        && !texts.iter().any(|(_, marker)| marker.is_added())
+        && !targets.iter().any(|(_, marker)| marker.is_added())
+        && !dots.iter().any(|(_, marker)| marker.is_added())
+    {
         return;
     }
 
@@ -336,7 +622,7 @@ fn sync_status_bar(
         (None, true) => (session.busy_text(), theme::STATUS_WARN),
         (None, false) => (status.text.clone(), theme::status_token(status.level())),
     };
-    for entity in &texts {
+    for (entity, _) in &texts {
         if let Ok(mut text) = all_text.get_mut(entity) {
             text.0.clone_from(&message);
         }
@@ -347,20 +633,21 @@ fn sync_status_bar(
     }
 
     let target = match session.is_connected {
-        true => format!(
-            "{}@{}:{}",
-            session.login.username, session.login.host, session.login.port
-        ),
+        true => session
+            .target
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
         false => String::new(),
     };
-    for entity in &targets {
+    for (entity, _) in &targets {
         if let Ok(mut text) = all_text.get_mut(entity) {
             text.0.clone_from(&target);
         }
     }
 
     let dot_token = connection_dot_token(&session);
-    for entity in &dots {
+    for (entity, _) in &dots {
         commands
             .entity(entity)
             .insert(ThemeBackgroundColor(dot_token.clone()));
@@ -378,16 +665,15 @@ fn connection_dot_token(session: &Session) -> ThemeToken {
 
 /// 顶栏显示当前打开的文件
 fn sync_current_file(
-    browser: Res<FileBrowser>,
     editor: Res<Editor>,
     labels: Query<Entity, With<CurrentFileText>>,
     mut all_text: Query<&mut Text>,
 ) {
-    if !browser.is_changed() && !editor.is_changed() {
+    if !editor.is_changed() {
         return;
     }
-    let label = match (&browser.selected, editor.data.is_some()) {
-        (Some(name), true) => format!("— {name}"),
+    let label = match (&editor.document, editor.data.is_some()) {
+        (Some(document), true) => format!("— {}", document.filename),
         _ => String::new(),
     };
     for entity in &labels {
@@ -439,8 +725,18 @@ impl Plugin for ShellPlugin {
             Update,
             (
                 handle_ui_scale.in_set(UiSet::Input),
-                (sync_status_bar, sync_current_file).in_set(UiSet::Rebuild),
+                (
+                    sync_status_bar,
+                    sync_status_copy.after(sync_status_bar),
+                    sync_copy_button_style.after(sync_status_copy),
+                    sync_current_file,
+                    sync_app_bar_layout,
+                )
+                    .in_set(UiSet::Rebuild),
             ),
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

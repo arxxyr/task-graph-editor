@@ -28,8 +28,11 @@ const GAP_Y: f32 = 48.0;
 /// 画布四周留白
 const PAD: f32 = 32.0;
 
-/// 回边向右绕出的基础距离
-const BACK_BULGE: f32 = 36.0;
+/// 避障通道与所跨区域右边界的距离
+const SIDE_BULGE: f32 = 36.0;
+
+/// 纵向范围重叠的通道之间的距离
+const LANE_GAP: f32 = 12.0;
 
 /// 节点在图里的角色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +218,7 @@ pub fn layout(graph: &SubGraph) -> GraphLayout {
     }
 
     let bottom_row = rows.keys().copied().max().unwrap_or(0);
-    let nodes = ids
+    let nodes: Vec<PlacedNode> = ids
         .iter()
         .map(|id| PlacedNode {
             id: id.clone(),
@@ -229,19 +232,36 @@ pub fn layout(graph: &SubGraph) -> GraphLayout {
         .collect();
 
     let mut right_edge = PAD + content_w;
+    let mut lanes: Vec<(usize, usize, f32)> = Vec::new();
     let placed_edges = edges
         .iter()
         .map(|e| {
             let a = pos[e.from.as_str()];
             let b = pos[e.to.as_str()];
             let is_back = back.contains(&(e.from.clone(), e.to.clone()));
-            let points = match is_back {
+            let direct = forward_route(a, b);
+            let needs_lane = is_back
+                || nodes.iter().any(|node| {
+                    node.id != e.from && node.id != e.to && route_intersects_node(&direct, node.pos)
+                });
+            let points = match needs_lane {
                 true => {
-                    let lane = back_lane(&rows, rank[&e.from], rank[&e.to], content_w);
+                    let from_row = rank[&e.from];
+                    let to_row = rank[&e.to];
+                    let lo = from_row.min(to_row);
+                    let hi = from_row.max(to_row);
+                    let mut lane = side_lane(&rows, from_row, to_row, content_w);
+                    // 共用一条纵线会掩盖跨层依赖，因此重叠区域分配独立通道。
+                    while lanes.iter().any(|&(other_lo, other_hi, other_x)| {
+                        lo <= other_hi && hi >= other_lo && (lane - other_x).abs() < LANE_GAP
+                    }) {
+                        lane += LANE_GAP;
+                    }
+                    lanes.push((lo, hi, lane));
                     right_edge = right_edge.max(lane);
-                    back_route(a, b, lane)
+                    side_route(a, b, lane)
                 }
-                false => forward_route(a, b),
+                false => direct,
             };
             PlacedEdge {
                 points,
@@ -260,11 +280,11 @@ pub fn layout(graph: &SubGraph) -> GraphLayout {
     }
 }
 
-/// 回边通道的 x 坐标
+/// 避障通道的 x 坐标
 ///
 /// 贴着这条边纵向跨过的那几层里最宽的一层，而不是全图最宽层——
 /// 否则一条只穿过单列区域的回边会被甩到很远的右边，看着像断掉的线。
-fn back_lane(
+fn side_lane(
     rows: &HashMap<usize, Vec<&String>>,
     from_row: usize,
     to_row: usize,
@@ -281,7 +301,7 @@ fn back_lane(
         .unwrap_or(1);
     let span_w = widest as f32 * NODE_W + (widest.saturating_sub(1)) as f32 * GAP_X;
     // 每层都对齐到内容中线，所以这段区域的右边界在中线右侧 span_w/2 处
-    PAD + (content_w + span_w) / 2.0 + BACK_BULGE
+    PAD + (content_w + span_w) / 2.0 + SIDE_BULGE
 }
 
 /// 顺行边：从上一个节点底边到下一个节点顶边，必要时中途横移
@@ -302,17 +322,43 @@ fn forward_route(a: Vec2, b: Vec2) -> Vec<Vec2> {
     ]
 }
 
-/// 回边：从右侧绕出去再折回来，避免和主干重叠
+/// 检查正交折线是否碰到节点矩形，边界接触也视为遮挡。
+fn route_intersects_node(points: &[Vec2], pos: Vec2) -> bool {
+    points.windows(2).any(|pair| {
+        let (a, b) = (pair[0], pair[1]);
+        match a.x == b.x {
+            true => {
+                a.x >= pos.x
+                    && a.x <= pos.x + NODE_W
+                    && a.y.max(b.y) >= pos.y
+                    && a.y.min(b.y) <= pos.y + NODE_H
+            }
+            false => {
+                a.y >= pos.y
+                    && a.y <= pos.y + NODE_H
+                    && a.x.max(b.x) >= pos.x
+                    && a.x.min(b.x) <= pos.x + NODE_W
+            }
+        }
+    })
+}
+
+/// 经层间空白绕到右侧：顺行跨层、回边、自环均不横穿同层其他节点。
 ///
-/// `lane` 是通道的 x 坐标，由 [`back_lane`] 按这条边跨过的层算好。
-fn back_route(a: Vec2, b: Vec2, lane: f32) -> Vec<Vec2> {
-    let y1 = a.y + NODE_H / 2.0;
-    let y2 = b.y + NODE_H / 2.0;
+/// 离开与进入节点的横线分别放在下方、上方间隙，纵线放在所跨区域外。
+/// 每端只占间隙的三分之一，最顶/最底层仍落在画布留白内。
+fn side_route(a: Vec2, b: Vec2, lane: f32) -> Vec<Vec2> {
+    let start = Vec2::new(a.x + NODE_W / 2.0, a.y + NODE_H);
+    let end = Vec2::new(b.x + NODE_W / 2.0, b.y);
+    let leave_y = start.y + GAP_Y / 3.0;
+    let enter_y = end.y - GAP_Y / 3.0;
     vec![
-        Vec2::new(a.x + NODE_W, y1),
-        Vec2::new(lane, y1),
-        Vec2::new(lane, y2),
-        Vec2::new(b.x + NODE_W, y2),
+        start,
+        Vec2::new(start.x, leave_y),
+        Vec2::new(lane, leave_y),
+        Vec2::new(lane, enter_y),
+        Vec2::new(end.x, enter_y),
+        end,
     ]
 }
 
@@ -519,9 +565,9 @@ mod tests {
         let back: Vec<&PlacedEdge> = out.edges.iter().filter(|e| e.back).collect();
         assert_eq!(back.len(), 1, "应当只有 c→b 一条回边");
 
-        let lane = back[0].points[1].x;
+        let lane = back[0].points.iter().map(|p| p.x).fold(0.0, f32::max);
         let widest_row_w = 3.0 * NODE_W + 2.0 * GAP_X;
-        let full_lane = PAD + (widest_row_w + widest_row_w) / 2.0 + BACK_BULGE;
+        let full_lane = PAD + (widest_row_w + widest_row_w) / 2.0 + SIDE_BULGE;
         assert!(
             lane < full_lane,
             "回边只穿过单列区域，通道不该贴到全图最宽层：lane={lane} full={full_lane}"
@@ -557,6 +603,109 @@ mod tests {
             for p in &e.points {
                 assert!(p.x <= out.size.x, "折线超出画布: {p:?}");
             }
+        }
+    }
+
+    /// 独立检查可见性约束：每段折线正交、留在画布内，且避开所有非端点卡片。
+    fn assert_clear_routes(graph: &SubGraph) {
+        let out = layout(graph);
+        assert_eq!(out.edges.len(), graph.edges.len());
+        for (source, placed) in graph.edges.iter().zip(&out.edges) {
+            assert!(placed.points.len() >= 2);
+            for pair in placed.points.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                assert!(a.x == b.x || a.y == b.y, "非正交线段：{pair:?}");
+                for point in [a, b] {
+                    assert!(point.x >= 0.0 && point.x <= out.size.x);
+                    assert!(point.y >= 0.0 && point.y <= out.size.y);
+                }
+                for node in &out.nodes {
+                    if node.id == source.from || node.id == source.to {
+                        continue;
+                    }
+                    let separated = a.x.max(b.x) < node.pos.x
+                        || a.x.min(b.x) > node.pos.x + NODE_W
+                        || a.y.max(b.y) < node.pos.y
+                        || a.y.min(b.y) > node.pos.y + NODE_H;
+                    assert!(
+                        separated,
+                        "{} → {} 的线段 {pair:?} 遮挡了 {}",
+                        source.from, source.to, node.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 跨层直达边绕过中间卡片且保留独立通道() {
+        let mut graph = chain(4);
+        graph.edges.push(edge(ENTRY_ID, "n3"));
+        graph.edges.push(edge("n0", "n3"));
+        assert_clear_routes(&graph);
+        let out = layout(&graph);
+        let lanes: Vec<f32> = out
+            .edges
+            .iter()
+            .rev()
+            .take(2)
+            .map(|edge| edge.points.iter().map(|point| point.x).fold(0.0, f32::max))
+            .collect();
+        assert!((lanes[0] - lanes[1]).abs() >= LANE_GAP);
+    }
+
+    #[test]
+    fn 回边避开端点同行的其他卡片() {
+        let graph = SubGraph {
+            nodes: vec![node("a"), node("b"), node("c"), node("d")],
+            edges: vec![
+                edge(ENTRY_ID, "a"),
+                edge(ENTRY_ID, "b"),
+                edge("a", "c"),
+                edge("b", "d"),
+                edge("c", "a"),
+                edge("d", EXIT_ID),
+            ],
+        };
+        assert_clear_routes(&graph);
+    }
+
+    #[test]
+    fn 自环有可见高度且完整落在画布内() {
+        let graph = SubGraph {
+            nodes: vec![node("a")],
+            edges: vec![edge(ENTRY_ID, "a"), edge("a", "a"), edge("a", EXIT_ID)],
+        };
+        assert_clear_routes(&graph);
+        let out = layout(&graph);
+        let loop_edge = &out.edges[1];
+        assert!(loop_edge.back);
+        assert!(loop_edge.points.iter().any(|p| p.y < y_of(&out, "a")));
+        assert!(
+            loop_edge
+                .points
+                .iter()
+                .any(|p| p.y > y_of(&out, "a") + NODE_H)
+        );
+    }
+
+    #[test]
+    fn 多种分支与闭环组合均不遮挡非端点节点() {
+        // 固定种子的组合覆盖不同层宽、回边、自环、跨层汇合，不依赖随机源或时序。
+        let mut seed = 17_u64;
+        for _ in 0..256 {
+            let mut graph = chain(6);
+            for from in 0..6 {
+                for to in 0..6 {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    if (seed >> 32).is_multiple_of(5) && to != from + 1 {
+                        graph
+                            .edges
+                            .push(edge(&format!("n{from}"), &format!("n{to}")));
+                    }
+                }
+            }
+            assert_clear_routes(&graph);
         }
     }
 }

@@ -10,6 +10,7 @@ use bevy::feathers::tokens;
 use bevy::picking::hover::Hovered;
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
+use bevy::text::LineBreak;
 use bevy::ui::{Interaction, Selected, UiScale};
 use bevy::window::PrimaryWindow;
 
@@ -34,6 +35,10 @@ struct FileRowsSlot;
 /// 卡片标题文字（计数随文件数更新）
 #[derive(Component, Clone, Default)]
 struct FileListTitle;
+
+/// 显示当前列表的真实目录，避免把仍在编辑的连接表单目录误当成文件来源。
+#[derive(Component, Clone, Default)]
+struct FileListDirectory;
 
 /// 右键菜单状态
 #[derive(Resource, Default)]
@@ -81,10 +86,18 @@ struct RenderedList {
 /// 构建文件列表卡片
 fn file_list_card(browser: &FileBrowser) -> impl Scene {
     let title = format!("文件列表 ({})", browser.files.len());
+    let directory = directory_label(browser);
     widgets::card_titled(
         title,
         FileListTitle,
         bsn_list![(
+            Text(directory)
+            FileListDirectory
+            ThemeTextColor({tokens::TEXT_DIM})
+            TextFont { font_size: px(11.0) }
+            TextLayout { linebreak: {LineBreak::AnyCharacter} }
+            Node { width: percent(100), margin: {UiRect::bottom(px(5.0))} }
+        ), (
             Node {
                 width: percent(100),
                 flex_direction: FlexDirection::Column,
@@ -94,6 +107,24 @@ fn file_list_card(browser: &FileBrowser) -> impl Scene {
             FileRowsSlot
         )],
     )
+}
+
+fn directory_label(browser: &FileBrowser) -> String {
+    match &browser.remote_dir {
+        Some(directory) => format!("当前目录：{directory}"),
+        None => "当前目录：尚未加载".into(),
+    }
+}
+
+fn sync_file_directory(
+    browser: Res<FileBrowser>,
+    mut labels: Query<(&mut Text, Ref<FileListDirectory>)>,
+) {
+    for (mut text, marker) in &mut labels {
+        if browser.is_changed() || marker.is_added() {
+            text.0 = directory_label(&browser);
+        }
+    }
 }
 
 /// 单个文件行
@@ -126,6 +157,7 @@ fn file_list_blank() -> impl Scene {
             min_height: px(24),
         }
         FileListBlank
+        Hovered
     }
 }
 
@@ -351,6 +383,7 @@ fn rebuild_context_menu(
     session: Res<Session>,
     mut rendered: ResMut<RenderedList>,
     mut roots: Query<(Entity, &mut Node), With<ContextMenuRoot>>,
+    pending: Query<(), With<widgets::SlotPending>>,
     mut commands: Commands,
 ) {
     if rendered.menu == Some(menu.version) {
@@ -359,6 +392,12 @@ fn rebuild_context_menu(
     let Ok((root, mut node)) = roots.single_mut() else {
         return;
     };
+    // 关闭和切换目标都要立即隐藏旧菜单，等待在飞场景落地后再替换。
+    // 不能提前推进版本，否则待生成的旧菜单会漏掉下一帧的清理。
+    if pending.contains(root) {
+        node.display = Display::None;
+        return;
+    }
     rendered.menu = Some(menu.version);
 
     if !menu.open {
@@ -462,11 +501,110 @@ impl Plugin for FileListPlugin {
                     spawn_file_list,
                     rebuild_file_rows,
                     sync_list_title,
+                    sync_file_directory,
                     sync_row_selection,
                     rebuild_context_menu,
                     sync_menu_item_style,
                 )
                     .in_set(UiSet::Rebuild),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::picking::hover::{HoverMap, update_is_hovered};
+    use bevy::picking::pointer::PointerId;
+    use bevy::scene::ScenePlugin;
+
+    #[test]
+    fn 空白场景维护真实悬停状态且右键打开上传菜单() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
+            .init_resource::<HoverMap>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .insert_resource(UiScale(1.25))
+            .init_resource::<ContextMenu>()
+            .add_systems(Update, (update_is_hovered, open_context_menu).chain());
+        let mut window = Window::default();
+        window.set_cursor_position(Some(Vec2::new(100.0, 50.0)));
+        app.world_mut().spawn((window, PrimaryWindow));
+        let blank = app.world_mut().spawn_scene(file_list_blank()).unwrap().id();
+        assert!(app.world().get::<Hovered>(blank).is_some());
+
+        app.world_mut()
+            .resource_mut::<HoverMap>()
+            .0
+            .entry(PointerId::Mouse)
+            .or_default()
+            .insert(
+                blank,
+                bevy::picking::backend::HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            );
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Right);
+        app.update();
+        let menu = app.world().resource::<ContextMenu>();
+        assert!(menu.open);
+        assert!(menu.target.is_none());
+        assert_eq!(menu.position, Vec2::new(80.0, 40.0));
+    }
+
+    #[test]
+    fn 菜单内容仍在生成时换目标或关闭不会重复排队() {
+        let mut app = App::new();
+        app.init_resource::<ContextMenu>()
+            .init_resource::<RenderedList>()
+            .insert_resource(Session::new(
+                crate::model::LoginConfig::default(),
+                Vec::new(),
+            ))
+            .add_systems(Update, rebuild_context_menu);
+        let root = app
+            .world_mut()
+            .spawn((ContextMenuRoot, Node::default(), widgets::SlotPending))
+            .id();
+        let old_item = app.world_mut().spawn(ChildOf(root)).id();
+        app.world_mut()
+            .resource_mut::<ContextMenu>()
+            .open_at(Vec2::ZERO, Some("新文件.json".into()));
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(root).unwrap().display,
+            Display::None
+        );
+        assert_eq!(app.world().resource::<RenderedList>().menu, None);
+        assert_eq!(app.world().get::<Children>(root).unwrap().len(), 1);
+
+        app.world_mut().resource_mut::<ContextMenu>().close();
+        app.update();
+        assert_eq!(app.world().resource::<RenderedList>().menu, None);
+        app.world_mut()
+            .entity_mut(root)
+            .remove::<widgets::SlotPending>();
+        app.update();
+        assert!(app.world().get_entity(old_item).is_err());
+        assert_eq!(app.world().resource::<RenderedList>().menu, Some(2));
+    }
+
+    #[test]
+    fn 目录标签更新保留文件列表实体() {
+        let mut app = App::new();
+        app.init_resource::<FileBrowser>()
+            .add_systems(Update, sync_file_directory);
+        let label = app
+            .world_mut()
+            .spawn((Text::new("旧目录"), FileListDirectory))
+            .id();
+        let row = app.world_mut().spawn(FileRow("task.json".into())).id();
+        app.world_mut().resource_mut::<FileBrowser>().remote_dir = Some("/A/task_graphs".into());
+        app.update();
+        assert_eq!(
+            app.world().get::<Text>(label).unwrap().0,
+            "当前目录：/A/task_graphs"
+        );
+        assert!(app.world().get::<FileRow>(row).is_some());
     }
 }

@@ -4357,11 +4357,12 @@ dependencies = [
 
 [[package]]
 name = "task-graph-editor"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bevy",
  "chrono",
  "icu_provider",
+ "libc",
  "mimalloc",
  "openssl",
  "rfd",
@@ -4370,6 +4371,7 @@ dependencies = [
  "ssh2",
  "thiserror 2.0.18",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

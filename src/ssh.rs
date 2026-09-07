@@ -5,6 +5,11 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
+mod agent;
+mod atomic_write;
+mod cancellation;
+pub use cancellation::SshCancellation;
+
 /// SSH 认证方式
 pub enum AuthMethod {
     /// 密码认证
@@ -24,7 +29,7 @@ pub struct SshConfig {
 /// SSH 操作错误
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
-    #[error("TCP 连接失败: {0}")]
+    #[error("网络或文件 I/O 失败: {0}")]
     TcpConnect(#[from] std::io::Error),
     #[error("SSH 操作失败: {0}")]
     Ssh(#[from] ssh2::Error),
@@ -34,6 +39,12 @@ pub enum SshError {
     CommandFailed { exit_code: i32, output: String },
     #[error("认证失败: {0}")]
     AuthFailed(String),
+    #[error("连接已取消")]
+    Cancelled,
+    #[error("连接状态异常: {0}")]
+    ConnectionState(String),
+    #[error("原子保存 {path} 失败: {reason}")]
+    AtomicWrite { path: String, reason: String },
 }
 
 /// SSH keepalive 间隔（秒）
@@ -41,20 +52,35 @@ pub enum SshError {
 /// 每隔此间隔发送一次 SSH keepalive 包，防止空闲连接被服务器或中间网络设备（NAT/防火墙）超时断开。
 const KEEPALIVE_INTERVAL_SECS: u32 = 30;
 
+/// 会话自身必须设置 API 超时，TCP 超时不能限制 libssh2 内部的 poll。
+fn handshake(tcp: TcpStream, timeout_ms: u32) -> Result<Session, SshError> {
+    let timeout = std::time::Duration::from_millis(u64::from(timeout_ms));
+    tcp.set_read_timeout(Some(timeout))?;
+    tcp.set_write_timeout(Some(timeout))?;
+    let mut session = Session::new()?;
+    session.set_timeout(timeout_ms);
+    session.set_tcp_stream(tcp);
+    session.handshake()?;
+    Ok(session)
+}
+
 /// 公钥认证：ssh-agent 全部身份 → 私钥文件逐个尝试；全部失败时汇总每一步的原因
 fn authenticate_public_key(
     session: &Session,
     username: &str,
     identity_files: &[PathBuf],
+    cancellation: &SshCancellation,
 ) -> Result<(), SshError> {
     let mut failures: Vec<String> = Vec::new();
 
-    match authenticate_with_agent(session, username) {
+    match agent::authenticate(session, username, cancellation) {
         Ok(()) => return Ok(()),
         Err(reason) => failures.push(reason),
     }
 
+    cancellation.check()?;
     for key in identity_files {
+        cancellation.check()?;
         match session.userauth_pubkey_file(username, None, key, None) {
             Ok(()) => return Ok(()),
             Err(e) => failures.push(format!("私钥 {}: {e}", key.display())),
@@ -66,39 +92,6 @@ fn authenticate_public_key(
     failures.push("密码为空，未尝试密码认证".into());
 
     Err(SshError::AuthFailed(failures.join("；")))
-}
-
-/// 用 ssh-agent 中的每一个身份依次尝试认证；agent 不可用或全部被拒时返回原因
-///
-/// ssh2 自带的 `userauth_agent` 只会尝试第一个身份，故这里手动遍历。
-fn authenticate_with_agent(session: &Session, username: &str) -> Result<(), String> {
-    let mut agent = session
-        .agent()
-        .map_err(|e| format!("ssh-agent 不可用: {e}"))?;
-    agent
-        .connect()
-        .map_err(|e| format!("ssh-agent 连接失败: {e}"))?;
-    agent
-        .list_identities()
-        .map_err(|e| format!("ssh-agent 列举身份失败: {e}"))?;
-    let identities = agent
-        .identities()
-        .map_err(|e| format!("ssh-agent 读取身份失败: {e}"))?;
-    if identities.is_empty() {
-        return Err("ssh-agent 中没有已加载的身份".into());
-    }
-
-    let mut last_error = String::new();
-    for identity in &identities {
-        match agent.userauth(username, identity) {
-            Ok(()) => return Ok(()),
-            Err(e) => last_error = e.to_string(),
-        }
-    }
-    Err(format!(
-        "ssh-agent 中 {} 个身份均被拒绝（最后错误: {last_error}）",
-        identities.len()
-    ))
 }
 
 /// 展开路径开头的 `~`，并规整结尾斜杠
@@ -151,21 +144,20 @@ pub struct SshConnection {
 
 impl SshConnection {
     /// 建立 SSH 连接并认证
-    pub fn connect(config: &SshConfig) -> Result<Self, SshError> {
-        let addr = format!("{}:{}", config.host, config.port);
-        let tcp = TcpStream::connect(&addr)?;
-        tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-
-        let mut session = Session::new()?;
-        session.set_tcp_stream(tcp);
-        session.handshake()?;
+    pub fn connect_cancellable(
+        config: &SshConfig,
+        cancellation: &SshCancellation,
+    ) -> Result<Self, SshError> {
+        let tcp = cancellation::connect_tcp(config, cancellation)?;
+        let session = handshake(tcp, 30_000)?;
+        cancellation.check()?;
 
         match &config.auth {
             AuthMethod::Password(password) => {
                 session.userauth_password(&config.username, password)?;
             }
             AuthMethod::PublicKey { identity_files } => {
-                authenticate_public_key(&session, &config.username, identity_files)?;
+                authenticate_public_key(&session, &config.username, identity_files, cancellation)?;
             }
         }
 
@@ -209,9 +201,23 @@ impl SshConnection {
         Ok(self.session.keepalive_send()?)
     }
 
+    /// 由 SFTP 服务端展开为绝对目录，绑定文档时不能留下相对路径。
+    pub fn canonical_dir(&self, dir: &str) -> Result<String, SshError> {
+        let resolved = self.resolve_path(dir);
+        let sftp = self.session.sftp()?;
+        let absolute = sftp.realpath(Path::new(&resolved))?;
+        let absolute = absolute
+            .to_str()
+            .ok_or_else(|| SshError::ConnectionState("远程目录不是有效 UTF-8".into()))?;
+        if !absolute.starts_with('/') {
+            return Err(SshError::ConnectionState("SFTP 未返回绝对目录".into()));
+        }
+        Ok(absolute.to_owned())
+    }
+
     /// 扫描远程目录，列出 `.json` 文件并附带排查线索
     pub fn list_json_files(&self, dir: &str) -> Result<DirListing, SshError> {
-        let resolved = self.resolve_path(dir);
+        let resolved = self.canonical_dir(dir)?;
         tracing::debug!(input = dir, resolved = %resolved, "SFTP readdir");
         let sftp = self.session.sftp()?;
         let entries = sftp.readdir(Path::new(&resolved)).map_err(|e| {
@@ -261,25 +267,6 @@ impl SshConnection {
         Ok(String::from_utf8(buf)?)
     }
 
-    /// 写入远程文件（覆盖）
-    pub fn write_file(&self, path: &str, content: &str) -> Result<(), SshError> {
-        let resolved = self.resolve_path(path);
-        tracing::debug!(path = %resolved, bytes = content.len(), "SFTP 写入文件");
-        let sftp = self.session.sftp()?;
-        let mut file = sftp.create(Path::new(&resolved))?;
-        file.write_all(content.as_bytes())?;
-        Ok(())
-    }
-
-    /// 重命名远程文件
-    pub fn rename_file(&self, old_path: &str, new_path: &str) -> Result<(), SshError> {
-        let (old, new) = (self.resolve_path(old_path), self.resolve_path(new_path));
-        tracing::debug!(from = %old, to = %new, "SFTP 重命名");
-        let sftp = self.session.sftp()?;
-        sftp.rename(Path::new(&old), Path::new(&new), None)?;
-        Ok(())
-    }
-
     /// 删除远程文件
     ///
     /// 走 SFTP 而非 `rm`：原先的 `rm -f '<path>'` 把路径放进单引号里，
@@ -295,6 +282,7 @@ impl SshConnection {
     /// 执行远程命令并返回 stdout
     pub fn exec_command(&self, command: &str) -> Result<String, SshError> {
         let mut channel = self.session.channel_session()?;
+        channel.handle_extended_data(ssh2::ExtendedData::Merge)?;
         channel.exec(command)?;
 
         let mut output = String::new();
@@ -321,6 +309,7 @@ impl SshConnection {
         stdin_data: &str,
     ) -> Result<String, SshError> {
         let mut channel = self.session.channel_session()?;
+        channel.handle_extended_data(ssh2::ExtendedData::Merge)?;
         channel.exec(command)?;
 
         // 写入 stdin 后关闭写端，让远程进程收到 EOF
@@ -345,7 +334,20 @@ impl SshConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_home;
+    use super::{expand_home, handshake};
+
+    #[test]
+    fn 不发送banner的本地服务受会话api时限约束() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+        // 仅 loopback，无远端与睡眠；服务端持有 socket 但永不发送 banner。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        assert!(handshake(socket, 100).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn 展开波浪线开头的路径() {

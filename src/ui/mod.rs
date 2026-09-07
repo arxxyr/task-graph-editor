@@ -21,6 +21,8 @@ pub mod password;
 pub mod screenshot;
 pub mod shell;
 pub mod theme;
+pub mod theme_picker;
+pub mod theme_preferences;
 pub mod widgets;
 pub mod worker_bridge;
 
@@ -37,6 +39,28 @@ pub enum PendingCommand {
     WaistJoints { field_path: Vec<usize> },
 }
 
+/// 已发起连接的目标快照，不随连接表单编辑而变化。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionTarget {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+}
+
+impl std::fmt::Display for ConnectionTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}:{}", self.username, self.host, self.port)
+    }
+}
+
+/// 已加载文档的来源；文件操作不能重新读取可编辑的连接表单。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDocument {
+    pub connection_generation: u64,
+    pub remote_dir: String,
+    pub filename: String,
+}
+
 /// SSH 会话与连接表单状态
 #[derive(Resource)]
 pub struct Session {
@@ -44,6 +68,10 @@ pub struct Session {
     pub login: LoginConfig,
     /// 后台工作线程句柄
     pub worker: Option<WorkerHandle>,
+    /// 每次手动建立或断开连接时递增，拒绝将旧文档写到新会话。
+    pub connection_generation: u64,
+    /// 实际连接目标，供状态栏显示。
+    pub target: Option<ConnectionTarget>,
     /// 当前忙碌状态
     pub busy: BusyState,
     /// 是否已连接（由 worker 响应驱动）
@@ -63,21 +91,30 @@ pub struct Session {
 
 impl Default for Session {
     fn default() -> Self {
-        Self {
-            login: crate::model::load_login_config(),
-            worker: None,
-            busy: BusyState::Idle,
-            is_connected: false,
-            reconnect_status: None,
-            pending_command: None,
-            ssh_hosts: ssh_config::load_user_hosts(),
-            hosts_version: 0,
-            form_version: 0,
-        }
+        Self::new(
+            crate::model::load_login_config(),
+            ssh_config::load_user_hosts(),
+        )
     }
 }
 
 impl Session {
+    /// 用显式配置创建会话，测试无需读取使用者的登录文件和 SSH 配置。
+    pub fn new(login: LoginConfig, ssh_hosts: Vec<SshHostEntry>) -> Self {
+        Self {
+            login,
+            worker: None,
+            connection_generation: 0,
+            target: None,
+            busy: BusyState::Idle,
+            is_connected: false,
+            reconnect_status: None,
+            pending_command: None,
+            ssh_hosts,
+            hosts_version: 0,
+            form_version: 0,
+        }
+    }
     /// 判断当前是否忙碌（有请求正在后台执行）
     pub fn is_busy(&self) -> bool {
         !matches!(self.busy, BusyState::Idle)
@@ -98,6 +135,16 @@ impl Session {
     /// 交互是否可用：未忙碌且不在自动重连中
     pub fn interactive(&self) -> bool {
         !self.is_busy() && self.reconnect_status.is_none()
+    }
+
+    /// 外部读取到的域值统一刷新表单，避免实际命令与屏幕内容不一致。
+    pub fn update_ros_domain_id(&mut self, value: Option<String>) {
+        if let Some(value) = value
+            && self.login.ros_domain_id != value
+        {
+            self.login.ros_domain_id = value;
+            self.form_version += 1;
+        }
     }
 
     /// 发送请求到后台线程
@@ -152,6 +199,8 @@ impl StatusLine {
 /// 远程文件浏览状态
 #[derive(Resource, Default)]
 pub struct FileBrowser {
+    /// 当前列表对应的规范化绝对目录；未成功列目录时不可操作旧条目。
+    pub remote_dir: Option<String>,
     /// 远程目录下的 JSON 文件名
     pub files: Vec<String>,
     /// 当前选中的文件
@@ -173,6 +222,8 @@ impl FileBrowser {
 pub struct Editor {
     /// 当前编辑的数据
     pub data: Option<TaskGraphData>,
+    /// 当前文档绑定的远程来源，与侧栏正在浏览的目录相互独立。
+    pub document: Option<RemoteDocument>,
     /// 当前选中的位姿字段索引路径（支持嵌套分组下钻，仅用于 Pose 类型）
     pub selected_pose_path: Option<Vec<usize>>,
     /// 结构版本号：字段树形状变化时递增（加载文件、创建位姿），驱动编辑器重建
@@ -188,8 +239,15 @@ impl Editor {
     /// 载入新数据（重置选中并递增结构版本）
     pub fn load(&mut self, data: Option<TaskGraphData>) {
         self.data = data;
+        self.document = None;
         self.selected_pose_path = None;
         self.structure_version += 1;
+    }
+
+    /// 加载远程文档并记住其来源。
+    pub fn load_remote(&mut self, data: TaskGraphData, document: RemoteDocument) {
+        self.load(Some(data));
+        self.document = Some(document);
     }
 
     /// 标记字段树结构已变化，需要重建控件
@@ -245,6 +303,8 @@ impl Plugin for EditorUiPlugin {
             )
             .add_plugins((
                 theme::ThemePlugin,
+                theme_preferences::ThemePreferencesPlugin,
+                theme_picker::ThemePickerPlugin,
                 widgets::WidgetsPlugin,
                 screenshot::ScreenshotPlugin,
                 fonts::FontsPlugin,

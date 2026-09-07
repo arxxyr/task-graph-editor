@@ -13,7 +13,7 @@ use bevy::feathers::theme::{ThemeBackgroundColor, ThemeBorderColor, ThemeTextCol
 use bevy::prelude::*;
 use bevy::text::LineBreak;
 use bevy::ui::Interaction;
-use bevy::ui_widgets::ScrollArea;
+use bevy::ui_widgets::{Activate, ScrollArea};
 
 use crate::model::{SubGraph, TaskNode};
 
@@ -30,7 +30,7 @@ const EDGE_W: f32 = 1.5;
 const DETAIL_W: f32 = 300.0;
 
 /// 当前看的是哪个视图
-#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
+#[derive(Resource, Default, Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ViewMode {
     /// context 参数编辑
     #[default]
@@ -106,6 +106,16 @@ fn category_token(node_type: &str) -> ThemeToken {
 #[derive(Component, Clone, Default)]
 struct GraphNodeMarker(String);
 
+/// 图卡文字记录未选中时的角色，选中与取消时只切换 token。
+#[derive(Component, Default, Clone)]
+struct GraphNodeLabel(ThemeToken);
+
+/// 详情栏插槽只更新选中节点，画布及其滚动位置保持不变。
+#[derive(Component, Clone, Default)]
+struct GraphDetailSlot {
+    rendered: Option<(u64, Option<String>)>,
+}
+
 /// 画布刚建好、水平滚动还停在最左，等布局出尺寸后挪到中间
 #[derive(Component, Clone, Default)]
 struct CanvasNeedsCenter;
@@ -122,6 +132,10 @@ struct DrillButton(String);
 #[derive(Component, Clone, Copy, Default)]
 struct ViewToggle(bool);
 
+/// 顶栏入口只生成一次，切换时更新组件而不销毁按钮与焦点。
+#[derive(Component)]
+struct ViewSwitchBuilt;
+
 /// 已渲染的版本，避免每帧重建
 #[derive(Resource, Default)]
 struct RenderedGraph {
@@ -129,8 +143,6 @@ struct RenderedGraph {
     nav: Option<u64>,
     /// 已渲染时对应的数据结构版本
     structure: Option<u64>,
-    /// 已渲染的切换按钮状态（有数据、当前视图）
-    switch: Option<(bool, ViewMode)>,
 }
 
 // ============================================================
@@ -143,12 +155,6 @@ fn graph_pane(graph: &SubGraph, nav: &GraphNav) -> Vec<BoxedScene> {
         return vec![boxed(widgets::hint("这一层已不存在，请返回上一层"))];
     };
     let placed = graph_layout::layout(current);
-    // 没选中节点时不占那 300px——留着也只是显示一句提示，画布本来就不够宽
-    let detail: Vec<BoxedScene> = match nav.selected.as_deref().and_then(|id| current.node(id)) {
-        Some(node) => vec![boxed(detail_panel(node))],
-        None => Vec::new(),
-    };
-
     vec![
         boxed(toolbar(graph, nav, current)),
         boxed(bsn! {
@@ -160,7 +166,15 @@ fn graph_pane(graph: &SubGraph, nav: &GraphNav) -> Vec<BoxedScene> {
             }
             Children [
                 (canvas(current, &placed, nav)),
-                {detail}
+                (
+                    Node {
+                        display: Display::None,
+                        width: {px(DETAIL_W)},
+                        flex_shrink: 0.0,
+                        height: percent(100),
+                    }
+                    GraphDetailSlot
+                )
             ]
         }),
     ]
@@ -187,14 +201,6 @@ fn toolbar(graph: &SubGraph, nav: &GraphNav, current: &SubGraph) -> impl Scene {
         graph.total_nodes(),
         graph.depth()
     );
-
-    // 详情栏只在选中后才出现，提示得放这儿，否则没人知道节点可以点
-    let tip: Vec<BoxedScene> = match nav.selected.is_none() {
-        true => vec![boxed(widgets::hint(
-            "点击节点查看输入参数，再点一次进入子图",
-        ))],
-        false => Vec::new(),
-    };
 
     bsn! {
         Node {
@@ -229,7 +235,7 @@ fn toolbar(graph: &SubGraph, nav: &GraphNav, current: &SubGraph) -> impl Scene {
                 Children [
                     (widgets::hint(summary)),
                     (legend()),
-                    {tip}
+                    (widgets::hint("点击节点查看输入参数，再点一次进入子图"))
                 ]
             )
         ]
@@ -360,7 +366,7 @@ fn node_scene(
                 border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
             }
             ThemeBackgroundColor({theme::CARD_HEADER_BG})
-            ThemeBorderColor({theme::CARD_BORDER})
+            ThemeBorderColor({theme::GRAPH_BORDER})
             Children [(widgets::readonly_value(label))]
         });
     };
@@ -387,8 +393,12 @@ fn node_scene(
         .collect();
 
     let border = match selected {
-        true => theme::POSE_SELECTED_BORDER,
-        false => theme::CARD_BORDER,
+        true => theme::GRAPH_SELECTED_BORDER,
+        false => theme::GRAPH_BORDER,
+    };
+    let background = match selected {
+        true => theme::GRAPH_SELECTED_BG,
+        false => theme::CARD_BG,
     };
 
     boxed(bsn! {
@@ -408,7 +418,7 @@ fn node_scene(
         }
         Button
         template_value(GraphNodeMarker(node.id.clone()))
-        ThemeBackgroundColor({theme::CARD_BG})
+        ThemeBackgroundColor({background})
         ThemeBorderColor({border})
         Children [
             (
@@ -430,12 +440,14 @@ fn node_scene(
                 Children [
                     (
                         Text({node.id.clone()})
+                        GraphNodeLabel({theme::SECTION_TEXT})
                         ThemeTextColor({theme::SECTION_TEXT})
                         TextFont { font_size: px(11.5) }
                         TextLayout { linebreak: {LineBreak::AnyCharacter} }
                     ),
                     (
                         Text({node.node_type.clone()})
+                        GraphNodeLabel({theme::READONLY_TEXT})
                         ThemeTextColor({theme::READONLY_TEXT})
                         TextFont { font_size: px(10.0) }
                     )
@@ -451,7 +463,7 @@ fn node_scene(
 fn edge_scene(edge: &PlacedEdge) -> Vec<BoxedScene> {
     let token = match edge.back {
         true => theme::GRAPH_BACK,
-        false => theme::CARD_BORDER,
+        false => theme::GRAPH_BORDER,
     };
     let mut parts: Vec<BoxedScene> = edge
         .points
@@ -638,18 +650,20 @@ fn sync_view_mode(
     mut params: Query<&mut Node, (With<ParamsPane>, Without<GraphPane>)>,
     mut graph: Query<&mut Node, (With<GraphPane>, Without<ParamsPane>)>,
 ) {
-    if !mode.is_changed() {
-        return;
-    }
+    // 面板通过 BSN 跨帧生成，可能晚于视图变化落地；按值同步同时覆盖首次生成。
     let (p, g) = match *mode {
         ViewMode::Params => (Display::Flex, Display::None),
         ViewMode::Graph => (Display::None, Display::Flex),
     };
     for mut node in &mut params {
-        node.display = p;
+        if node.display != p {
+            node.display = p;
+        }
     }
     for mut node in &mut graph {
-        node.display = g;
+        if node.display != g {
+            node.display = g;
+        }
     }
 }
 
@@ -693,6 +707,79 @@ fn rebuild_graph(
     widgets::replace_slot_children(&mut commands, slot, content);
 }
 
+/// 选中变化只改颜色，保留画布和输入状态；跨帧新增的图卡与文字也同步当前选择。
+fn sync_node_selection(
+    nav: Res<GraphNav>,
+    nodes: Query<(Entity, Ref<GraphNodeMarker>)>,
+    labels: Query<(Entity, Ref<GraphNodeLabel>)>,
+    parents: Query<&ChildOf>,
+    mut commands: Commands,
+) {
+    for (entity, marker) in &nodes {
+        if !nav.is_changed() && !marker.is_added() {
+            continue;
+        }
+        let (background, border) = match nav.selected.as_deref() == Some(marker.0.as_str()) {
+            true => (theme::GRAPH_SELECTED_BG, theme::GRAPH_SELECTED_BORDER),
+            false => (theme::CARD_BG, theme::GRAPH_BORDER),
+        };
+        commands
+            .entity(entity)
+            .insert((ThemeBackgroundColor(background), ThemeBorderColor(border)));
+    }
+    for (entity, label) in &labels {
+        if !nav.is_changed() && !label.is_added() {
+            continue;
+        }
+        let Some(card) =
+            widgets::self_or_ancestor(entity, &parents, |parent| nodes.contains(parent))
+        else {
+            continue;
+        };
+        let Ok((_, marker)) = nodes.get(card) else {
+            continue;
+        };
+        let color = match nav.selected.as_deref() == Some(marker.0.as_str()) {
+            true => theme::GRAPH_SELECTED_TEXT,
+            false => label.0.clone(),
+        };
+        commands.entity(entity).insert(ThemeTextColor(color));
+    }
+}
+
+/// 独立替换详情内容，不重建拥有 ScrollPosition 的画布。
+fn rebuild_detail(
+    editor: Res<Editor>,
+    nav: Res<GraphNav>,
+    mut slots: Query<(Entity, &mut GraphDetailSlot, &mut Node)>,
+    pending: Query<(), With<widgets::SlotPending>>,
+    mut commands: Commands,
+) {
+    let state = (nav.version, nav.selected.clone());
+    for (entity, mut slot, mut panel) in &mut slots {
+        if slot.rendered.as_ref() == Some(&state) || pending.contains(entity) {
+            continue;
+        }
+        let selected = editor.data.as_ref().and_then(|data| {
+            data.graph
+                .subgraph_at(&nav.path)
+                .and_then(|graph| nav.selected.as_deref().and_then(|id| graph.node(id)))
+        });
+        let content = match selected {
+            Some(node) => {
+                panel.display = Display::Flex;
+                vec![boxed(detail_panel(node))]
+            }
+            None => {
+                panel.display = Display::None;
+                Vec::new()
+            }
+        };
+        widgets::replace_slot_children(&mut commands, entity, content);
+        slot.rendered = Some(state.clone());
+    }
+}
+
 /// 点击节点：选中；再点一次带子图的节点则下钻
 fn handle_node_press(
     nodes: Query<(&Interaction, &GraphNodeMarker), Changed<Interaction>>,
@@ -715,16 +802,14 @@ fn handle_node_press(
             true => nav.enter(&marker.0),
             false => {
                 nav.selected = Some(marker.0.clone());
-                nav.version += 1;
             }
         }
     }
 }
 
-/// 面包屑与下钻按钮
+/// 面包屑使用原生 UI Button，继续由 Interaction 驱动。
 fn handle_nav_press(
     crumbs: Query<(&Interaction, &CrumbMarker), Changed<Interaction>>,
-    drills: Query<(&Interaction, &DrillButton), Changed<Interaction>>,
     mut nav: ResMut<GraphNav>,
 ) {
     for (state, crumb) in &crumbs {
@@ -732,10 +817,26 @@ fn handle_nav_press(
             nav.go_to(crumb.0);
         }
     }
-    for (state, drill) in &drills {
-        if *state == Interaction::Pressed {
-            nav.enter(&drill.0);
-        }
+}
+
+/// 详情中的下钻入口是 FeathersButton，鼠标和键盘统一通过 Activate 触发。
+fn handle_drill_activate(
+    event: On<Activate>,
+    drills: Query<&DrillButton>,
+    editor: Res<Editor>,
+    mut nav: ResMut<GraphNav>,
+) {
+    let Ok(drill) = drills.get(event.entity) else {
+        return;
+    };
+    let exists = editor.data.as_ref().is_some_and(|data| {
+        data.graph
+            .subgraph_at(&nav.path)
+            .and_then(|graph| graph.node(&drill.0))
+            .is_some_and(|node| node.children.is_some())
+    });
+    if exists {
+        nav.enter(&drill.0);
     }
 }
 
@@ -760,50 +861,57 @@ fn center_canvas(
     }
 }
 
-/// 顶栏的视图切换按钮
+/// FeathersButton 没有旧 Interaction 组件，实际点击及键盘触发均发出 Activate。
 fn handle_view_toggle(
-    toggles: Query<(&Interaction, &ViewToggle), Changed<Interaction>>,
+    event: On<Activate>,
+    toggles: Query<&ViewToggle>,
+    mut variants: Query<(&ViewToggle, &mut ButtonVariant)>,
     mut mode: ResMut<ViewMode>,
 ) {
-    for (state, toggle) in &toggles {
-        if *state != Interaction::Pressed {
-            continue;
-        }
-        let want = match toggle.0 {
-            true => ViewMode::Graph,
-            false => ViewMode::Params,
-        };
-        if *mode != want {
-            *mode = want;
-        }
+    let Ok(toggle) = toggles.get(event.entity) else {
+        return;
+    };
+    let want = match toggle.0 {
+        true => ViewMode::Graph,
+        false => ViewMode::Params,
+    };
+    mode.set_if_neq(want);
+    // picking 的 observer 在 PreUpdate 中触发；提前写 variant，让同帧 Feathers 样式同步可见。
+    update_view_variants(want, &mut variants);
+}
+
+fn update_view_variants(mode: ViewMode, toggles: &mut Query<(&ViewToggle, &mut ButtonVariant)>) {
+    for (toggle, mut variant) in toggles.iter_mut() {
+        let selected = matches!(
+            (toggle.0, mode),
+            (true, ViewMode::Graph) | (false, ViewMode::Params)
+        );
+        variant.set_if_neq(match selected {
+            true => ButtonVariant::Primary,
+            false => ButtonVariant::Normal,
+        });
     }
 }
 
-/// 只在有数据时露出切换按钮，并跟随当前视图高亮
-fn rebuild_view_switch(
-    editor: Res<Editor>,
+/// 处理程序切换与跨帧刚生成的按钮，选中样式只更新组件。
+fn sync_view_switch(mode: Res<ViewMode>, mut toggles: Query<(&ViewToggle, &mut ButtonVariant)>) {
+    update_view_variants(*mode, &mut toggles);
+}
+
+/// 入口始终可见；未加载文档时切到流程图显示明确的加载提示。
+fn build_view_switch(
     mode: Res<ViewMode>,
-    mut rendered: ResMut<RenderedGraph>,
-    slots: Query<Entity, With<ViewSwitchSlot>>,
+    slots: Query<Entity, (With<ViewSwitchSlot>, Without<ViewSwitchBuilt>)>,
     pending: Query<(), With<widgets::SlotPending>>,
     mut commands: Commands,
 ) {
-    let state = (editor.data.is_some(), *mode);
-    if rendered.switch == Some(state) {
-        return;
+    for slot in &slots {
+        if pending.contains(slot) {
+            continue;
+        }
+        widgets::replace_slot_children(&mut commands, slot, view_switch(*mode));
+        commands.entity(slot).insert(ViewSwitchBuilt);
     }
-    let Ok(slot) = slots.single() else {
-        return;
-    };
-    if pending.contains(slot) {
-        return;
-    }
-    rendered.switch = Some(state);
-    let content = match state.0 {
-        true => view_switch(state.1),
-        false => Vec::new(),
-    };
-    widgets::replace_slot_children(&mut commands, slot, content);
 }
 
 /// 视图切换按钮组，供顶栏使用
@@ -834,20 +942,464 @@ impl Plugin for GraphViewPlugin {
         app.init_resource::<ViewMode>()
             .init_resource::<GraphNav>()
             .init_resource::<RenderedGraph>()
+            .add_observer(handle_view_toggle)
+            .add_observer(handle_drill_activate)
             .add_systems(
                 Update,
-                (handle_node_press, handle_nav_press, handle_view_toggle).in_set(UiSet::Input),
+                (handle_node_press, handle_nav_press).in_set(UiSet::Input),
             )
             .add_systems(
                 Update,
                 (
                     reset_on_reload,
                     rebuild_graph,
-                    rebuild_view_switch,
+                    sync_node_selection,
+                    rebuild_detail,
+                    build_view_switch,
+                    sync_view_switch,
                     sync_view_mode,
                     center_canvas,
                 )
+                    .chain()
                     .in_set(UiSet::Rebuild),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_editor() -> Editor {
+        Editor {
+            data: Some(crate::model::parse_task_graph(
+                r#"{"map_id":"m","task_id":"t","config":{"context":{},"nodes":[{"id":"step","type":"sequence","nodes":[{"id":"child","type":"log"}],"edges":[]}],"edges":[]}}"#,
+            ).unwrap()),
+            ..default()
+        }
+    }
+
+    #[test]
+    fn 选中节点保留画布实体和双轴滚动位置() {
+        let mut app = App::new();
+        app.insert_resource(test_editor())
+            .init_resource::<GraphNav>()
+            .insert_resource(RenderedGraph {
+                nav: Some(0),
+                ..default()
+            })
+            .add_systems(
+                Update,
+                (handle_node_press, rebuild_graph, sync_node_selection).chain(),
+            );
+        let slot = app.world_mut().spawn(GraphSlot).id();
+        let scroll = Vec2::new(120.0, 1600.0);
+        let canvas = app
+            .world_mut()
+            .spawn((ScrollPosition(scroll), ChildOf(slot)))
+            .id();
+        let card = app
+            .world_mut()
+            .spawn((
+                GraphNodeMarker("step".into()),
+                Interaction::None,
+                ThemeBorderColor(theme::GRAPH_BORDER),
+                ChildOf(canvas),
+            ))
+            .id();
+        app.update();
+        *app.world_mut().get_mut::<Interaction>(card).unwrap() = Interaction::Pressed;
+        app.update();
+
+        assert_eq!(app.world().resource::<GraphNav>().version, 0);
+        assert_eq!(
+            app.world().resource::<GraphNav>().selected.as_deref(),
+            Some("step")
+        );
+        assert_eq!(app.world().get::<ScrollPosition>(canvas).unwrap().0, scroll);
+        assert_eq!(app.world().get::<ChildOf>(card).unwrap().parent(), canvas);
+        assert_eq!(
+            app.world().get::<ThemeBorderColor>(card).unwrap().0,
+            theme::GRAPH_SELECTED_BORDER
+        );
+        assert_eq!(
+            app.world().get::<ThemeBackgroundColor>(card).unwrap().0,
+            theme::GRAPH_SELECTED_BG
+        );
+        // 标签可能比卡片晚生成，随后取消选择应恢复各自的原始文字角色。
+        let title = app
+            .world_mut()
+            .spawn((GraphNodeLabel(theme::SECTION_TEXT), ChildOf(card)))
+            .id();
+        let subtitle = app
+            .world_mut()
+            .spawn((GraphNodeLabel(theme::READONLY_TEXT), ChildOf(card)))
+            .id();
+        app.update();
+        for label in [title, subtitle] {
+            assert_eq!(
+                app.world().get::<ThemeTextColor>(label).unwrap().0,
+                theme::GRAPH_SELECTED_TEXT
+            );
+        }
+        app.world_mut().resource_mut::<GraphNav>().selected = None;
+        app.update();
+        assert_eq!(
+            app.world().get::<ThemeBackgroundColor>(card).unwrap().0,
+            theme::CARD_BG
+        );
+        assert_eq!(
+            app.world().get::<ThemeBorderColor>(card).unwrap().0,
+            theme::GRAPH_BORDER
+        );
+        assert_eq!(
+            app.world().get::<ThemeTextColor>(title).unwrap().0,
+            theme::SECTION_TEXT
+        );
+        assert_eq!(
+            app.world().get::<ThemeTextColor>(subtitle).unwrap().0,
+            theme::READONLY_TEXT
+        );
+        assert!(app.world().get::<widgets::SlotPending>(slot).is_none());
+        assert!(app.world().get::<CanvasNeedsCenter>(canvas).is_none());
+    }
+
+    #[test]
+    fn 再次点击已选中复合节点才触发下钻重建() {
+        let mut app = App::new();
+        app.insert_resource(test_editor())
+            .init_resource::<GraphNav>()
+            .add_systems(Update, handle_node_press);
+        let card = app
+            .world_mut()
+            .spawn((GraphNodeMarker("step".into()), Interaction::Pressed))
+            .id();
+        app.update();
+        assert_eq!(app.world().resource::<GraphNav>().version, 0);
+        *app.world_mut().get_mut::<Interaction>(card).unwrap() = Interaction::None;
+        app.update();
+        *app.world_mut().get_mut::<Interaction>(card).unwrap() = Interaction::Pressed;
+        app.update();
+        let nav = app.world().resource::<GraphNav>();
+        assert_eq!(nav.path, ["step"]);
+        assert!(nav.selected.is_none());
+        assert_eq!(nav.version, 1);
+    }
+
+    #[test]
+    fn 延迟生成的卡片立即使用当前选中样式() {
+        let mut app = App::new();
+        app.insert_resource(GraphNav {
+            selected: Some("step".into()),
+            ..default()
+        })
+        .add_systems(Update, sync_node_selection);
+        app.update();
+        let card = app.world_mut().spawn(GraphNodeMarker("step".into())).id();
+        app.update();
+        assert_eq!(
+            app.world().get::<ThemeBorderColor>(card).unwrap().0,
+            theme::GRAPH_SELECTED_BORDER
+        );
+    }
+
+    /// 真实 BSN/Feathers 按钮和输入分发；不创建原生窗口，不读取用户配置。
+    fn graph_app(editor: Editor) -> App {
+        use bevy::input::InputPlugin;
+        use bevy::input_focus::{InputDispatchPlugin, InputFocus};
+        use bevy::scene::ScenePlugin;
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            ScenePlugin,
+            InputPlugin,
+            InputDispatchPlugin,
+            bevy::ui_widgets::ButtonPlugin,
+        ))
+        .init_asset::<Font>()
+        .init_resource::<InputFocus>()
+        .insert_resource(editor)
+        .insert_resource(super::super::Session::new(
+            crate::model::LoginConfig::default(),
+            Vec::new(),
+        ))
+        .configure_sets(
+            Update,
+            (UiSet::Input, UiSet::Update, UiSet::Rebuild).chain(),
+        )
+        .add_plugins((widgets::WidgetsPlugin, GraphViewPlugin));
+        app.world_mut()
+            .spawn((Window::default(), bevy::window::PrimaryWindow));
+        app
+    }
+
+    fn settle_scenes(app: &mut App) {
+        for _ in 0..4 {
+            app.update();
+        }
+    }
+
+    fn view_button(app: &mut App, graph: bool) -> Entity {
+        app.world_mut()
+            .query::<(Entity, &ViewToggle)>()
+            .iter(app.world())
+            .find(|(_, marker)| marker.0 == graph)
+            .unwrap()
+            .0
+    }
+
+    fn click_caption(app: &mut App, button: Entity) {
+        use bevy::picking::pointer::{Location, PointerButton, PointerId};
+        let entity = app.world().get::<Children>(button).unwrap()[0];
+        let location = Location {
+            target: bevy::camera::NormalizedRenderTarget::None {
+                width: 1,
+                height: 1,
+            },
+            position: Vec2::ZERO,
+        };
+        let hit = bevy::picking::backend::HitData::new(Entity::PLACEHOLDER, 0.0, None, None);
+        app.world_mut().trigger(Pointer::new(
+            PointerId::Mouse,
+            location.clone(),
+            Press {
+                button: PointerButton::Primary,
+                hit: hit.clone(),
+                count: 1,
+            },
+            entity,
+        ));
+        app.world_mut().flush();
+        app.world_mut().trigger(Pointer::new(
+            PointerId::Mouse,
+            location.clone(),
+            Click {
+                button: PointerButton::Primary,
+                hit: hit.clone(),
+                count: 1,
+                duration: std::time::Duration::ZERO,
+            },
+            entity,
+        ));
+        app.world_mut().flush();
+        app.world_mut().trigger(Pointer::new(
+            PointerId::Mouse,
+            location,
+            Release {
+                button: PointerButton::Primary,
+                hit,
+            },
+            entity,
+        ));
+        app.world_mut().flush();
+    }
+
+    #[test]
+    fn 真实feathers流程图按钮激活后同帧切换视图() {
+        let mut app = graph_app(test_editor());
+        let params = app.world_mut().spawn((ParamsPane, Node::default())).id();
+        let graph = app
+            .world_mut()
+            .spawn((
+                GraphPane,
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+            ))
+            .id();
+        let button = app
+            .world_mut()
+            .spawn_scene(widgets::button(
+                "流程图",
+                ButtonVariant::Normal,
+                ViewToggle(true),
+            ))
+            .unwrap()
+            .id();
+        settle_scenes(&mut app);
+        assert!(
+            app.world()
+                .get::<bevy::ui_widgets::Button>(button)
+                .is_some()
+        );
+        assert!(
+            app.world().get::<Interaction>(button).is_none(),
+            "Feathers按钮没有旧Interaction组件"
+        );
+        app.world_mut().trigger(Activate { entity: button });
+        app.update();
+        assert_eq!(*app.world().resource::<ViewMode>(), ViewMode::Graph);
+        assert_eq!(
+            app.world().get::<Node>(params).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(graph).unwrap().display,
+            Display::Flex
+        );
+    }
+
+    #[test]
+    fn 无文档时点击按钮文字仍能切换并显示加载提示() {
+        let mut app = graph_app(Editor::default());
+        app.world_mut().spawn((ViewSwitchSlot, Node::default()));
+        let params = app.world_mut().spawn((ParamsPane, Node::default())).id();
+        let graph = app
+            .world_mut()
+            .spawn((
+                GraphPane,
+                GraphSlot,
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+            ))
+            .id();
+        settle_scenes(&mut app);
+        let button = view_button(&mut app, true);
+        click_caption(&mut app, button);
+        app.update();
+        assert_eq!(*app.world().resource::<ViewMode>(), ViewMode::Graph);
+        assert_eq!(
+            app.world().get::<Node>(params).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(graph).unwrap().display,
+            Display::Flex
+        );
+        assert!(
+            app.world_mut()
+                .query::<&Text>()
+                .iter(app.world())
+                .any(|text| text.0 == "请先从左侧选择一个文件")
+        );
+        assert_eq!(view_button(&mut app, true), button, "点击不重建按钮");
+        assert_eq!(
+            *app.world().get::<ButtonVariant>(button).unwrap(),
+            ButtonVariant::Primary
+        );
+
+        app.world_mut()
+            .resource_mut::<Editor>()
+            .load(test_editor().data);
+        settle_scenes(&mut app);
+        assert_eq!(
+            view_button(&mut app, true),
+            button,
+            "加载文档也保持入口实体"
+        );
+        assert!(
+            app.world_mut()
+                .query::<&GraphNodeMarker>()
+                .iter(app.world())
+                .any(|node| node.0 == "step")
+        );
+    }
+
+    #[test]
+    fn 回车与空格通过真实键盘分发切换且保留按钮焦点() {
+        use bevy::input::{
+            ButtonState,
+            keyboard::{Key, KeyboardInput},
+        };
+        use bevy::input_focus::{FocusCause, InputFocus};
+        let mut app = graph_app(test_editor());
+        app.world_mut().spawn((ViewSwitchSlot, Node::default()));
+        settle_scenes(&mut app);
+        let graph_button = view_button(&mut app, true);
+        let params_button = view_button(&mut app, false);
+        let window = app
+            .world_mut()
+            .query_filtered::<Entity, With<bevy::window::PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        for (button, key_code, logical_key, wanted) in [
+            (graph_button, KeyCode::Enter, Key::Enter, ViewMode::Graph),
+            (params_button, KeyCode::Space, Key::Space, ViewMode::Params),
+        ] {
+            app.world_mut()
+                .resource_mut::<InputFocus>()
+                .set(button, FocusCause::Navigated);
+            app.world_mut().write_message(KeyboardInput {
+                key_code,
+                logical_key,
+                state: ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window,
+            });
+            app.update();
+            assert_eq!(*app.world().resource::<ViewMode>(), wanted);
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(button));
+            assert_eq!(
+                *app.world().get::<ButtonVariant>(button).unwrap(),
+                ButtonVariant::Primary
+            );
+        }
+        assert_eq!(view_button(&mut app, true), graph_button);
+        assert_eq!(view_button(&mut app, false), params_button);
+    }
+
+    #[test]
+    fn 迟到的bsn面板按已经选定的视图初始化() {
+        let mut app = graph_app(Editor::default());
+        *app.world_mut().resource_mut::<ViewMode>() = ViewMode::Graph;
+        app.update();
+        let params = app.world_mut().spawn((ParamsPane, Node::default())).id();
+        let graph = app
+            .world_mut()
+            .spawn((
+                GraphPane,
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+            ))
+            .id();
+        app.world_mut().spawn((ViewSwitchSlot, Node::default()));
+        settle_scenes(&mut app);
+        assert_eq!(
+            app.world().get::<Node>(params).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(graph).unwrap().display,
+            Display::Flex
+        );
+        let button = view_button(&mut app, true);
+        assert_eq!(
+            *app.world().get::<ButtonVariant>(button).unwrap(),
+            ButtonVariant::Primary
+        );
+    }
+
+    #[test]
+    fn 详情feathers按钮文字可下钻且原生面包屑仍能返回() {
+        let mut app = graph_app(test_editor());
+        let button = app
+            .world_mut()
+            .spawn_scene(widgets::button(
+                "进入子图",
+                ButtonVariant::Primary,
+                DrillButton("step".into()),
+            ))
+            .unwrap()
+            .id();
+        let root_crumb = app
+            .world_mut()
+            .spawn_scene(crumb("根", 0, false))
+            .unwrap()
+            .id();
+        settle_scenes(&mut app);
+        assert!(app.world().get::<Interaction>(button).is_none());
+        click_caption(&mut app, button);
+        app.update();
+        assert_eq!(app.world().resource::<GraphNav>().path, ["step"]);
+        *app.world_mut().get_mut::<Interaction>(root_crumb).unwrap() = Interaction::Pressed;
+        app.update();
+        assert!(app.world().resource::<GraphNav>().path.is_empty());
     }
 }

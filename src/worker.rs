@@ -4,13 +4,27 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::ssh::{AuthMethod, DirListing, SshConfig, SshConnection};
+use crate::ssh::{AuthMethod, DirListing, SshCancellation, SshConfig, SshConnection};
 
 /// UI 唤醒回调：后台线程产生响应后调用，通知 UI 层尽快处理
 ///
 /// 与 GUI 框架解耦——Bevy 侧传入 winit 的 `EventLoopProxy` 唤醒，
 /// 测试等无窗口场景可传空闭包。
 pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
+
+/// 文件名只能是目录内的单个路径段，不能由 task_id 越界寻址。
+pub fn validate_filename(filename: &str) -> Result<(), String> {
+    match filename {
+        "" | "." | ".." => Err("文件名不能为空或相对目录".into()),
+        name if name
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '\0' | '\r' | '\n')) =>
+        {
+            Err("文件名不能包含路径分隔符或控制字符".into())
+        }
+        _ => Ok(()),
+    }
+}
 
 /// UI 忙碌状态
 pub enum BusyState {
@@ -62,7 +76,7 @@ pub enum WorkerRequest {
         filename: String,
         existing_files: Vec<String>,
     },
-    /// 删除文件（rm + 刷新列表）
+    /// 删除文件（SFTP unlink + 刷新列表）
     DeleteFile {
         remote_dir: String,
         filename: String,
@@ -94,13 +108,16 @@ pub enum WorkerResponse {
     FileList(Result<DirListing, String>),
     /// 文件内容加载完成
     FileLoaded {
+        remote_dir: String,
         filename: String,
         result: Result<String, String>,
     },
     /// 保存完成
     FileSaved {
+        remote_dir: String,
         old_filename: String,
         new_filename: Option<String>,
+        cleanup_warning: Option<String>,
         file_list: Result<DirListing, String>,
     },
     /// 保存失败
@@ -115,6 +132,7 @@ pub enum WorkerResponse {
     BackupFailed(String),
     /// 删除完成
     FileDeleted {
+        remote_dir: String,
         filename: String,
         file_list: Result<DirListing, String>,
     },
@@ -147,27 +165,33 @@ pub enum WorkerResponse {
 pub struct WorkerHandle {
     tx: mpsc::Sender<WorkerRequest>,
     rx: Mutex<mpsc::Receiver<WorkerResponse>>,
+    cancellation: SshCancellation,
 }
 
 impl WorkerHandle {
     /// 启动后台工作线程，返回通信句柄
-    pub fn spawn(wake: WakeFn) -> Self {
+    pub fn spawn(wake: WakeFn) -> std::io::Result<Self> {
         let (req_tx, req_rx) = mpsc::channel::<WorkerRequest>();
         let (resp_tx, resp_rx) = mpsc::channel::<WorkerResponse>();
 
+        let cancellation = SshCancellation::default();
+        let worker_cancellation = cancellation.clone();
         std::thread::Builder::new()
             .name("ssh-worker".into())
-            .spawn(move || worker_loop(req_rx, resp_tx, wake))
-            .expect("启动后台工作线程失败");
+            .spawn(move || worker_loop(req_rx, resp_tx, wake, worker_cancellation))?;
 
-        Self {
+        Ok(Self {
             tx: req_tx,
             rx: Mutex::new(resp_rx),
-        }
+            cancellation,
+        })
     }
 
     /// 发送请求到后台线程
     pub fn send(&self, request: WorkerRequest) {
+        if matches!(request, WorkerRequest::Disconnect) {
+            self.cancellation.cancel();
+        }
         // 发送失败说明后台线程已退出，忽略即可
         let _ = self.tx.send(request);
     }
@@ -175,6 +199,14 @@ impl WorkerHandle {
     /// 非阻塞接收一个响应（UI 轮询时调用）
     pub fn try_recv(&self) -> Option<WorkerResponse> {
         self.rx.lock().ok()?.try_recv().ok()
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        // 不能等待工作线程自己轮询 Disconnect，套接字上的阻塞操作也必须被打断。
+        self.cancellation.cancel();
+        let _ = self.tx.send(WorkerRequest::Disconnect);
     }
 }
 
@@ -252,7 +284,12 @@ fn read_ros_domain_id(conn: &SshConnection) -> Option<String> {
 /// 1. **已连接**：处理请求，空闲时发送 keepalive 心跳
 /// 2. **重连中**：指数退避自动重连，期间仍响应 Disconnect 等请求
 /// 3. **未连接**：阻塞等待 Connect 请求
-fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResponse>, wake: WakeFn) {
+fn worker_loop(
+    rx: mpsc::Receiver<WorkerRequest>,
+    tx: mpsc::Sender<WorkerResponse>,
+    wake: WakeFn,
+    cancellation: SshCancellation,
+) {
     let mut connection: Option<SshConnection> = None;
     // 保存连接参数，用于自动重连时重建连接
     let mut connect_params: Option<(SshConfig, String)> = None;
@@ -260,20 +297,23 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
 
     /// 发送响应并唤醒 UI
     macro_rules! respond {
-        ($resp:expr) => {
+        ($resp:expr) => {{
             let _ = tx.send($resp);
             (wake)();
-        };
+        }};
     }
 
     loop {
+        if cancellation.is_cancelled() {
+            break;
+        }
         // ── 重连：到时间就尝试 ──
         if let Some(ref mut rs) = reconnect
             && Instant::now() >= rs.next_try
         {
             rs.attempt += 1;
             if let Some((config, remote_dir)) = &connect_params {
-                match SshConnection::connect(config) {
+                match SshConnection::connect_cancellable(config, &cancellation) {
                     Ok(conn) => {
                         let ros_domain_id = read_ros_domain_id(&conn);
                         let file_list = list_files_logged(&conn, remote_dir);
@@ -339,6 +379,9 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
             }
         };
 
+        if cancellation.is_cancelled() {
+            break;
+        }
         // ── 处理请求 ──
         match request {
             WorkerRequest::Connect {
@@ -349,6 +392,8 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 remote_dir,
             } => {
                 reconnect = None; // 取消进行中的自动重连
+                connection = None;
+                connect_params = None;
                 let config = SshConfig {
                     host,
                     port,
@@ -357,10 +402,13 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 };
 
                 tracing::info!(host = %config.host, port, user = %config.username, remote_dir = %remote_dir, "开始连接");
-                match SshConnection::connect(&config) {
+                match SshConnection::connect_cancellable(&config, &cancellation) {
                     Ok(conn) => {
                         let ros_domain_id = read_ros_domain_id(&conn);
                         let file_list = list_files_logged(&conn, &remote_dir);
+                        let remote_dir = file_list
+                            .as_ref()
+                            .map_or(remote_dir, |listing| listing.resolved_dir.clone());
                         connect_params = Some((config, remote_dir));
                         connection = Some(conn);
                         respond!(WorkerResponse::Connected {
@@ -388,6 +436,11 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                     continue;
                 };
                 let result = list_files_logged(conn, &remote_dir);
+                if let Ok(listing) = &result
+                    && let Some((_, directory)) = &mut connect_params
+                {
+                    directory.clone_from(&listing.resolved_dir);
+                }
                 respond!(WorkerResponse::FileList(result));
             }
 
@@ -397,14 +450,30 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
             } => {
                 let Some(conn) = connection.as_ref() else {
                     respond!(WorkerResponse::FileLoaded {
+                        remote_dir,
                         filename,
                         result: Err("未连接".into()),
                     });
                     continue;
                 };
+                let remote_dir = match conn.canonical_dir(&remote_dir) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        respond!(WorkerResponse::FileLoaded {
+                            remote_dir,
+                            filename,
+                            result: Err(error.to_string()),
+                        });
+                        continue;
+                    }
+                };
                 let path = format!("{remote_dir}/{filename}");
                 let result = conn.read_file(&path).map_err(|e| e.to_string());
-                respond!(WorkerResponse::FileLoaded { filename, result });
+                respond!(WorkerResponse::FileLoaded {
+                    remote_dir,
+                    filename,
+                    result
+                });
             }
 
             WorkerRequest::SaveFile {
@@ -413,6 +482,12 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 content,
                 new_filename,
             } => {
+                let valid_names = validate_filename(&current_filename)
+                    .and_then(|()| new_filename.as_deref().map_or(Ok(()), validate_filename));
+                if let Err(error) = valid_names {
+                    respond!(WorkerResponse::SaveFailed(error));
+                    continue;
+                }
                 let Some(conn) = connection.as_ref() else {
                     respond!(WorkerResponse::SaveFailed("未连接".into()));
                     continue;
@@ -420,28 +495,25 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
 
                 let current_path = format!("{remote_dir}/{current_filename}");
 
-                // 写入文件
-                if let Err(e) = conn.write_file(&current_path, &content) {
-                    respond!(WorkerResponse::SaveFailed(e.to_string()));
-                    continue;
-                }
-
-                // 可选重命名
-                if let Some(ref new_name) = new_filename {
-                    let new_path = format!("{remote_dir}/{new_name}");
-                    if let Err(e) = conn.rename_file(&current_path, &new_path) {
-                        respond!(WorkerResponse::SaveFailed(format!(
-                            "文件已保存但重命名失败: {e}"
-                        )));
+                let new_path = new_filename
+                    .as_ref()
+                    .map(|name| format!("{remote_dir}/{name}"));
+                let outcome = match conn.save_file(&current_path, &content, new_path.as_deref()) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        respond!(WorkerResponse::SaveFailed(error.to_string()));
                         continue;
                     }
-                }
+                };
+                tracing::info!(path = %outcome.saved_path, "任务图已提交");
 
                 // 刷新文件列表
                 let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileSaved {
+                    remote_dir,
                     old_filename: current_filename,
                     new_filename,
+                    cleanup_warning: outcome.cleanup_warning,
                     file_list,
                 });
             }
@@ -487,7 +559,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 let backup_path = format!("{remote_dir}/{backup_name}");
 
                 // 写入备份文件
-                if let Err(e) = conn.write_file(&backup_path, &content) {
+                if let Err(e) = conn.write_new_file(&backup_path, &content) {
                     respond!(WorkerResponse::BackupFailed(format!(
                         "写入备份文件失败: {e}"
                     )));
@@ -521,6 +593,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 // 刷新文件列表
                 let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileDeleted {
+                    remote_dir,
                     filename,
                     file_list,
                 });
@@ -537,7 +610,7 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                 };
 
                 let path = format!("{remote_dir}/{filename}");
-                if let Err(e) = conn.write_file(&path, &content) {
+                if let Err(e) = conn.write_new_file(&path, &content) {
                     respond!(WorkerResponse::UploadFailed(e.to_string()));
                     continue;
                 }
@@ -572,6 +645,54 @@ fn worker_loop(rx: mpsc::Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerRespons
                     .map_err(|e| e.to_string());
                 respond!(WorkerResponse::CommandOutput(result));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle() -> (WorkerHandle, SshCancellation) {
+        let (tx, _requests) = mpsc::channel();
+        let (_responses, rx) = mpsc::channel();
+        let cancellation = SshCancellation::default();
+        (
+            WorkerHandle {
+                tx,
+                rx: Mutex::new(rx),
+                cancellation: cancellation.clone(),
+            },
+            cancellation,
+        )
+    }
+
+    #[test]
+    fn 断开和销毁句柄不依赖后台读取消息就取消() {
+        let (worker, cancellation) = handle();
+        worker.send(WorkerRequest::Disconnect);
+        assert!(cancellation.is_cancelled());
+        let (worker, cancellation) = handle();
+        drop(worker);
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn 文件名不能越出绑定目录但支持中文和引号() {
+        for name in [
+            "../task.json",
+            "sub/task.json",
+            "sub\\task.json",
+            "\0.json",
+            "\n.json",
+            "",
+            ".",
+            "..",
+        ] {
+            assert!(validate_filename(name).is_err(), "应拒绝 {name:?}");
+        }
+        for name in ["task.json", "任务 '$ 文件.json"] {
+            assert!(validate_filename(name).is_ok());
         }
     }
 }

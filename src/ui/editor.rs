@@ -10,14 +10,15 @@
 //! - 轨迹点、二维数组行的内容懒加载——展开时才建，避免大轨迹一次生成上千个输入框。
 
 use bevy::feathers::controls::{
-    ButtonVariant, FeathersNumberInput, NumberInputValue, UpdateNumberInput,
+    ButtonVariant, FeathersNumberInput, NumberFormat, NumberInputValue, UpdateNumberInput,
 };
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, ThemeToken};
 use bevy::feathers::tokens;
 use bevy::prelude::*;
-use bevy::text::{EditableText, TextEditChange};
+use bevy::text::{EditableText, LineBreak, TextEditChange};
 use bevy::ui::Checked;
 use bevy::ui_widgets::ValueChange;
+use std::collections::HashSet;
 
 use crate::model::{ContextField, ContextValue, RobotPose, TaskGraphData, TrajectoryPoint};
 
@@ -29,19 +30,167 @@ use super::connect::ActionButton;
 use super::shell::{ActionBarSlot, EditorSlot};
 use super::theme;
 use super::widgets::{
-    self, BoxedScene, ButtonGate, Collapsible, NumberFieldInit, NumberInitValue, boxed,
+    self, BoxedScene, ButtonGate, Collapsible, NumberFieldBorder, NumberFieldInit, NumberInitValue,
+    boxed,
 };
 use super::worker_bridge::AppAction;
-use super::{Editor, Session, UiSet};
+use super::{Editor, Session, StatusLine, UiSet};
+
+/// 当前文档尚未修复的数值输入错误，保存前必须检查。
+///
+/// 无效文本不写回模型，但仍保留在输入框中供用户修正；不能静默保存旧值。
+#[derive(Resource, Default)]
+pub struct InputValidation {
+    structure_version: u64,
+    invalid_fields: HashSet<Entity>,
+}
+
+impl InputValidation {
+    /// 是否仍有属于当前字段树的输入错误。
+    pub fn has_errors(&self, editor: &Editor) -> bool {
+        self.structure_version == editor.structure_version && !self.invalid_fields.is_empty()
+    }
+
+    fn field_is_invalid(&self, editor: &Editor, entity: Entity) -> bool {
+        self.structure_version == editor.structure_version && self.invalid_fields.contains(&entity)
+    }
+
+    fn reset_for(&mut self, editor: &Editor) {
+        if self.structure_version != editor.structure_version {
+            self.structure_version = editor.structure_version;
+            self.invalid_fields.clear();
+        }
+    }
+
+    fn set_invalid(&mut self, editor: &Editor, entity: Entity, invalid: bool) -> bool {
+        self.reset_for(editor);
+        match invalid {
+            true => self.invalid_fields.insert(entity),
+            false => self.invalid_fields.remove(&entity),
+        }
+    }
+}
+
+/// 外部删除或整棵字段树重建后，不让已经消失的控件继续阻止保存。
+fn clear_stale_input_errors(
+    editor: Res<Editor>,
+    fields: Query<(), With<ValueBinding>>,
+    mut validation: ResMut<InputValidation>,
+) {
+    validation.reset_for(&editor);
+    validation
+        .invalid_fields
+        .retain(|entity| fields.contains(*entity));
+}
+
+/// Feathers 只负责解析并发事件，本应用补齐空值、语法和数值范围校验。
+fn validate_number_text(text: &str, format: NumberFormat) -> Result<(), &'static str> {
+    let text = text.trim();
+    match format {
+        NumberFormat::F64 => match text.parse::<f64>() {
+            Ok(value) if value.is_finite() => Ok(()),
+            _ => Err("请输入有效且有限的 64 位浮点数"),
+        },
+        NumberFormat::F32 => match text.parse::<f32>() {
+            Ok(value) if value.is_finite() => Ok(()),
+            _ => Err("请输入有效且有限的 32 位浮点数"),
+        },
+        NumberFormat::I64 => text
+            .parse::<i64>()
+            .map(|_| ())
+            .map_err(|_| "请输入有效的 64 位整数"),
+        NumberFormat::I32 => text
+            .parse::<i32>()
+            .map(|_| ())
+            .map_err(|_| "请输入有效的 32 位整数"),
+    }
+}
+
+/// 每次文本变化都校验，覆盖不会产生 ValueChange 的空串、半截指数和整数溢出。
+fn on_number_text_edit(
+    change: On<TextEditChange>,
+    texts: Query<(&ChildOf, &EditableText)>,
+    fields: Query<(&ValueBinding, &NumberFormat, &NumberFieldBorder)>,
+    editor: Res<Editor>,
+    mut validation: ResMut<InputValidation>,
+    mut status: ResMut<StatusLine>,
+    mut commands: Commands,
+) {
+    let Ok((parent, editable)) = texts.get(change.event_target()) else {
+        return;
+    };
+    let entity = parent.parent();
+    let Ok((binding, format, normal_border)) = fields.get(entity) else {
+        return;
+    };
+    let result = validate_number_text(&editable.value().to_string(), *format);
+    let changed = validation.set_invalid(&editor, entity, result.is_err());
+    match result {
+        Err(reason) => {
+            let field_name = editor
+                .data
+                .as_ref()
+                .and_then(|data| {
+                    crate::model::field_at_path(&data.context_fields, &binding.field_path)
+                })
+                .map_or("数值字段", |field| field.key.as_str());
+            status.set(format!(
+                "输入错误：{field_name}，{reason}；修正标红数值后才能保存"
+            ));
+            commands
+                .entity(entity)
+                .insert(ThemeBorderColor(theme::STATUS_ERROR));
+        }
+        Ok(()) if changed => {
+            commands
+                .entity(entity)
+                .insert(ThemeBorderColor(normal_border.0.clone()));
+            match validation.has_errors(&editor) {
+                true => status.set("输入错误：仍有数值需要修正，请检查标红的输入框"),
+                false => status.set("数值输入已修正，可保存"),
+            }
+        }
+        Ok(()) => {}
+    }
+}
 
 /// 元数据字段
 #[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
-enum MetaField {
+pub(super) enum MetaField {
     /// 地图 ID
     #[default]
     MapId,
     /// 任务 ID
     TaskId,
+}
+
+/// 当前编辑文档的远程完整来源，独立于左侧文件列表目录。
+#[derive(Component, Clone, Default)]
+struct DocumentSourceLabel;
+
+fn document_source_label(editor: &Editor) -> String {
+    match &editor.document {
+        Some(document) => format!(
+            "保存位置：{}/{}",
+            document.remote_dir.trim_end_matches('/'),
+            document.filename,
+        ),
+        None => "保存位置：尚未绑定远程文件".into(),
+    }
+}
+
+fn sync_document_source(
+    editor: Res<Editor>,
+    mut labels: Query<(&mut Text, Ref<DocumentSourceLabel>)>,
+) {
+    for (mut text, marker) in &mut labels {
+        if editor.is_changed() || marker.is_added() {
+            let label = document_source_label(&editor);
+            if text.0 != label {
+                text.0 = label;
+            }
+        }
+    }
 }
 
 /// 位姿卡片，记录自身的索引路径（用于选中）
@@ -191,10 +340,18 @@ fn sync_pose_hint(editor: Res<Editor>, mut hints: Query<&mut Node, With<PoseHint
 // ============================================================
 
 /// 元数据卡片
-fn metadata_card(data: &TaskGraphData) -> impl Scene {
+fn metadata_card(data: &TaskGraphData, editor: &Editor) -> impl Scene {
     widgets::card(
         "元数据",
         bsn_list![
+            (
+                Text({document_source_label(editor)})
+                DocumentSourceLabel
+                ThemeTextColor({tokens::TEXT_DIM})
+                TextFont { font_size: px(11.0) }
+                TextLayout { linebreak: {LineBreak::AnyCharacter} }
+                Node { width: percent(100), margin: {UiRect::bottom(px(5.0))} }
+            ),
             widgets::form_row(
                 "map_id",
                 widgets::text_field(data.map_id.clone(), MetaField::MapId)
@@ -822,7 +979,7 @@ fn rebuild_editor(
 
     let content: Vec<BoxedScene> = match &editor.data {
         Some(data) => {
-            let mut items: Vec<BoxedScene> = vec![boxed(metadata_card(data))];
+            let mut items: Vec<BoxedScene> = vec![boxed(metadata_card(data, &editor))];
             let groups = field_groups(
                 &data.context_fields,
                 &[],
@@ -896,10 +1053,18 @@ fn sync_pose_selection(
 
 /// 新建的数值输入：把初值推给控件
 fn push_initial_values(
-    inits: Query<(Entity, &NumberFieldInit), Added<NumberFieldInit>>,
+    inits: Query<(Entity, &NumberFieldInit, &Children)>,
+    mut texts: Query<&mut EditableText>,
     mut commands: Commands,
 ) {
-    for (entity, init) in &inits {
+    for (entity, init, children) in &inits {
+        // 数值输入根节点先生成时，其内部文本框可能尚未就绪，保留初值标记重试。
+        let Some(child) = children.iter().find(|child| texts.contains(*child)) else {
+            continue;
+        };
+        if let Ok(mut editable) = texts.get_mut(child) {
+            editable.max_characters = Some(widgets::NUMBER_MAX_CHARACTERS);
+        }
         let value = match init.0 {
             NumberInitValue::Zero => NumberInputValue::F64(0.0),
             NumberInitValue::F64(v) => NumberInputValue::F64(v),
@@ -915,6 +1080,7 @@ fn push_initial_values(
 fn push_refreshed_values(
     editor: Res<Editor>,
     mut rendered: ResMut<RenderedEditor>,
+    validation: Res<InputValidation>,
     fields: Query<(Entity, &ValueBinding), With<FeathersNumberInput>>,
     mut commands: Commands,
 ) {
@@ -926,6 +1092,10 @@ fn push_refreshed_values(
         return;
     };
     for (entity, binding) in &fields {
+        // 用户仍在修正的文本由其本人决定，ROS2 回填不能用模型旧值悄悄覆盖它。
+        if validation.field_is_invalid(&editor, entity) {
+            continue;
+        }
         if let Some(value) = read_f64(data, binding) {
             commands.trigger(UpdateNumberInput {
                 entity,
@@ -982,12 +1152,23 @@ fn on_f64_change(
     change: On<ValueChange<f64>>,
     fields: Query<&ValueBinding>,
     mut editor: ResMut<Editor>,
+    mut validation: ResMut<InputValidation>,
+    mut status: ResMut<StatusLine>,
+    mut commands: Commands,
 ) {
     let Ok(binding) = fields.get(change.source) else {
         return;
     };
     let binding = binding.clone();
     let value = change.value;
+    if !value.is_finite() {
+        validation.set_invalid(&editor, change.source, true);
+        status.set("输入错误：数值超出有限浮点数范围，请修正标红数值后再保存");
+        commands
+            .entity(change.source)
+            .insert(ThemeBorderColor(theme::STATUS_ERROR));
+        return;
+    }
     if let Some(data) = &mut editor.data {
         apply_f64(data, &binding, value);
     }
@@ -1057,9 +1238,11 @@ pub struct EditorPanelPlugin;
 impl Plugin for EditorPanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RenderedEditor>()
+            .init_resource::<InputValidation>()
             .add_observer(on_meta_edit)
             .add_observer(on_text_field_edit)
             .add_observer(on_f64_change)
+            .add_observer(on_number_text_edit)
             .add_observer(on_i64_change)
             .add_observer(on_bool_change)
             .add_observer(on_pose_card_click)
@@ -1070,11 +1253,268 @@ impl Plugin for EditorPanelPlugin {
                     rebuild_action_bar,
                     sync_pose_selection,
                     sync_pose_hint,
+                    sync_document_source,
                     fill_lazy_bodies,
                     push_initial_values,
                     push_refreshed_values,
+                    clear_stale_input_errors,
                 )
                     .in_set(UiSet::Rebuild),
             );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::input_focus::InputFocus;
+    use bevy::scene::ScenePlugin;
+    use bevy::text::{FontCx, LayoutCx, TextEdit, apply_text_edits};
+
+    /// 使用真实 Feathers 场景和文本编辑流程，无窗口、网络与帧间等待。
+    fn number_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
+            .init_asset::<Font>()
+            .init_resource::<InputFocus>()
+            .init_resource::<FontCx>()
+            .init_resource::<LayoutCx>()
+            .init_resource::<bevy::clipboard::Clipboard>()
+            .init_resource::<Editor>()
+            .init_resource::<RenderedEditor>()
+            .init_resource::<InputValidation>()
+            .init_resource::<StatusLine>()
+            .add_observer(on_number_text_edit)
+            .add_observer(on_f64_change)
+            .add_observer(on_i64_change)
+            .add_systems(
+                Update,
+                (
+                    push_initial_values,
+                    push_refreshed_values,
+                    clear_stale_input_errors,
+                ),
+            )
+            .add_systems(PostUpdate, apply_text_edits);
+        // Parley 的全选依赖字形布局；加载仓库字体让无窗口测试具备真实选区语义。
+        // 空字体集合没有字形，SelectAll 会退化为空选区，不能用于验证替换编辑。
+        let font = Font::from_bytes(
+            include_bytes!("../../assets/fonts/SarasaTermSCNerd-Regular.ttf").to_vec(),
+        );
+        let mut fonts = app.world_mut().resource_mut::<FontCx>();
+        let registered = fonts.collection.register_fonts(font.data, None);
+        let family = fonts
+            .collection
+            .family_name(registered[0].0)
+            .unwrap()
+            .to_string();
+        fonts.set_sans_serif_family(&family).unwrap();
+        app
+    }
+
+    fn numeric_text(app: &mut App, field: Entity) -> Entity {
+        let children = app.world().get::<Children>(field).unwrap();
+        children
+            .iter()
+            .find(|child| app.world().get::<EditableText>(*child).is_some())
+            .unwrap()
+    }
+
+    fn replace_text(app: &mut App, field: Entity, value: &str) {
+        let entity = numeric_text(app, field);
+        let mut editable = app.world_mut().get_mut::<EditableText>(entity).unwrap();
+        editable.queue_edit(TextEdit::SelectAll);
+        editable.queue_edit(TextEdit::Insert(value.to_string().into()));
+        app.update();
+    }
+
+    fn has_errors(app: &App) -> bool {
+        app.world()
+            .resource::<InputValidation>()
+            .has_errors(app.world().resource::<Editor>())
+    }
+
+    fn float_field(app: &mut App, value: f64) -> Entity {
+        let data = crate::model::parse_task_graph(
+            r#"{"map_id":"m","task_id":"t","config":{"context":{"speed":1.5}}}"#,
+        )
+        .unwrap();
+        app.world_mut().resource_mut::<Editor>().load(Some(data));
+        app.world_mut()
+            .spawn_scene(widgets::number_field(
+                value,
+                None,
+                ValueBinding::new(vec![0], ValueSlot::Scalar),
+            ))
+            .unwrap()
+            .id()
+    }
+
+    #[test]
+    fn 合法极小极大浮点初值和外部回填均完整显示() {
+        for value in [
+            1e-20,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            let mut app = number_app();
+            let field = float_field(&mut app, value);
+            app.update();
+            let text = numeric_text(&mut app, field);
+            let editable = app.world().get::<EditableText>(text).unwrap();
+            assert_eq!(
+                editable.max_characters,
+                Some(widgets::NUMBER_MAX_CHARACTERS)
+            );
+            assert_eq!(
+                editable
+                    .value()
+                    .to_string()
+                    .parse::<f64>()
+                    .unwrap()
+                    .to_bits(),
+                value.to_bits()
+            );
+
+            let refreshed = -value;
+            {
+                let mut editor = app.world_mut().resource_mut::<Editor>();
+                assert!(apply_f64(
+                    editor.data.as_mut().unwrap(),
+                    &ValueBinding::new(vec![0], ValueSlot::Scalar),
+                    refreshed
+                ));
+                editor.mark_values_changed();
+            }
+            app.update();
+            let refreshed_text = app
+                .world()
+                .get::<EditableText>(text)
+                .unwrap()
+                .value()
+                .to_string();
+            assert_eq!(
+                refreshed_text
+                    .parse::<f64>()
+                    .unwrap_or_else(|_| panic!("回填 {refreshed:?} 后文本为 {refreshed_text:?}"))
+                    .to_bits(),
+                refreshed.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn 数值输入错误可见且阻止保存并由用户修正解除() {
+        let mut app = number_app();
+        let field = float_field(&mut app, 1.5);
+        app.update();
+        for invalid in ["1e999", "-1e999", "1e", ""] {
+            replace_text(&mut app, field, invalid);
+            assert!(has_errors(&app), "应拦截 {invalid:?}");
+            assert!(
+                app.world()
+                    .resource::<StatusLine>()
+                    .text
+                    .contains("输入错误")
+            );
+            assert_eq!(
+                app.world().get::<ThemeBorderColor>(field).unwrap().0,
+                theme::STATUS_ERROR
+            );
+            let editor = app.world().resource::<Editor>();
+            assert_eq!(
+                read_f64(
+                    editor.data.as_ref().unwrap(),
+                    &ValueBinding::new(vec![0], ValueSlot::Scalar)
+                ),
+                Some(1.5)
+            );
+        }
+        replace_text(&mut app, field, "2.25");
+        let text = numeric_text(&mut app, field);
+        assert!(
+            !has_errors(&app),
+            "修正后的文本为 {:?}",
+            app.world()
+                .get::<EditableText>(text)
+                .unwrap()
+                .value()
+                .to_string()
+        );
+        assert_eq!(
+            app.world().get::<ThemeBorderColor>(field).unwrap().0,
+            theme::INPUT_BORDER
+        );
+
+        replace_text(&mut app, field, "1e999");
+        {
+            let mut editor = app.world_mut().resource_mut::<Editor>();
+            assert!(apply_f64(
+                editor.data.as_mut().unwrap(),
+                &ValueBinding::new(vec![0], ValueSlot::Scalar),
+                1e-20
+            ));
+            editor.mark_values_changed();
+        }
+        app.update();
+        assert!(has_errors(&app));
+        let text = numeric_text(&mut app, field);
+        assert_eq!(
+            app.world()
+                .get::<EditableText>(text)
+                .unwrap()
+                .value()
+                .to_string(),
+            "1e999"
+        );
+        replace_text(&mut app, field, "3.25");
+        assert!(!has_errors(&app));
+        assert_eq!(
+            app.world()
+                .get::<EditableText>(text)
+                .unwrap()
+                .value()
+                .to_string()
+                .parse::<f64>()
+                .unwrap(),
+            3.25
+        );
+    }
+
+    #[test]
+    fn 删除错误控件和切换文档后不残留保存阻塞() {
+        let mut app = number_app();
+        let field = float_field(&mut app, 1.5);
+        app.update();
+        replace_text(&mut app, field, "1e999");
+        app.world_mut().entity_mut(field).despawn();
+        app.update();
+        assert!(!has_errors(&app));
+
+        let field = float_field(&mut app, 1.5);
+        app.update();
+        replace_text(&mut app, field, "1e999");
+        app.world_mut().resource_mut::<Editor>().load(None);
+        assert!(!has_errors(&app));
+    }
+
+    #[test]
+    fn 整数范围与浮点语法按控件类型校验() {
+        assert!(validate_number_text(&i64::MIN.to_string(), NumberFormat::I64).is_ok());
+        assert!(validate_number_text(&i64::MAX.to_string(), NumberFormat::I64).is_ok());
+        for text in [
+            "9223372036854775808",
+            "-9223372036854775809",
+            "1.5",
+            "1e2",
+            "",
+        ] {
+            assert!(validate_number_text(text, NumberFormat::I64).is_err());
+        }
+        for text in ["NaN", "inf", "-inf", "1e999", ""] {
+            assert!(validate_number_text(text, NumberFormat::F64).is_err());
+        }
     }
 }

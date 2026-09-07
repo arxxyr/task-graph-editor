@@ -157,7 +157,8 @@ pub struct PasswordInputPlugin;
 
 impl Plugin for PasswordInputPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, init_password_mask);
+        // 初始遮罩必须先于输入刷新，否则初次文本事件会把空缓冲误当作用户清空密码。
+        app.add_systems(Update, init_password_mask.in_set(super::UiSet::Input));
     }
 }
 
