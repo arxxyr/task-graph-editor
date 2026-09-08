@@ -1,7 +1,7 @@
 //! 桥接层使用纯状态响应验证来源绑定，无需真实窗口、登录配置或 SSH 服务端。
 
 use super::*;
-use crate::ui::binding::{ValueBinding, ValueSlot};
+use crate::ui::binding::{PosePart, ValueBinding, ValueSlot};
 use crate::ui::{connect, editor as editor_panel, widgets};
 use bevy::clipboard::{ClipboardError, ClipboardRead};
 use bevy::input_focus::InputFocus;
@@ -30,6 +30,97 @@ fn editor() -> Editor {
         },
     );
     editor
+}
+
+/// 使用混合字符串/对象位姿，并保留模型未知字段，验证回填不会改变原始格式。
+fn pose_editor() -> Editor {
+    let mut pose = serde_json::to_value(RobotPose::default()).unwrap();
+    pose["fixture_metadata"] = serde_json::json!({"station": "A"});
+    pose["chassis_pose"]["position"]["precision"] = serde_json::json!("原始扩展字段");
+    let text_pose = serde_json::to_string_pretty(&pose).unwrap();
+    let context = serde_json::json!({
+        "pick_poses": [text_pose.clone(), pose.clone(), text_pose.clone()],
+        "home_pose": text_pose.clone(),
+        "profiles": {
+            "home_pose": text_pose.clone(),
+            "pick_poses": [text_pose, pose],
+        },
+        "speed": 1.5,
+        "empty_poses": [],
+    });
+    let data = model::parse_task_graph(
+        &serde_json::json!({"map_id": "m", "task_id": "task", "config": {"context": context}})
+            .to_string(),
+    )
+    .unwrap();
+    let mut editor = editor();
+    editor.load_remote(data, editor.document.clone().unwrap());
+    editor
+}
+
+fn context_path(data: &model::TaskGraphData, keys: &[&str]) -> Vec<usize> {
+    let mut fields = data.context_fields.as_slice();
+    let mut path = Vec::new();
+    for key in keys {
+        let index = fields.iter().position(|field| field.key == *key).unwrap();
+        path.push(index);
+        fields = match &fields[index].value {
+            ContextValue::NestedGroup(children) => children,
+            _ => &[],
+        };
+    }
+    path
+}
+
+const TRACKED_POSE_OUTPUT: &str = "pose:
+  position:
+    x: 0.7197834644638161
+    y: 0.18714868614716318
+    z: 0.125
+  orientation:
+    w: 0.9992947295789162
+    x: 0.001
+    y: 0.002
+    z: 0.037550545079943314
+---";
+const JOINT_OUTPUT: &str = "head_joint_1=-0.314158499 head_joint_2=0.000042716 body_joint_1=0.679999937 body_joint_2=0.299999416";
+
+fn fetch_cases() -> [(AppAction, PosePart, &'static str); 3] {
+    [
+        (
+            AppAction::FetchChassisPose,
+            PosePart::Chassis,
+            TRACKED_POSE_OUTPUT,
+        ),
+        (AppAction::FetchHeadJoints, PosePart::Head, JOINT_OUTPUT),
+        (AppAction::FetchWaistJoints, PosePart::Waist, JOINT_OUTPUT),
+    ]
+}
+
+/// 运行真实动作处理系统，确认请求捕获目标和结构版本，全程不连接 SSH。
+fn request_pose(
+    editor: Editor,
+    target: PoseTarget,
+    action: AppAction,
+) -> (Session, Editor, StatusLine) {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .insert_resource(session())
+        .insert_resource(editor)
+        .init_resource::<StatusLine>()
+        .init_resource::<FileBrowser>()
+        .init_resource::<InputValidation>()
+        .add_message::<DispatchAction>()
+        .add_systems(Update, handle_actions);
+    app.world_mut()
+        .write_message(DispatchAction(AppAction::SelectPose(target)));
+    app.world_mut().write_message(DispatchAction(action));
+    app.update();
+    (
+        app.world_mut().remove_resource::<Session>().unwrap(),
+        app.world_mut().remove_resource::<Editor>().unwrap(),
+        app.world_mut().remove_resource::<StatusLine>().unwrap(),
+    )
 }
 
 fn listing(directory: &str, files: &[&str]) -> Result<DirListing, String> {
@@ -634,4 +725,350 @@ fn 保存成功但清理失败保持来源并明确提示() {
     assert_eq!(editor.document.as_ref().unwrap().filename, "new.json");
     assert!(status.text.contains("文件已保存"));
     assert!(status.text.contains("旧文件未删除"));
+}
+
+#[test]
+fn 位姿数组三个取数动作固定原目标且保留其他元素与原始格式() {
+    for (action, part, output) in fetch_cases() {
+        for index in 0..2 {
+            let editor = pose_editor();
+            let path = context_path(editor.data.as_ref().unwrap(), &["pick_poses"]);
+            let target = PoseTarget::array_element(path.clone(), index);
+            let (mut session, mut editor, mut status) =
+                request_pose(editor, target.clone(), action.clone());
+            assert!(editor.has_pose_selection());
+            assert!(matches!(session.busy, BusyState::Fetching(_)));
+            let (pending_target, version) = match session.pending_command.as_ref().unwrap() {
+                PendingCommand::ChassisPose {
+                    target,
+                    structure_version,
+                }
+                | PendingCommand::HeadJoints {
+                    target,
+                    structure_version,
+                }
+                | PendingCommand::WaistJoints {
+                    target,
+                    structure_version,
+                } => (target, *structure_version),
+            };
+            assert_eq!(pending_target, &target);
+            assert_eq!(version, editor.structure_version);
+
+            // 请求在途时改变选中和数值版本，结果仍须落在发起时的那一项。
+            let other_target = PoseTarget::array_element(path, 2);
+            editor.selected_pose = Some(other_target.clone());
+            editor.mark_values_changed();
+            let value_version = editor.value_version;
+            let mut expected = editor.data.as_ref().unwrap().clone();
+            let expected_pose = target.pose_mut(&mut expected).unwrap();
+            match part {
+                PosePart::Chassis => {
+                    expected_pose.chassis_pose = model::Pose {
+                        position: model::Position {
+                            x: 0.7197834644638161,
+                            y: 0.18714868614716318,
+                            z: 0.125,
+                        },
+                        orientation: model::Orientation {
+                            w: 0.9992947295789162,
+                            x: 0.001,
+                            y: 0.002,
+                            z: 0.037550545079943314,
+                        },
+                    };
+                }
+                PosePart::Head => {
+                    expected_pose.head_pose.position.x = -0.314158499;
+                    expected_pose.head_pose.position.y = 0.000042716;
+                }
+                PosePart::Waist => {
+                    expected_pose.waist_pose.position.x = 0.679999937;
+                    expected_pose.waist_pose.position.y = 0.299999416;
+                }
+            }
+            handle_response(
+                WorkerResponse::CommandOutput(Ok(output.into())),
+                &mut session,
+                &mut status,
+                &mut FileBrowser::default(),
+                &mut editor,
+            );
+            let data = editor.data.as_ref().unwrap();
+            assert_eq!(data.context_fields, expected.context_fields);
+            assert_eq!(editor.selected_pose.as_ref(), Some(&other_target));
+            assert_eq!(editor.structure_version, version);
+            assert_eq!(editor.value_version, value_version + 1);
+            assert!(matches!(session.busy, BusyState::Idle));
+            assert!(session.pending_command.is_none());
+            assert!(status.text.ends_with(&format!("pick_poses[{index}]")));
+
+            let saved: serde_json::Value =
+                serde_json::from_str(&model::serialize_task_graph(data).unwrap()).unwrap();
+            let raw_poses = &data.raw_json["config"]["context"]["pick_poses"];
+            let saved_poses = &saved["config"]["context"]["pick_poses"];
+            for other in 0..3 {
+                if other != index {
+                    assert_eq!(saved_poses[other], raw_poses[other]);
+                }
+            }
+            assert_eq!(saved_poses[index].is_string(), raw_poses[index].is_string());
+            let decoded = match saved_poses[index].as_str() {
+                Some(text) => serde_json::from_str::<serde_json::Value>(text).unwrap(),
+                None => saved_poses[index].clone(),
+            };
+            assert_eq!(
+                decoded["fixture_metadata"],
+                serde_json::json!({"station": "A"})
+            );
+            assert_eq!(
+                decoded["chassis_pose"]["position"]["precision"],
+                "原始扩展字段"
+            );
+            let reparsed = model::parse_task_graph(&saved.to_string()).unwrap();
+            assert_eq!(reparsed.context_fields, expected.context_fields);
+        }
+    }
+}
+
+#[test]
+fn 独立与嵌套位姿及嵌套数组均可通过取数动作回填() {
+    for (keys, array_index, label) in [
+        (vec!["home_pose"], None, "home_pose"),
+        (vec!["profiles", "home_pose"], None, "profiles.home_pose"),
+        (
+            vec!["profiles", "pick_poses"],
+            Some(1),
+            "profiles.pick_poses[1]",
+        ),
+    ] {
+        let editor = pose_editor();
+        let target = PoseTarget {
+            field_path: context_path(editor.data.as_ref().unwrap(), &keys),
+            array_index,
+        };
+        let (mut session, mut editor, mut status) =
+            request_pose(editor, target.clone(), AppAction::FetchChassisPose);
+        assert!(editor.has_pose_selection());
+        handle_response(
+            WorkerResponse::CommandOutput(Ok(TRACKED_POSE_OUTPUT.into())),
+            &mut session,
+            &mut status,
+            &mut FileBrowser::default(),
+            &mut editor,
+        );
+        assert_eq!(
+            target
+                .pose(editor.data.as_ref().unwrap())
+                .unwrap()
+                .chassis_pose
+                .position
+                .x,
+            0.7197834644638161
+        );
+        assert!(status.text.ends_with(label));
+    }
+}
+
+#[test]
+fn 无效位姿目标不能发起任何取数命令() {
+    let editor = pose_editor();
+    let data = editor.data.as_ref().unwrap();
+    let invalid_targets = [
+        PoseTarget::default(),
+        PoseTarget::field(context_path(data, &["pick_poses"])),
+        PoseTarget::array_element(context_path(data, &["pick_poses"]), 3),
+        PoseTarget::array_element(context_path(data, &["home_pose"]), 0),
+        PoseTarget::array_element(context_path(data, &["empty_poses"]), 0),
+        PoseTarget::field(context_path(data, &["speed"])),
+    ];
+    for target in invalid_targets {
+        for (action, _, _) in fetch_cases() {
+            let (session, editor, status) = request_pose(pose_editor(), target.clone(), action);
+            assert!(!editor.has_pose_selection());
+            assert!(session.pending_command.is_none());
+            assert!(matches!(session.busy, BusyState::Idle));
+            assert_eq!(status.text, "选中的字段不是位姿类型");
+        }
+    }
+}
+
+#[test]
+fn 位姿回填拒绝重载同名同形文档及字段结构变化后的旧响应() {
+    for reload in [true, false] {
+        for (action, _, output) in fetch_cases() {
+            let editor = pose_editor();
+            let target = PoseTarget::array_element(
+                context_path(editor.data.as_ref().unwrap(), &["pick_poses"]),
+                0,
+            );
+            let (mut session, mut editor, mut status) = request_pose(editor, target, action);
+            let expected = editor.data.as_ref().unwrap().context_fields.clone();
+            let value_version = editor.value_version;
+            match reload {
+                true => editor.load_remote(
+                    editor.data.clone().unwrap(),
+                    editor.document.clone().unwrap(),
+                ),
+                false => editor.mark_structure_changed(),
+            }
+            handle_response(
+                WorkerResponse::CommandOutput(Ok(output.into())),
+                &mut session,
+                &mut status,
+                &mut FileBrowser::default(),
+                &mut editor,
+            );
+            assert_eq!(editor.data.as_ref().unwrap().context_fields, expected);
+            assert_eq!(editor.value_version, value_version);
+            assert!(session.pending_command.is_none());
+            assert!(status.text.contains("过期"));
+        }
+    }
+}
+
+#[test]
+fn 位姿回填拒绝已经删除或改变类型的目标() {
+    for remove_element in [true, false] {
+        let editor = pose_editor();
+        let target = PoseTarget::array_element(
+            context_path(editor.data.as_ref().unwrap(), &["pick_poses"]),
+            2,
+        );
+        let (mut session, mut editor, mut status) =
+            request_pose(editor, target.clone(), AppAction::FetchChassisPose);
+        let data = editor.data.as_mut().unwrap();
+        let field = model::field_at_path_mut(&mut data.context_fields, &target.field_path).unwrap();
+        match (&mut field.value, remove_element) {
+            (ContextValue::PoseArray(poses), true) => {
+                poses.pop();
+            }
+            (value, false) => *value = ContextValue::Text("类型已变化".into()),
+            _ => unreachable!("测试夹具应为位姿数组"),
+        }
+        let expected = data.context_fields.clone();
+        let value_version = editor.value_version;
+        handle_response(
+            WorkerResponse::CommandOutput(Ok(TRACKED_POSE_OUTPUT.into())),
+            &mut session,
+            &mut status,
+            &mut FileBrowser::default(),
+            &mut editor,
+        );
+        assert_eq!(editor.data.as_ref().unwrap().context_fields, expected);
+        assert_eq!(editor.value_version, value_version);
+        assert_eq!(status.text, "目标位姿字段已不存在");
+    }
+}
+
+#[test]
+fn 位姿获取失败或无法解析时不改变任何数据() {
+    for (action, _, _) in fetch_cases() {
+        for result in [Err("读取超时".into()), Ok("无法解析的输出".into())] {
+            let editor = pose_editor();
+            let target = PoseTarget::array_element(
+                context_path(editor.data.as_ref().unwrap(), &["pick_poses"]),
+                0,
+            );
+            let (mut session, mut editor, mut status) =
+                request_pose(editor, target, action.clone());
+            let expected = editor.data.as_ref().unwrap().context_fields.clone();
+            let value_version = editor.value_version;
+            handle_response(
+                WorkerResponse::CommandOutput(result),
+                &mut session,
+                &mut status,
+                &mut FileBrowser::default(),
+                &mut editor,
+            );
+            assert_eq!(editor.data.as_ref().unwrap().context_fields, expected);
+            assert_eq!(editor.value_version, value_version);
+            assert!(session.pending_command.is_none());
+            assert!(status.text.contains("失败"));
+        }
+    }
+}
+
+#[test]
+#[ignore = "需要 TASK_GRAPH_REAL_FILE 和 TGE_TRACKED_POSE_FILE 指定只读文件副本"]
+fn 真实文件位姿数组选择后使用真实底盘输出逐项回填往返() {
+    let file = std::env::var("TASK_GRAPH_REAL_FILE").expect("需要 TASK_GRAPH_REAL_FILE");
+    let output_file = std::env::var("TGE_TRACKED_POSE_FILE").expect("需要 TGE_TRACKED_POSE_FILE");
+    let field_name = std::env::var("TGE_POSE_ARRAY_FIELD").unwrap_or_else(|_| "pick_poses".into());
+    let content = std::fs::read_to_string(file).expect("读取任务图副本失败");
+    let output = std::fs::read_to_string(output_file).expect("读取 ROS2 输出副本失败");
+    let chassis = model::parse_tracked_pose(&output).expect("必须提供有效 tracked_pose 输出");
+    let original = model::parse_task_graph(&content).expect("任务图副本必须能解析");
+    let path = context_path(&original, &[&field_name]);
+    let field = model::field_at_path(&original.context_fields, &path).unwrap();
+    let ContextValue::PoseArray(poses) = &field.value else {
+        panic!("{field_name} 应被识别为位姿数组");
+    };
+    assert!(!poses.is_empty());
+    let raw_poses = original.raw_json["config"]["context"][&field_name]
+        .as_array()
+        .unwrap();
+    for index in 0..poses.len() {
+        let mut editor = editor();
+        editor.load_remote(original.clone(), editor.document.clone().unwrap());
+        let target = PoseTarget::array_element(path.clone(), index);
+        let (mut session, mut editor, mut status) =
+            request_pose(editor, target.clone(), AppAction::FetchChassisPose);
+        assert!(editor.has_pose_selection());
+        assert!(session.pending_command.is_some());
+        // 改选另一项，响应仍须准确写回发起请求的下标。
+        editor.selected_pose = Some(PoseTarget::array_element(
+            path.clone(),
+            (index + 1) % poses.len(),
+        ));
+        handle_response(
+            WorkerResponse::CommandOutput(Ok(output.clone())),
+            &mut session,
+            &mut status,
+            &mut FileBrowser::default(),
+            &mut editor,
+        );
+        let data = editor.data.as_ref().unwrap();
+        let mut expected = original.clone();
+        target.pose_mut(&mut expected).unwrap().chassis_pose = chassis.clone();
+        assert_eq!(
+            data.context_fields, expected.context_fields,
+            "第 {index} 项应只更新底盘部位"
+        );
+        let saved = model::serialize_task_graph(data).unwrap();
+        let saved_json: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        let saved_poses = saved_json["config"]["context"][&field_name]
+            .as_array()
+            .unwrap();
+        assert_eq!(saved_poses.len(), raw_poses.len());
+        for (other, (saved_pose, raw_pose)) in saved_poses.iter().zip(raw_poses).enumerate() {
+            assert_eq!(
+                saved_pose.is_string(),
+                raw_pose.is_string(),
+                "第 {other} 项格式必须保留"
+            );
+            if other != index {
+                assert_eq!(saved_pose, raw_pose, "第 {other} 项原始内容不得变化");
+            }
+        }
+        let reparsed = model::parse_task_graph(&saved).unwrap();
+        assert_eq!(reparsed.context_fields, expected.context_fields);
+        let actual = &target.pose(&reparsed).unwrap().chassis_pose;
+        for comp in crate::ui::binding::PoseComp::POSITION
+            .into_iter()
+            .chain(crate::ui::binding::PoseComp::ORIENTATION)
+        {
+            assert_eq!(
+                comp.get(actual).to_bits(),
+                comp.get(&chassis).to_bits(),
+                "第 {index} 项的 {comp:?} 精度不一致"
+            );
+        }
+        assert!(status.text.ends_with(&format!("{field_name}[{index}]")));
+    }
+    println!(
+        "{field_name}：{} 个元素逐项选择与回填通过，全部 {} 个底盘 f64 分量位级一致，其他项原始内容及各项存储格式保持不变",
+        poses.len(),
+        poses.len() * 7
+    );
 }

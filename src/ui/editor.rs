@@ -23,8 +23,8 @@ use std::collections::HashSet;
 use crate::model::{ContextField, ContextValue, RobotPose, TaskGraphData, TrajectoryPoint};
 
 use super::binding::{
-    BoolBinding, PoseComp, PosePart, TextBinding, ValueBinding, ValueSlot, apply_bool, apply_f64,
-    apply_i64, apply_text, read_f64,
+    BoolBinding, PoseComp, PosePart, PoseTarget, TextBinding, ValueBinding, ValueSlot, apply_bool,
+    apply_f64, apply_i64, apply_text, read_f64,
 };
 use super::connect::ActionButton;
 use super::shell::{ActionBarSlot, EditorSlot};
@@ -193,18 +193,16 @@ fn sync_document_source(
     }
 }
 
-/// 位姿卡片，记录自身的索引路径（用于选中）
+/// 位姿卡片，记录独立位姿或数组元素的完整目标（用于选中）
 #[derive(Component, Clone, Default)]
 struct PoseCard {
-    /// 字段索引路径
-    path: Vec<usize>,
+    target: PoseTarget,
 }
 
 /// 位姿卡片的标题文字（选中时变色）
 #[derive(Component, Clone, Default)]
 struct PoseCardTitle {
-    /// 字段索引路径
-    path: Vec<usize>,
+    target: PoseTarget,
 }
 
 /// 懒加载内容的类型
@@ -247,8 +245,8 @@ struct RenderedEditor {
     values: u64,
     /// 已渲染的操作栏状态（有数据、已连接）
     action_bar: Option<(bool, bool)>,
-    /// 已渲染的选中路径
-    selection: Option<Vec<usize>>,
+    /// 已渲染的选中位姿目标
+    selection: Option<PoseTarget>,
 }
 
 /// 四元数分量的色条：w 用中性色，xyz 与位置三轴同色，便于横排时快速定位
@@ -373,7 +371,7 @@ fn metadata_card(data: &TaskGraphData, editor: &Editor) -> impl Scene {
 fn field_groups(
     fields: &[ContextField],
     path_prefix: &[usize],
-    selected: Option<&[usize]>,
+    selected: Option<&PoseTarget>,
 ) -> Vec<BoxedScene> {
     let mut poses = Vec::new();
     let mut scalars = Vec::new();
@@ -403,7 +401,7 @@ fn field_groups(
             .iter()
             .map(|&i| {
                 let path = child_path(path_prefix, i);
-                let is_selected = selected == Some(path.as_slice());
+                let is_selected = selected == Some(&PoseTarget::field(path.clone()));
                 boxed(pose_card(&fields[i], path, is_selected))
             })
             .collect();
@@ -476,7 +474,7 @@ fn field_groups(
     if !others.is_empty() {
         let body: Vec<BoxedScene> = others
             .iter()
-            .map(|&i| other_field(&fields[i], child_path(path_prefix, i)))
+            .map(|&i| other_field(&fields[i], child_path(path_prefix, i), selected))
             .collect();
         out.push(boxed(widgets::collapsible(
             "其他",
@@ -508,10 +506,21 @@ fn pose_card(field: &ContextField, path: Vec<usize>, selected: bool) -> impl Sce
         .map(|&part| boxed(pose_part(part, &path, pose)))
         .collect();
 
+    selectable_pose_card(field.key.clone(), PoseTarget::field(path), selected, parts)
+}
+
+/// 独立位姿和数组元素共用选中外壳，折叠及数值控件保持原实体。
+fn selectable_pose_card(
+    title: String,
+    target: PoseTarget,
+    selected: bool,
+    parts: Vec<BoxedScene>,
+) -> impl Scene {
     let (bg, border) = pose_card_tokens(selected);
-    let card_marker = PoseCard { path: path.clone() };
-    let title_marker = PoseCardTitle { path };
-    let key = field.key.clone();
+    let card_marker = PoseCard {
+        target: target.clone(),
+    };
+    let title_marker = PoseCardTitle { target };
 
     bsn! {
         Node {
@@ -525,7 +534,7 @@ fn pose_card(field: &ContextField, path: Vec<usize>, selected: bool) -> impl Sce
         template_value(card_marker)
         ThemeBackgroundColor(bg)
         ThemeBorderColor(border)
-        Children [(widgets::collapsible_titled(key, title_marker, None, false, parts))]
+        Children [(widgets::collapsible_titled(title, title_marker, None, false, parts))]
     }
 }
 
@@ -737,7 +746,7 @@ fn traj_point_body(point: &TrajectoryPoint, path: &[usize], index: usize) -> Vec
 fn nested_section(
     field: &ContextField,
     path: Vec<usize>,
-    selected: Option<&[usize]>,
+    selected: Option<&PoseTarget>,
 ) -> impl Scene {
     let ContextValue::NestedGroup(children) = &field.value else {
         unreachable!("调用方已按类型分组");
@@ -756,7 +765,11 @@ fn nested_section(
 // ============================================================
 
 /// 其他字段：null / 文本 / 位姿数组 / 原始 JSON
-fn other_field(field: &ContextField, path: Vec<usize>) -> BoxedScene {
+fn other_field(
+    field: &ContextField,
+    path: Vec<usize>,
+    selected: Option<&PoseTarget>,
+) -> BoxedScene {
     let key = field.key.clone();
     match &field.value {
         ContextValue::Null => {
@@ -800,10 +813,12 @@ fn other_field(field: &ContextField, path: Vec<usize>) -> BoxedScene {
                             .iter()
                             .map(|&part| boxed(pose_array_part(part, &path, index, pose)))
                             .collect();
-                        boxed(widgets::collapsible(
+                        let target = PoseTarget::array_element(path.clone(), index);
+                        let is_selected = selected == Some(&target);
+                        boxed(selectable_pose_card(
                             format!("[{index}]"),
-                            None,
-                            false,
+                            target,
+                            is_selected,
                             parts,
                         ))
                     })
@@ -975,16 +990,12 @@ fn rebuild_editor(
         "重建编辑器"
     );
     rendered.structure = Some(editor.structure_version);
-    rendered.selection.clone_from(&editor.selected_pose_path);
+    rendered.selection.clone_from(&editor.selected_pose);
 
     let content: Vec<BoxedScene> = match &editor.data {
         Some(data) => {
             let mut items: Vec<BoxedScene> = vec![boxed(metadata_card(data, &editor))];
-            let groups = field_groups(
-                &data.context_fields,
-                &[],
-                editor.selected_pose_path.as_deref(),
-            );
+            let groups = field_groups(&data.context_fields, &[], editor.selected_pose.as_ref());
             items.push(boxed(widgets::card("Context 参数", groups)));
             items
         }
@@ -1029,24 +1040,28 @@ fn rebuild_action_bar(
 fn sync_pose_selection(
     editor: Res<Editor>,
     mut rendered: ResMut<RenderedEditor>,
-    cards: Query<(Entity, &PoseCard)>,
-    titles: Query<(Entity, &PoseCardTitle)>,
+    cards: Query<(Entity, Ref<PoseCard>)>,
+    titles: Query<(Entity, Ref<PoseCardTitle>)>,
     mut commands: Commands,
 ) {
-    if rendered.selection == editor.selected_pose_path {
-        return;
-    }
-    rendered.selection.clone_from(&editor.selected_pose_path);
-    let selected = editor.selected_pose_path.as_deref();
+    let changed = rendered.selection != editor.selected_pose;
+    rendered.selection.clone_from(&editor.selected_pose);
+    let selected = editor.selected_pose.as_ref();
 
     for (entity, card) in &cards {
-        let (bg, border) = pose_card_tokens(selected == Some(card.path.as_slice()));
+        if !changed && !card.is_added() {
+            continue;
+        }
+        let (bg, border) = pose_card_tokens(selected == Some(&card.target));
         commands
             .entity(entity)
             .insert((ThemeBackgroundColor(bg), ThemeBorderColor(border)));
     }
     for (entity, title) in &titles {
-        let token = pose_title_token(selected == Some(title.path.as_slice()));
+        if !changed && !title.is_added() {
+            continue;
+        }
+        let token = pose_title_token(selected == Some(&title.target));
         commands.entity(entity).insert(ThemeTextColor(token));
     }
 }
@@ -1220,6 +1235,9 @@ fn on_pose_card_click(
     parents: Query<&ChildOf>,
     mut writer: MessageWriter<AppAction>,
 ) {
+    if click.button != bevy::picking::pointer::PointerButton::Primary {
+        return;
+    }
     // 点中的多半是卡片标题或里面的控件，往上找到挂了 PoseCard 的那层
     let Some(entity) = widgets::self_or_ancestor(click.entity, &parents, |e| cards.contains(e))
     else {
@@ -1229,7 +1247,7 @@ fn on_pose_card_click(
         return;
     };
     click.propagate(false);
-    writer.write(AppAction::SelectPose(card.path.clone()));
+    writer.write(AppAction::SelectPose(card.target.clone()));
 }
 
 /// 编辑器插件
@@ -1263,6 +1281,10 @@ impl Plugin for EditorPanelPlugin {
             );
     }
 }
+
+#[cfg(test)]
+#[path = "editor/pose_selection_tests.rs"]
+mod pose_selection_tests;
 
 #[cfg(test)]
 mod tests {

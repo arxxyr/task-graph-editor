@@ -9,6 +9,7 @@ use bevy::prelude::*;
 use crate::model::{LoginConfig, TaskGraphData};
 use crate::ssh_config::{self, SshHostEntry};
 use crate::worker::{BusyState, WorkerHandle};
+use binding::PoseTarget;
 
 pub mod binding;
 pub mod connect;
@@ -28,15 +29,24 @@ pub mod worker_bridge;
 
 /// 等待中的远程命令类型（用于识别 `CommandOutput` 响应的来源）
 ///
-/// `field_path` 是索引路径：首元素索引顶层 `context_fields`，
-/// 后续元素依次下钻嵌套分组（见 [`crate::model::field_at_path`]）。
+/// 保存发起时的完整位姿目标及结构版本，返回时不读取当前选中，
+/// 也不能将旧请求写入重载后恰好位于相同索引的新文档。
 pub enum PendingCommand {
     /// 获取底盘位姿
-    ChassisPose { field_path: Vec<usize> },
+    ChassisPose {
+        target: PoseTarget,
+        structure_version: u64,
+    },
     /// 获取头部关节角
-    HeadJoints { field_path: Vec<usize> },
+    HeadJoints {
+        target: PoseTarget,
+        structure_version: u64,
+    },
     /// 获取腰部关节角
-    WaistJoints { field_path: Vec<usize> },
+    WaistJoints {
+        target: PoseTarget,
+        structure_version: u64,
+    },
 }
 
 /// 已发起连接的目标快照，不随连接表单编辑而变化。
@@ -224,8 +234,8 @@ pub struct Editor {
     pub data: Option<TaskGraphData>,
     /// 当前文档绑定的远程来源，与侧栏正在浏览的目录相互独立。
     pub document: Option<RemoteDocument>,
-    /// 当前选中的位姿字段索引路径（支持嵌套分组下钻，仅用于 Pose 类型）
-    pub selected_pose_path: Option<Vec<usize>>,
+    /// 当前选中的独立位姿或位姿数组元素，支持嵌套分组下钻。
+    pub selected_pose: Option<PoseTarget>,
     /// 结构版本号：字段树形状变化时递增（加载文件、创建位姿），驱动编辑器重建
     ///
     /// 单纯的数值编辑不递增，否则输入焦点会在每次按键后丢失。
@@ -240,7 +250,7 @@ impl Editor {
     pub fn load(&mut self, data: Option<TaskGraphData>) {
         self.data = data;
         self.document = None;
-        self.selected_pose_path = None;
+        self.selected_pose = None;
         self.structure_version += 1;
     }
 
@@ -260,15 +270,12 @@ impl Editor {
         self.value_version += 1;
     }
 
-    /// 检查选中字段是否为 Pose 类型（支持嵌套分组路径）
+    /// 检查完整选中目标仍指向一个位姿。
     pub fn has_pose_selection(&self) -> bool {
-        self.selected_pose_path.as_ref().is_some_and(|path| {
-            self.data.as_ref().is_some_and(|data| {
-                matches!(
-                    crate::model::field_at_path(&data.context_fields, path).map(|f| &f.value),
-                    Some(crate::model::ContextValue::Pose(_))
-                )
-            })
+        self.selected_pose.as_ref().is_some_and(|target| {
+            self.data
+                .as_ref()
+                .is_some_and(|data| target.pose(data).is_some())
         })
     }
 }

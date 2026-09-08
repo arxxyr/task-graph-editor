@@ -8,7 +8,65 @@
 
 use bevy::prelude::*;
 
-use crate::model::{ContextValue, Pose, RobotPose, TaskGraphData, field_at_path_mut};
+use crate::model::{
+    ContextValue, Pose, RobotPose, TaskGraphData, field_at_path, field_at_path_mut,
+};
+
+/// 一个可选中、可从 ROS2 回填的位姿，支持独立字段与位姿数组元素。
+///
+/// 字段路径只描述嵌套分组，数组下标单独保存，不能混入字段路径。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PoseTarget {
+    pub field_path: Vec<usize>,
+    pub array_index: Option<usize>,
+}
+
+impl PoseTarget {
+    /// 独立位姿字段。
+    pub fn field(field_path: Vec<usize>) -> Self {
+        Self {
+            field_path,
+            array_index: None,
+        }
+    }
+
+    /// 位姿数组中的一个元素。
+    pub fn array_element(field_path: Vec<usize>, array_index: usize) -> Self {
+        Self {
+            field_path,
+            array_index: Some(array_index),
+        }
+    }
+
+    /// 类型不匹配、字段不存在或数组越界时拒绝定位。
+    pub fn pose<'a>(&self, data: &'a TaskGraphData) -> Option<&'a RobotPose> {
+        let field = field_at_path(&data.context_fields, &self.field_path)?;
+        match (&field.value, self.array_index) {
+            (ContextValue::Pose(pose), None) => Some(pose),
+            (ContextValue::PoseArray(poses), Some(index)) => poses.get(index),
+            _ => None,
+        }
+    }
+
+    /// 使用与只读定位相同的规则，避免选中验证与回填目标不一致。
+    pub fn pose_mut<'a>(&self, data: &'a mut TaskGraphData) -> Option<&'a mut RobotPose> {
+        let field = field_at_path_mut(&mut data.context_fields, &self.field_path)?;
+        match (&mut field.value, self.array_index) {
+            (ContextValue::Pose(pose), None) => Some(pose),
+            (ContextValue::PoseArray(poses), Some(index)) => poses.get_mut(index),
+            _ => None,
+        }
+    }
+
+    /// 已验证目标的可读路径，数组目标保留具体下标。
+    pub fn display_path(&self, data: &TaskGraphData) -> String {
+        let path = crate::model::key_path_string(&data.context_fields, &self.field_path);
+        match self.array_index {
+            Some(index) => format!("{path}[{index}]"),
+            None => path,
+        }
+    }
+}
 
 /// 机器人部位
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -370,6 +428,65 @@ mod tests {
             graph: crate::model::SubGraph::default(),
             raw_json: serde_json::json!({}),
         }
+    }
+
+    #[test]
+    fn 位姿目标统一定位顶层嵌套字段和数组元素() {
+        let mut data = sample_data();
+        let ContextValue::NestedGroup(fields) =
+            &mut field_at_path_mut(&mut data.context_fields, &[9, 0])
+                .unwrap()
+                .value
+        else {
+            panic!("应为嵌套分组");
+        };
+        fields.push(ContextField {
+            key: "pick_poses".into(),
+            value: ContextValue::PoseArray(vec![RobotPose::default(); 2]),
+        });
+        for (target, label) in [
+            (PoseTarget::field(vec![0]), "target_pose"),
+            (PoseTarget::array_element(vec![8], 0), "poses[0]"),
+            (
+                PoseTarget::field(vec![9, 0, 0]),
+                "stations.station_1.slot_pose",
+            ),
+            (
+                PoseTarget::array_element(vec![9, 0, 1], 1),
+                "stations.station_1.pick_poses[1]",
+            ),
+        ] {
+            assert_eq!(target.display_path(&data), label);
+            assert_eq!(target.pose(&data).unwrap(), &RobotPose::default());
+            target.pose_mut(&mut data).unwrap().chassis_pose.position.x = 1.2345678901234567;
+            assert_eq!(
+                target.pose(&data).unwrap().chassis_pose.position.x,
+                1.2345678901234567
+            );
+        }
+        let first = PoseTarget::array_element(vec![9, 0, 1], 0);
+        assert_eq!(first.pose(&data).unwrap(), &RobotPose::default());
+    }
+
+    #[test]
+    fn 位姿目标拒绝缺失路径类型不匹配及越界下标() {
+        let mut data = sample_data();
+        let original = data.context_fields.clone();
+        for target in [
+            PoseTarget::default(),
+            PoseTarget::field(vec![usize::MAX]),
+            PoseTarget::field(vec![1]),
+            PoseTarget::field(vec![8]),
+            PoseTarget::array_element(vec![0], 0),
+            PoseTarget::array_element(vec![1], 0),
+            PoseTarget::array_element(vec![8], 1),
+            PoseTarget::array_element(vec![9, 0, 0], 0),
+            PoseTarget::field(vec![8, 0]),
+        ] {
+            assert!(target.pose(&data).is_none(), "{target:?}");
+            assert!(target.pose_mut(&mut data).is_none(), "{target:?}");
+        }
+        assert_eq!(data.context_fields, original);
     }
 
     #[test]

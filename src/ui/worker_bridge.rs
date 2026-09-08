@@ -20,6 +20,7 @@ use crate::ssh::{AuthMethod, DirListing};
 use crate::ssh_config;
 use crate::worker::{BusyState, WakeFn, WorkerHandle, WorkerRequest, WorkerResponse};
 
+use super::binding::PoseTarget;
 use super::editor::InputValidation;
 use super::{
     ConnectionTarget, Editor, FileBrowser, PendingCommand, RemoteDocument, Session, StatusLine,
@@ -105,8 +106,8 @@ pub enum AppAction {
     FetchHeadJoints,
     /// 从 ROS2 获取腰部关节角
     FetchWaistJoints,
-    /// 选中某个位姿字段（索引路径）
-    SelectPose(Vec<usize>),
+    /// 选中独立位姿或位姿数组中的一个元素。
+    SelectPose(PoseTarget),
     /// 在 null 字段上创建一个默认位姿
     CreatePose(Vec<usize>),
     /// 重新读取 `~/.ssh/config`
@@ -199,9 +200,9 @@ fn auth_method(session: &Session) -> AuthMethod {
     AuthMethod::PublicKey { identity_files }
 }
 
-/// 校验当前选中位姿并返回其索引路径（无有效选中时写状态提示）
-fn validated_pose_path(editor: &Editor, status: &mut StatusLine) -> Option<Vec<usize>> {
-    let Some(path) = editor.selected_pose_path.clone() else {
+/// 校验当前选中位姿并返回完整目标（无有效选中时写状态提示）。
+fn validated_pose_target(editor: &Editor, status: &mut StatusLine) -> Option<PoseTarget> {
+    let Some(target) = editor.selected_pose.clone() else {
         status.set("请先选中一个位姿点位");
         return None;
     };
@@ -209,7 +210,7 @@ fn validated_pose_path(editor: &Editor, status: &mut StatusLine) -> Option<Vec<u
         status.set("选中的字段不是位姿类型");
         return None;
     }
-    Some(path)
+    Some(target)
 }
 
 /// 把 ssh config 中的主机条目填入连接表单（密码保持不动，由用户自行决定）
@@ -249,19 +250,16 @@ pub(super) fn apply_ssh_host(session: &mut Session, status: &mut StatusLine, ind
     ));
 }
 
-/// 将获取到的远程数据写入指定路径的位姿字段，成功时返回 key 路径（用于状态提示）
+/// 将远程数据写入发起时的位姿目标，成功时返回含数组下标的路径。
 fn apply_to_pose_at(
     editor: &mut Editor,
-    field_path: &[usize],
+    target: &PoseTarget,
     apply: impl FnOnce(&mut RobotPose),
 ) -> Option<String> {
     let data = editor.data.as_mut()?;
-    let field = model::field_at_path_mut(&mut data.context_fields, field_path)?;
-    let ContextValue::Pose(pose) = &mut field.value else {
-        return None;
-    };
+    let pose = target.pose_mut(data)?;
     apply(pose);
-    Some(model::key_path_string(&data.context_fields, field_path))
+    Some(target.display_path(data))
 }
 
 /// 创建跨线程唤醒回调
@@ -466,12 +464,15 @@ fn handle_actions(
             }
 
             AppAction::FetchChassisPose => {
-                let Some(path) = validated_pose_path(&editor, &mut status) else {
+                let Some(target) = validated_pose_target(&editor, &mut status) else {
                     continue;
                 };
                 session.busy = BusyState::Fetching("底盘位姿".into());
                 status.set("");
-                session.pending_command = Some(PendingCommand::ChassisPose { field_path: path });
+                session.pending_command = Some(PendingCommand::ChassisPose {
+                    target,
+                    structure_version: editor.structure_version,
+                });
                 let command = ros_cmd(
                     &session,
                     "timeout 15 ros2 topic echo /tracked_pose --once 2>/dev/null",
@@ -480,12 +481,15 @@ fn handle_actions(
             }
 
             AppAction::FetchHeadJoints => {
-                let Some(path) = validated_pose_path(&editor, &mut status) else {
+                let Some(target) = validated_pose_target(&editor, &mut status) else {
                     continue;
                 };
                 session.busy = BusyState::Fetching("头部关节角".into());
                 status.set("");
-                session.pending_command = Some(PendingCommand::HeadJoints { field_path: path });
+                session.pending_command = Some(PendingCommand::HeadJoints {
+                    target,
+                    structure_version: editor.structure_version,
+                });
                 let command = ros_cmd(&session, "timeout 15 python3 -");
                 session.send(WorkerRequest::ExecCommandWithStdin {
                     command,
@@ -494,12 +498,15 @@ fn handle_actions(
             }
 
             AppAction::FetchWaistJoints => {
-                let Some(path) = validated_pose_path(&editor, &mut status) else {
+                let Some(target) = validated_pose_target(&editor, &mut status) else {
                     continue;
                 };
                 session.busy = BusyState::Fetching("腰部关节角".into());
                 status.set("");
-                session.pending_command = Some(PendingCommand::WaistJoints { field_path: path });
+                session.pending_command = Some(PendingCommand::WaistJoints {
+                    target,
+                    structure_version: editor.structure_version,
+                });
                 let command = ros_cmd(&session, "timeout 15 python3 -");
                 session.send(WorkerRequest::ExecCommandWithStdin {
                     command,
@@ -507,8 +514,8 @@ fn handle_actions(
                 });
             }
 
-            AppAction::SelectPose(path) => {
-                editor.selected_pose_path = Some(path.clone());
+            AppAction::SelectPose(target) => {
+                editor.selected_pose = Some(target.clone());
             }
 
             AppAction::CreatePose(path) => {
@@ -909,55 +916,71 @@ fn handle_command_output(
     status: &mut StatusLine,
     editor: &mut Editor,
 ) {
-    let output = match (result, &pending) {
-        (Ok(output), Some(_)) => output,
-        (Err(e), Some(_)) => {
+    let Some(pending) = pending else {
+        // 没有对应请求的输出不能回填当前选中。
+        return;
+    };
+    let structure_version = match &pending {
+        PendingCommand::ChassisPose {
+            structure_version, ..
+        }
+        | PendingCommand::HeadJoints {
+            structure_version, ..
+        }
+        | PendingCommand::WaistJoints {
+            structure_version, ..
+        } => *structure_version,
+    };
+    if structure_version != editor.structure_version {
+        status.set("文档或字段结构已变化，已忽略过期的位姿获取结果");
+        return;
+    }
+    let output = match result {
+        Ok(output) => output,
+        Err(e) => {
             status.set(format!("远程命令执行失败: {e}"));
             return;
         }
-        // 没有 pending_command 的 CommandOutput，忽略
-        (_, None) => return,
     };
 
     // 解析输出并写入位姿，返回 (提示前缀, 写入结果)
     let (label, applied) = match pending {
-        Some(PendingCommand::ChassisPose { field_path }) => {
+        PendingCommand::ChassisPose { target, .. } => {
             let Some(chassis) = model::parse_tracked_pose(&output) else {
                 status.set("解析 tracked_pose 输出失败");
                 return;
             };
             (
                 "底盘位姿",
-                apply_to_pose_at(editor, &field_path, |pose| pose.chassis_pose = chassis),
+                apply_to_pose_at(editor, &target, |pose| pose.chassis_pose = chassis),
             )
         }
-        Some(PendingCommand::HeadJoints { field_path }) => {
+        PendingCommand::HeadJoints { target, .. } => {
             let Some(angles) = model::parse_joint_states(&output) else {
                 status.set("解析 joint_states 输出失败");
                 return;
             };
             (
                 "头部关节角",
-                apply_to_pose_at(editor, &field_path, |pose| {
+                apply_to_pose_at(editor, &target, |pose| {
                     pose.head_pose.position.x = angles.head_joint_1;
                     pose.head_pose.position.y = angles.head_joint_2;
                 }),
             )
         }
-        Some(PendingCommand::WaistJoints { field_path }) => {
+        PendingCommand::WaistJoints { target, .. } => {
             let Some(angles) = model::parse_joint_states(&output) else {
                 status.set("解析 joint_states 输出失败");
                 return;
             };
             (
                 "腰部关节角",
-                apply_to_pose_at(editor, &field_path, |pose| {
+                apply_to_pose_at(editor, &target, |pose| {
                     pose.waist_pose.position.x = angles.body_joint_1;
                     pose.waist_pose.position.y = angles.body_joint_2;
                 }),
             )
         }
-        None => return,
     };
 
     match applied {
