@@ -12,6 +12,21 @@ use crate::ssh::{AuthMethod, DirListing, SshCancellation, SshConfig, SshConnecti
 /// 测试等无窗口场景可传空闭包。
 pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
 
+/// 保存回执只能确认对应文档中对应的一次提交。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaveTicket {
+    pub document_version: u64,
+    pub sequence: u64,
+}
+
+/// 加载和删除回执绑定发起时的文档与连接，序号在文档重载后也不复用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentReadTicket {
+    pub document_version: u64,
+    pub connection_generation: u64,
+    pub sequence: u64,
+}
+
 /// 文件名只能是目录内的单个路径段，不能由 task_id 越界寻址。
 pub fn validate_filename(filename: &str) -> Result<(), String> {
     match filename {
@@ -60,11 +75,13 @@ pub enum WorkerRequest {
     RefreshFiles { remote_dir: String },
     /// 加载远程文件内容（返回原始 JSON 字符串，解析在 UI 端做）
     LoadFile {
+        ticket: DocumentReadTicket,
         remote_dir: String,
         filename: String,
     },
     /// 保存文件（写入 + 可选重命名 + 自动刷新列表）
     SaveFile {
+        ticket: SaveTicket,
         remote_dir: String,
         current_filename: String,
         content: String,
@@ -78,6 +95,7 @@ pub enum WorkerRequest {
     },
     /// 删除文件（SFTP unlink + 刷新列表）
     DeleteFile {
+        ticket: DocumentReadTicket,
         remote_dir: String,
         filename: String,
     },
@@ -108,12 +126,14 @@ pub enum WorkerResponse {
     FileList(Result<DirListing, String>),
     /// 文件内容加载完成
     FileLoaded {
+        ticket: DocumentReadTicket,
         remote_dir: String,
         filename: String,
         result: Result<String, String>,
     },
     /// 保存完成
     FileSaved {
+        ticket: SaveTicket,
         remote_dir: String,
         old_filename: String,
         new_filename: Option<String>,
@@ -121,7 +141,7 @@ pub enum WorkerResponse {
         file_list: Result<DirListing, String>,
     },
     /// 保存失败
-    SaveFailed(String),
+    SaveFailed { ticket: SaveTicket, error: String },
     /// 备份完成
     BackupDone {
         original: String,
@@ -132,12 +152,16 @@ pub enum WorkerResponse {
     BackupFailed(String),
     /// 删除完成
     FileDeleted {
+        ticket: DocumentReadTicket,
         remote_dir: String,
         filename: String,
         file_list: Result<DirListing, String>,
     },
     /// 删除失败
-    DeleteFailed(String),
+    DeleteFailed {
+        ticket: DocumentReadTicket,
+        error: String,
+    },
     /// 上传完成
     FileUploaded {
         filename: String,
@@ -445,11 +469,13 @@ fn worker_loop(
             }
 
             WorkerRequest::LoadFile {
+                ticket,
                 remote_dir,
                 filename,
             } => {
                 let Some(conn) = connection.as_ref() else {
                     respond!(WorkerResponse::FileLoaded {
+                        ticket,
                         remote_dir,
                         filename,
                         result: Err("未连接".into()),
@@ -460,6 +486,7 @@ fn worker_loop(
                     Ok(directory) => directory,
                     Err(error) => {
                         respond!(WorkerResponse::FileLoaded {
+                            ticket,
                             remote_dir,
                             filename,
                             result: Err(error.to_string()),
@@ -470,6 +497,7 @@ fn worker_loop(
                 let path = format!("{remote_dir}/{filename}");
                 let result = conn.read_file(&path).map_err(|e| e.to_string());
                 respond!(WorkerResponse::FileLoaded {
+                    ticket,
                     remote_dir,
                     filename,
                     result
@@ -477,6 +505,7 @@ fn worker_loop(
             }
 
             WorkerRequest::SaveFile {
+                ticket,
                 remote_dir,
                 current_filename,
                 content,
@@ -485,11 +514,14 @@ fn worker_loop(
                 let valid_names = validate_filename(&current_filename)
                     .and_then(|()| new_filename.as_deref().map_or(Ok(()), validate_filename));
                 if let Err(error) = valid_names {
-                    respond!(WorkerResponse::SaveFailed(error));
+                    respond!(WorkerResponse::SaveFailed { ticket, error });
                     continue;
                 }
                 let Some(conn) = connection.as_ref() else {
-                    respond!(WorkerResponse::SaveFailed("未连接".into()));
+                    respond!(WorkerResponse::SaveFailed {
+                        ticket,
+                        error: "未连接".into()
+                    });
                     continue;
                 };
 
@@ -501,7 +533,10 @@ fn worker_loop(
                 let outcome = match conn.save_file(&current_path, &content, new_path.as_deref()) {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        respond!(WorkerResponse::SaveFailed(error.to_string()));
+                        respond!(WorkerResponse::SaveFailed {
+                            ticket,
+                            error: error.to_string()
+                        });
                         continue;
                     }
                 };
@@ -510,6 +545,7 @@ fn worker_loop(
                 // 刷新文件列表
                 let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileSaved {
+                    ticket,
                     remote_dir,
                     old_filename: current_filename,
                     new_filename,
@@ -576,23 +612,31 @@ fn worker_loop(
             }
 
             WorkerRequest::DeleteFile {
+                ticket,
                 remote_dir,
                 filename,
             } => {
                 let Some(conn) = connection.as_ref() else {
-                    respond!(WorkerResponse::DeleteFailed("未连接".into()));
+                    respond!(WorkerResponse::DeleteFailed {
+                        ticket,
+                        error: "未连接".into()
+                    });
                     continue;
                 };
 
                 let path = format!("{remote_dir}/{filename}");
                 if let Err(e) = conn.delete_file(&path) {
-                    respond!(WorkerResponse::DeleteFailed(e.to_string()));
+                    respond!(WorkerResponse::DeleteFailed {
+                        ticket,
+                        error: e.to_string()
+                    });
                     continue;
                 }
 
                 // 刷新文件列表
                 let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileDeleted {
+                    ticket,
                     remote_dir,
                     filename,
                     file_list,

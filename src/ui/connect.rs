@@ -2,11 +2,10 @@
 //!
 //! 表单只在启动时建一次，之后由 observer 单向同步到 [`Session`]；
 //! 只有"套用 ssh config 主机"会反向刷新输入框（靠 `form_version` 触发）。
-//! 会随状态变化的部分（按钮组、主机菜单项）拆成独立插槽单独重建，
-//! 这样重建时不会打断正在输入的文本框。
+//! 连接按钮常驻，只同步显隐、禁用与焦点；主机菜单项在配置刷新后单独重建。
 
 use bevy::feathers::controls::{
-    ButtonVariant, FeathersMenuButton, FeathersMenuItem, FeathersMenuPopup,
+    ButtonVariant, FeathersButton, FeathersMenuButton, FeathersMenuItem, FeathersMenuPopup,
 };
 use bevy::feathers::theme::{ThemeTextColor, ThemedText};
 use bevy::input::ButtonState;
@@ -15,6 +14,7 @@ use bevy::input_focus::tab_navigation::{NavAction, TabIndex, TabNavigation};
 use bevy::input_focus::{FocusCause, FocusedInput, InputFocus};
 use bevy::prelude::*;
 use bevy::text::{EditableText, FontWeight, TextEdit, TextEditChange};
+use bevy::ui::{InteractionDisabled, Pressed};
 use bevy::ui_widgets::{Activate, MenuAction, MenuEvent, MenuFocusState};
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 
@@ -45,9 +45,24 @@ pub enum LoginField {
     RemoteDir,
 }
 
-/// 按钮组插槽（连接状态变化时重建）
-#[derive(Component, Default, Clone)]
-struct ConnectButtonsSlot;
+/// 固定的四种连接操作；实体身份不随连接状态变化。
+#[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ConnectButton {
+    #[default]
+    Connect,
+    Disconnect,
+    Refresh,
+    Upload,
+}
+
+#[derive(Component, Clone, Copy, Default)]
+struct ConnectButtonCaption(ConnectButton);
+
+struct ConnectButtonState {
+    visible: bool,
+    enabled: bool,
+    label: &'static str,
+}
 
 /// 主机下拉菜单弹层插槽（ssh config 重新解析后重建）
 #[derive(Component, Default, Clone)]
@@ -73,8 +88,6 @@ struct RenderedVersions {
     hosts: Option<u64>,
     /// 已刷回输入框的表单版本
     form: Option<u64>,
-    /// 已渲染的按钮状态（已连接、重连中）
-    buttons: Option<(bool, bool)>,
 }
 
 /// 构建连接面板
@@ -114,7 +127,7 @@ fn connect_panel(session: &Session) -> impl Scene {
                     width: percent(100),
                     margin: {UiRect::top(px(2.0))},
                 }
-                ConnectButtonsSlot
+                Children [{connect_buttons()}]
             )
         ],
     )
@@ -438,45 +451,78 @@ fn host_menu_item(index: usize, entry: &SshHostEntry) -> impl Scene {
     }
 }
 
-/// 连接 / 断开 / 刷新 / 上传按钮组
-///
-/// 只按"连接状态"决定按钮有哪些；忙碌与否是属性，交给 [`ButtonGate`]。
-fn connect_buttons(connected: bool, reconnecting: bool) -> Vec<BoxedScene> {
-    match (connected, reconnecting) {
-        (true, _) => vec![
-            boxed(widgets::button_gated(
-                "断开",
-                ButtonVariant::Normal,
-                ButtonGate::Always,
-                ActionButton(AppAction::Disconnect),
-            )),
-            boxed(widgets::button_gated(
-                "刷新列表",
-                ButtonVariant::Normal,
-                ButtonGate::WhenIdle,
-                ActionButton(AppAction::RefreshFiles),
-            )),
-            boxed(widgets::button_gated(
-                "上传文件",
-                ButtonVariant::Normal,
-                ButtonGate::WhenIdle,
-                ActionButton(AppAction::UploadFile),
-            )),
-        ],
-        // 连接和重连过程中也能取消，后台通过套接字 shutdown 打断等待。
-        (false, true) => vec![boxed(widgets::button_gated(
-            "断开",
-            ButtonVariant::Normal,
-            ButtonGate::Always,
-            ActionButton(AppAction::Disconnect),
-        ))],
-        (false, false) => vec![boxed(widgets::button_gated(
-            "连接",
-            ButtonVariant::Primary,
-            ButtonGate::WhenIdle,
-            ActionButton(AppAction::Connect),
-        ))],
+impl ConnectButton {
+    fn action(self) -> AppAction {
+        match self {
+            Self::Connect => AppAction::Connect,
+            Self::Disconnect => AppAction::Disconnect,
+            Self::Refresh => AppAction::RefreshFiles,
+            Self::Upload => AppAction::UploadFile,
+        }
     }
+
+    fn state(self, session: &Session) -> ConnectButtonState {
+        let connecting = session.reconnect_status.is_some()
+            || matches!(session.busy, crate::worker::BusyState::Connecting);
+        let (visible, enabled, label) = match self {
+            Self::Connect => (
+                !session.is_connected && !connecting,
+                session.interactive(),
+                "连接",
+            ),
+            Self::Disconnect => (
+                session.is_connected || connecting,
+                true,
+                match (session.reconnect_status.is_some(), connecting) {
+                    (true, _) => "取消重连",
+                    (false, true) => "取消连接",
+                    (false, false) => "断开",
+                },
+            ),
+            Self::Refresh => (session.is_connected, session.interactive(), "刷新列表"),
+            Self::Upload => (session.is_connected, session.interactive(), "上传文件"),
+        };
+        ConnectButtonState {
+            visible,
+            enabled: visible && enabled,
+            label,
+        }
+    }
+}
+
+/// 四个按钮与表单一起生成；跨帧落地前保持隐藏禁用，由状态同步统一初始化。
+fn connect_buttons() -> Vec<BoxedScene> {
+    [
+        ConnectButton::Connect,
+        ConnectButton::Disconnect,
+        ConnectButton::Refresh,
+        ConnectButton::Upload,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let variant = match kind {
+            ConnectButton::Connect => ButtonVariant::Primary,
+            _ => ButtonVariant::Normal,
+        };
+        let caption = bsn! {
+            Text::default()
+            ThemedText
+            template_value(ConnectButtonCaption(kind))
+        };
+        boxed(bsn! {
+            @FeathersButton {
+                @caption: {caption},
+                @variant: variant
+            }
+            template_value(kind)
+            template_value(ActionButton(kind.action()))
+            template_value(ButtonGate::Managed)
+            InteractionDisabled
+            TabIndex(-1)
+            Node { display: Display::None }
+        })
+    })
+    .collect()
 }
 
 /// 点击后发出指定操作的按钮标记
@@ -490,12 +536,17 @@ impl Default for ActionButton {
 }
 
 /// 按钮激活 → 发出对应的操作消息
-pub fn on_action_button(
+pub(super) fn on_action_button(
     activate: On<Activate>,
-    buttons: Query<&ActionButton>,
+    buttons: Query<(&ActionButton, Option<&ConnectButton>)>,
+    session: Res<Session>,
     mut writer: MessageWriter<AppAction>,
 ) {
-    if let Ok(button) = buttons.get(activate.entity) {
+    if let Ok((button, connection)) = buttons.get(activate.entity) {
+        // 辅助功能或同帧延迟的 Activate 也必须服从实际连接状态。
+        if connection.is_some_and(|kind| !kind.state(&session).enabled) {
+            return;
+        }
         writer.write(button.0.clone());
     }
 }
@@ -513,31 +564,71 @@ fn spawn_connect_panel(
     }
 }
 
-/// 按连接状态重建按钮组
-fn rebuild_buttons(
+/// 连接状态仅更新属性；隐藏或禁用焦点按钮时转到可用的连接/断开入口。
+#[allow(clippy::type_complexity)]
+fn sync_connect_buttons(
     session: Res<Session>,
-    mut rendered: ResMut<RenderedVersions>,
-    slots: Query<Entity, With<ConnectButtonsSlot>>,
-    pending: Query<(), With<widgets::SlotPending>>,
+    mut buttons: Query<(
+        Entity,
+        &ConnectButton,
+        &mut Node,
+        &mut TabIndex,
+        Has<InteractionDisabled>,
+        Has<Pressed>,
+    )>,
+    mut captions: Query<(&ConnectButtonCaption, &mut Text)>,
+    parents: Query<&ChildOf>,
+    mut focus: ResMut<InputFocus>,
     mut commands: Commands,
 ) {
-    let state = (
-        session.is_connected,
-        session.reconnect_status.is_some()
-            || matches!(session.busy, crate::worker::BusyState::Connecting),
-    );
-    if rendered.buttons == Some(state) {
-        return;
+    let focused_button = focus.get().and_then(|entity| {
+        widgets::self_or_ancestor(entity, &parents, |entity| buttons.contains(entity))
+    });
+    let mut move_focus = false;
+    let mut next_focus = None;
+    for (entity, kind, mut node, mut tab, disabled, pressed) in &mut buttons {
+        let state = kind.state(&session);
+        let display = match state.visible {
+            true => Display::Flex,
+            false => Display::None,
+        };
+        if node.display != display {
+            node.display = display;
+        }
+        tab.set_if_neq(TabIndex(match state.enabled {
+            true => 0,
+            false => -1,
+        }));
+        match (state.enabled, disabled) {
+            (true, true) => {
+                commands.entity(entity).remove::<InteractionDisabled>();
+            }
+            (false, false) => {
+                commands.entity(entity).insert(InteractionDisabled);
+            }
+            _ => {}
+        }
+        // 上游不会清除已禁用按钮的 Pressed；常驻控件要主动结束被状态转换打断的按压。
+        if !state.enabled && pressed {
+            commands.entity(entity).remove::<Pressed>();
+        }
+        move_focus |= focused_button == Some(entity) && !state.enabled;
+        if state.enabled && matches!(kind, ConnectButton::Connect | ConnectButton::Disconnect) {
+            next_focus = Some(entity);
+        }
     }
-    let Ok(slot) = slots.single() else {
-        return;
-    };
-    // 上一批还没落地就先等着，不要推进版本号，下一帧自动重试
-    if pending.contains(slot) {
-        return;
+    if move_focus {
+        match next_focus {
+            Some(entity) => focus.set(entity, FocusCause::Navigated),
+            None => focus.clear(),
+        }
     }
-    rendered.buttons = Some(state);
-    widgets::replace_slot_children(&mut commands, slot, connect_buttons(state.0, state.1));
+    for (caption, mut text) in &mut captions {
+        let label = caption.0.state(&session).label;
+        if text.0 != label {
+            text.0 = label.into();
+        }
+    }
 }
 
 /// ssh config 重新解析后重建菜单项
@@ -654,13 +745,13 @@ impl Plugin for ConnectPanelPlugin {
                 Update,
                 (
                     spawn_connect_panel,
-                    rebuild_buttons,
                     rebuild_host_menu,
                     open_ready_host_menu.after(rebuild_host_menu),
                     refresh_form_fields,
                 )
                     .in_set(UiSet::Rebuild),
             )
+            .add_systems(Update, sync_connect_buttons.after(UiSet::Rebuild))
             .add_systems(
                 PostUpdate,
                 position_open_host_menu.after(bevy::ui::UiSystems::Layout),

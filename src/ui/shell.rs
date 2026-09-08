@@ -666,18 +666,30 @@ fn connection_dot_token(session: &Session) -> ThemeToken {
 /// 顶栏显示当前打开的文件
 fn sync_current_file(
     editor: Res<Editor>,
+    editing: Option<Res<super::graph_edit::GraphEditing>>,
     labels: Query<Entity, With<CurrentFileText>>,
     mut all_text: Query<&mut Text>,
 ) {
-    if !editor.is_changed() {
-        return;
-    }
+    let dirty = editor.has_unsaved_changes()
+        || editing
+            .as_ref()
+            .is_some_and(|editing| editing.has_draft_changes());
     let label = match (&editor.document, editor.data.is_some()) {
-        (Some(document), true) => format!("— {}", document.filename),
+        (Some(document), true) => format!(
+            "— {}{}",
+            document.filename,
+            if dirty { " · 未保存" } else { "" }
+        ),
+        (None, true) => match dirty {
+            true => "— 本地文档 · 未保存".into(),
+            false => "— 本地文档".into(),
+        },
         _ => String::new(),
     };
     for entity in &labels {
-        if let Ok(mut text) = all_text.get_mut(entity) {
+        if let Ok(mut text) = all_text.get_mut(entity)
+            && text.0 != label
+        {
             text.0.clone_from(&label);
         }
     }

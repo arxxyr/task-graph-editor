@@ -426,6 +426,7 @@ mod tests {
                 },
             ],
             graph: crate::model::SubGraph::default(),
+            graph_edit: crate::model::GraphDocument::default(),
             raw_json: serde_json::json!({}),
         }
     }

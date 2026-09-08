@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+mod graph;
+pub mod graph_edit;
+pub mod graph_schema;
+
+pub use graph_edit::{GraphCommand, GraphDocument, GraphEditError};
+
 /// 三维位置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Position {
@@ -125,8 +131,7 @@ pub struct ContextField {
 
 /// 任务图中的一个节点
 ///
-/// 只读：本工具编辑的是 context 参数，流程本身由机器人端定义。
-/// 序列化时 `config.nodes` / `config.edges` 原样从 `raw_json` 带回去。
+/// 此结构只用于展示；编辑统一进入 GraphDocument 的完整 JSON 事务。
 #[derive(Debug, Clone)]
 pub struct TaskNode {
     /// 节点 id，同层内唯一
@@ -148,6 +153,19 @@ pub struct SubGraph {
     pub nodes: Vec<TaskNode>,
     /// 本层的边，端点可能是虚拟的 `_entry` / `_exit`
     pub edges: Vec<GraphEdge>,
+    /// 本层无法完整展示的结构问题，路径指向原始 JSON
+    pub diagnostics: Vec<GraphDiagnostic>,
+    /// 原始数组中的节点与边条数；手工构造的图可不提供
+    pub source_counts: Option<(usize, usize)>,
+}
+
+/// 流程图读取诊断；不修改原始数据，也不阻止编辑无关的 context
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphDiagnostic {
+    /// 原始 JSON 中的字段路径，如 `$.config.nodes[0].id`
+    pub path: String,
+    /// 可直接展示给使用者的原因
+    pub message: String,
 }
 
 /// 一条有向边
@@ -166,6 +184,17 @@ pub const ENTRY_ID: &str = "_entry";
 pub const EXIT_ID: &str = "_exit";
 
 impl SubGraph {
+    /// 递归统计全部图层的诊断，便于在根层提示隐藏子图中的问题
+    pub fn diagnostic_count(&self) -> usize {
+        self.diagnostics.len()
+            + self
+                .nodes
+                .iter()
+                .filter_map(|node| node.children.as_ref())
+                .map(SubGraph::diagnostic_count)
+                .sum::<usize>()
+    }
+
     /// 按 id 找节点
     pub fn node(&self, id: &str) -> Option<&TaskNode> {
         self.nodes.iter().find(|n| n.id == id)
@@ -209,10 +238,43 @@ pub struct TaskGraphData {
     pub task_id: String,
     /// 所有 context 字段（按 key 排序）
     pub context_fields: Vec<ContextField>,
-    /// 任务流程图（只读展示）
+    /// 任务流程图的派生展示视图，不能独立修改后用于保存
     pub graph: SubGraph,
+    /// 完整流程 JSON 工作副本和编辑历史
+    pub graph_edit: GraphDocument,
     /// 原始 JSON（用于合并回写时保留未编辑字段）
     pub raw_json: serde_json::Value,
+}
+
+impl TaskGraphData {
+    /// 原子修改流程，成功后同步展示投影，不重解析或覆盖 context。
+    pub fn apply_graph_command(
+        &mut self,
+        expected_revision: u64,
+        command: GraphCommand,
+    ) -> Result<bool, GraphEditError> {
+        let changed = self.graph_edit.apply(expected_revision, command)?;
+        self.refresh_graph(changed);
+        Ok(changed)
+    }
+
+    pub fn undo_graph(&mut self, expected_revision: u64) -> Result<bool, GraphEditError> {
+        let changed = self.graph_edit.undo(expected_revision)?;
+        self.refresh_graph(changed);
+        Ok(changed)
+    }
+
+    pub fn redo_graph(&mut self, expected_revision: u64) -> Result<bool, GraphEditError> {
+        let changed = self.graph_edit.redo(expected_revision)?;
+        self.refresh_graph(changed);
+        Ok(changed)
+    }
+
+    fn refresh_graph(&mut self, changed: bool) {
+        if changed {
+            self.graph = graph::parse_subgraph(self.graph_edit.current_config(), "$.config");
+        }
+    }
 }
 
 /// 解析错误
@@ -437,53 +499,6 @@ fn classify_context_value(key: &str, value: &serde_json::Value) -> ContextValue 
 // 解析与序列化
 // ============================================================
 
-/// 解析一层图的节点与边
-fn parse_subgraph(container: &serde_json::Value) -> SubGraph {
-    let nodes = container
-        .get("nodes")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(parse_node).collect())
-        .unwrap_or_default();
-    let edges = container
-        .get("edges")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| {
-                    Some(GraphEdge {
-                        from: e.get("from")?.as_str()?.to_string(),
-                        to: e.get("to")?.as_str()?.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    SubGraph { nodes, edges }
-}
-
-/// 解析单个节点；没有 id 的条目直接跳过
-fn parse_node(value: &serde_json::Value) -> Option<TaskNode> {
-    let id = value.get("id")?.as_str()?.to_string();
-    let children = value.get("nodes").is_some().then(|| parse_subgraph(value));
-    Some(TaskNode {
-        id,
-        node_type: value
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        inputs: value
-            .get("inputs")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        checkpoint: value
-            .get("checkpoint")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        children,
-    })
-}
-
 /// 从 JSON 字符串解析任务图数据
 ///
 /// 提取 map_id、task_id，并遍历 config.context 中所有字段，
@@ -520,13 +535,18 @@ pub fn parse_task_graph(json_str: &str) -> Result<TaskGraphData, ParseError> {
         }
     }
 
-    let graph = raw.get("config").map(parse_subgraph).unwrap_or_default();
+    let graph_edit = raw
+        .get("config")
+        .map(GraphDocument::new)
+        .unwrap_or_default();
+    let graph = graph::parse_subgraph(graph_edit.current_config(), "$.config");
 
     Ok(TaskGraphData {
         map_id,
         task_id,
         context_fields,
         graph,
+        graph_edit,
         raw_json: raw,
     })
 }
@@ -841,6 +861,10 @@ pub fn serialize_task_graph(data: &TaskGraphData) -> Result<String, serde_json::
             context.insert(field.key.clone(), value);
         }
     }
+    data.graph_edit
+        .validate_for_save()
+        .map_err(<serde_json::Error as serde::ser::Error>::custom)?;
+    data.graph_edit.merge_into(&mut json);
     serde_json::to_string_pretty(&json)
 }
 

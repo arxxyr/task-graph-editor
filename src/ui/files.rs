@@ -1,7 +1,7 @@
 //! 文件列表：远程 JSON 文件的浏览、选中与右键操作
 //!
-//! 列表在文件集合变化时整体重建；选中态单独用 `Selected` 组件同步，
-//! 不触发重建。右键菜单是常驻的绝对定位浮层（Feathers 的菜单只支持左键触发），
+//! 同一连接与目录下按文件名复用行，增删和排序只调整有变化的实体；
+//! 选中态单独用 `Selected` 组件同步。右键菜单是常驻的绝对定位浮层（Feathers 的菜单只支持左键触发），
 //! 由 [`ContextMenu`] 资源驱动内容与位置。
 
 use bevy::feathers::controls::FeathersListRow;
@@ -13,6 +13,7 @@ use bevy::prelude::*;
 use bevy::text::LineBreak;
 use bevy::ui::{Interaction, Selected, UiScale};
 use bevy::window::PrimaryWindow;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use super::shell::{ContextMenuRoot, FileListSlot};
 use super::theme;
@@ -27,6 +28,33 @@ pub struct FileRow(pub String);
 /// 列表底部的空白区（右键可上传）
 #[derive(Component, Clone, Default)]
 struct FileListBlank;
+
+/// 空列表提示常驻，文件增删只切换显示。
+#[derive(Component)]
+struct FileListEmpty;
+
+/// 文件名只在实际连接代次和已解析目录中具有稳定身份。
+#[derive(Component, Clone, PartialEq, Eq)]
+struct FileListSource {
+    connection_generation: u64,
+    remote_dir: Option<String>,
+}
+
+impl FileListSource {
+    fn current(session: &Session, browser: &FileBrowser) -> Self {
+        Self {
+            connection_generation: session.connection_generation,
+            remote_dir: browser.remote_dir.clone(),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct RenderedFiles {
+    slot: Entity,
+    source: FileListSource,
+    version: u64,
+}
 
 /// 列表容器插槽
 #[derive(Component, Clone, Default)]
@@ -78,7 +106,7 @@ impl ContextMenu {
 #[derive(Resource, Default)]
 struct RenderedList {
     /// 已渲染的文件列表版本
-    files: Option<u64>,
+    files: Option<RenderedFiles>,
     /// 已渲染的右键菜单版本
     menu: Option<u64>,
 }
@@ -128,19 +156,14 @@ fn sync_file_directory(
 }
 
 /// 单个文件行
-fn file_row(filename: &str, selected: bool) -> impl Scene {
+fn file_row(filename: &str) -> impl Scene {
     let name = filename.to_string();
-    let row_marker = FileRow(name.clone());
-    // Selected 是标记组件，只在选中时插入
-    let selected_marker = selected.then(|| template_value(Selected));
     bsn! {
         @FeathersListRow
         Node {
             width: percent(100),
             border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
         }
-        template_value(row_marker)
-        {selected_marker}
         Children [(
             Text(name)
             ThemedText
@@ -174,71 +197,131 @@ fn spawn_file_list(
     }
 }
 
-/// 文件集合变化时重建行
-fn rebuild_file_rows(
+/// 同一来源按文件名协调行实体，保留未变化的行及其交互状态。
+#[allow(clippy::type_complexity)]
+fn reconcile_file_rows(
     browser: Res<FileBrowser>,
+    session: Res<Session>,
     mut rendered: ResMut<RenderedList>,
-    slots: Query<Entity, With<FileRowsSlot>>,
-    pending: Query<(), With<widgets::SlotPending>>,
+    slots: Query<(Entity, Option<&Children>), With<FileRowsSlot>>,
+    rows: Query<(&FileRow, &FileListSource)>,
+    mut footers: Query<
+        (&mut Node, Has<FileListEmpty>, Has<FileListBlank>),
+        Or<(With<FileListEmpty>, With<FileListBlank>)>,
+    >,
     mut commands: Commands,
 ) {
-    let Ok(slot) = slots.single() else {
+    let Ok((slot, children)) = slots.single() else {
         return;
     };
-    if rendered.files == Some(browser.list_version) {
-        return;
-    }
-    // 上一批还没落地就等着，不推进版本号，下一帧自动重试
-    if pending.contains(slot) {
+    let state = RenderedFiles {
+        slot,
+        source: FileListSource::current(&session, &browser),
+        version: browser.list_version,
+    };
+    if rendered.files.as_ref() == Some(&state) {
         return;
     }
     debug!(
-        was = ?rendered.files,
+        was = ?rendered.files.as_ref().map(|files| files.version),
         now = browser.list_version,
         count = browser.files.len(),
-        "重建文件列表行"
+        "同步文件列表行"
     );
-    rendered.files = Some(browser.list_version);
-
-    let mut rows: Vec<BoxedScene> = match browser.files.is_empty() {
-        true => vec![boxed(bsn! {
-            Node { padding: {UiRect::all(px(4.0))} }
-            Children [(widgets::hint("未连接，或远程目录下无 JSON 文件"))]
-        })],
-        false => browser
-            .files
-            .iter()
-            .map(|name| {
-                let selected = browser.selected.as_deref() == Some(name.as_str());
-                boxed(file_row(name, selected))
-            })
-            .collect(),
-    };
-    rows.push(boxed(file_list_blank()));
-
-    widgets::replace_slot_children(&mut commands, slot, rows);
+    let previous: Vec<_> = children
+        .into_iter()
+        .flat_map(|children| children.iter())
+        .collect();
+    let mut available: BTreeMap<&str, VecDeque<Entity>> = BTreeMap::new();
+    let (mut empty, mut blank) = (None, None);
+    for &entity in &previous {
+        if let Ok((row, source)) = rows.get(entity)
+            && source == &state.source
+        {
+            available.entry(&row.0).or_default().push_back(entity);
+        }
+        if let Ok((mut node, is_empty, is_blank)) = footers.get_mut(entity) {
+            match (is_empty, is_blank) {
+                (true, _) => {
+                    empty = Some(entity);
+                    node.display = match browser.files.is_empty() {
+                        true => Display::Flex,
+                        false => Display::None,
+                    };
+                }
+                (_, true) => blank = Some(entity),
+                _ => {}
+            }
+        }
+    }
+    let mut ordered = Vec::with_capacity(browser.files.len() + 2);
+    for filename in &browser.files {
+        let entity = available
+            .get_mut(filename.as_str())
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_else(|| {
+                // 先保留根实体与身份，再异步填入控件。后续刷新能立即复用或删除这个根，
+                // 不会像父插槽的 related 场景列表一样留下无法追踪的在飞子项。
+                commands
+                    .queue_spawn_scene(file_row(filename))
+                    .insert((FileRow(filename.clone()), state.source.clone()))
+                    .id()
+            });
+        ordered.push(entity);
+    }
+    ordered.push(empty.unwrap_or_else(|| {
+        commands
+            .spawn((
+                FileListEmpty,
+                Node {
+                    display: match browser.files.is_empty() {
+                        true => Display::Flex,
+                        false => Display::None,
+                    },
+                    padding: UiRect::all(px(4.0)),
+                    ..default()
+                },
+                Text::new("未连接，或远程目录下无 JSON 文件"),
+                ThemeTextColor(tokens::TEXT_DIM),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(12.0),
+                    ..default()
+                },
+            ))
+            .id()
+    }));
+    ordered.push(blank.unwrap_or_else(|| commands.spawn_scene(file_list_blank()).id()));
+    let retained: HashSet<_> = ordered.iter().copied().collect();
+    for &entity in &previous {
+        if !retained.contains(&entity) {
+            commands.entity(entity).despawn();
+        }
+    }
+    if previous != ordered {
+        commands.entity(slot).replace_children(&ordered);
+    }
+    rendered.files = Some(state);
 }
 
 /// 卡片标题里的计数跟随文件数
-fn sync_list_title(browser: Res<FileBrowser>, mut titles: Query<&mut Text, With<FileListTitle>>) {
-    if !browser.is_changed() {
-        return;
-    }
-    for mut text in &mut titles {
-        text.0 = format!("文件列表 ({})", browser.files.len());
+fn sync_list_title(browser: Res<FileBrowser>, mut titles: Query<(&mut Text, Ref<FileListTitle>)>) {
+    for (mut text, marker) in &mut titles {
+        if browser.is_changed() || marker.is_added() {
+            text.0 = format!("文件列表 ({})", browser.files.len());
+        }
     }
 }
 
 /// 选中态同步：只加减 `Selected` 组件，不重建列表
 fn sync_row_selection(
     browser: Res<FileBrowser>,
-    rows: Query<(Entity, &FileRow, Has<Selected>)>,
+    rows: Query<(Entity, Ref<FileRow>, Has<Selected>)>,
     mut commands: Commands,
 ) {
-    if !browser.is_changed() {
-        return;
-    }
     for (entity, row, has_selected) in &rows {
+        if !browser.is_changed() && !row.is_added() {
+            continue;
+        }
         let should_select = browser.selected.as_deref() == Some(row.0.as_str());
         match (should_select, has_selected) {
             (true, false) => {
@@ -499,17 +582,21 @@ impl Plugin for FileListPlugin {
                 Update,
                 (
                     spawn_file_list,
-                    rebuild_file_rows,
+                    reconcile_file_rows,
                     sync_list_title,
                     sync_file_directory,
-                    sync_row_selection,
+                    sync_row_selection.after(reconcile_file_rows),
                     rebuild_context_menu,
-                    sync_menu_item_style,
+                    sync_menu_item_style.after(rebuild_context_menu),
                 )
                     .in_set(UiSet::Rebuild),
             );
     }
 }
+
+#[cfg(test)]
+#[path = "files/lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

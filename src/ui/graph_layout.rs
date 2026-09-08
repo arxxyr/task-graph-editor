@@ -4,14 +4,18 @@
 //! 便于单测。渲染在 [`super::graph_view`]。
 //!
 //! 算法是分层图布局的简化版：按最长路径给节点定层，同层水平居中排开，
+//! 层间按水平区间分配通道并自动留出足够间距，端口与侧通道保留每条边的身份。
 //! 边走正交折线。`loop` 节点的循环体带回边，直接拓扑排序会因为有环排不出层级，
-//! 所以先用 DFS 把回边挑出来、定层时当它不存在，渲染时再单独画成虚线——
+//! 所以先用 DFS 把回边挑出来、定层时当它不存在，渲染时再用强调色标记——
 //! 层次排得出来，循环关系也一眼看得见。
 
 use bevy::math::Vec2;
 use std::collections::{HashMap, HashSet};
 
 use crate::model::{ENTRY_ID, EXIT_ID, GraphEdge, SubGraph};
+
+mod manual;
+pub use manual::layout_with_positions;
 
 /// 节点框宽度
 pub const NODE_W: f32 = 230.0;
@@ -59,6 +63,8 @@ pub struct PlacedNode {
 /// 排好位置的边
 #[derive(Debug, Clone)]
 pub struct PlacedEdge {
+    /// 在原始 `SubGraph::edges` 中的位置，过滤悬空边后也不改变身份
+    pub edge_index: usize,
     /// 折线顶点，至少两个；相邻两点必定共享 x 或 y（正交）
     pub points: Vec<Vec2>,
     /// 是否为把流程绕回去的回边
@@ -74,6 +80,48 @@ pub struct GraphLayout {
     pub edges: Vec<PlacedEdge>,
     /// 画布尺寸
     pub size: Vec2,
+}
+
+/// 节点身份不明确时不能安全地构造邻接关系或选择目标。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LayoutError {
+    #[error("节点 ID 为空或只有空白")]
+    Empty { node_index: usize },
+    #[error("节点使用了保留 ID：{id}")]
+    Reserved { node_index: usize, id: String },
+    #[error("节点 ID {id} 在本层重复")]
+    Duplicate {
+        first_index: usize,
+        node_index: usize,
+        id: String,
+    },
+    #[error("第 {} 条连接无法在当前手工位置之间走线，请恢复自动布局", edge_index + 1)]
+    Unroutable { edge_index: usize },
+}
+
+fn validate_node_ids(graph: &SubGraph) -> Result<(), LayoutError> {
+    let mut seen = HashMap::new();
+    for (node_index, node) in graph.nodes.iter().enumerate() {
+        match node.id.as_str() {
+            id if id.trim().is_empty() => return Err(LayoutError::Empty { node_index }),
+            ENTRY_ID | EXIT_ID => {
+                return Err(LayoutError::Reserved {
+                    node_index,
+                    id: node.id.clone(),
+                });
+            }
+            id => {
+                if let Some(first_index) = seen.insert(id, node_index) {
+                    return Err(LayoutError::Duplicate {
+                        first_index,
+                        node_index,
+                        id: node.id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 找出所有回边
@@ -161,7 +209,11 @@ fn rank_nodes(
     }
 
     // 出口固定排在最底下，否则它会跟某个中间节点挤在同一层
-    if let Some(bottom) = rank.values().copied().max()
+    if let Some(bottom) = rank
+        .iter()
+        .filter(|(id, _)| id.as_str() != EXIT_ID)
+        .map(|(_, rank)| *rank)
+        .max()
         && rank.contains_key(EXIT_ID)
     {
         rank.insert(EXIT_ID.to_string(), bottom + 1);
@@ -170,18 +222,20 @@ fn rank_nodes(
 }
 
 /// 计算一层子图的布局
-pub fn layout(graph: &SubGraph) -> GraphLayout {
+pub fn layout(graph: &SubGraph) -> Result<GraphLayout, LayoutError> {
+    validate_node_ids(graph)?;
     let mut ids: Vec<String> = vec![ENTRY_ID.to_string()];
     ids.extend(graph.nodes.iter().map(|n| n.id.clone()));
     ids.push(EXIT_ID.to_string());
 
     let known: HashSet<&str> = ids.iter().map(String::as_str).collect();
-    let edges: Vec<GraphEdge> = graph
+    let (edge_indices, edges): (Vec<usize>, Vec<GraphEdge>) = graph
         .edges
         .iter()
-        .filter(|e| known.contains(e.from.as_str()) && known.contains(e.to.as_str()))
-        .cloned()
-        .collect();
+        .enumerate()
+        .filter(|(_, e)| known.contains(e.from.as_str()) && known.contains(e.to.as_str()))
+        .map(|(index, edge)| (index, edge.clone()))
+        .unzip();
 
     let mut adj: HashMap<&str, Vec<&str>> =
         ids.iter().map(|id| (id.as_str(), Vec::new())).collect();
@@ -201,28 +255,88 @@ pub fn layout(graph: &SubGraph) -> GraphLayout {
     let widest = rows.values().map(Vec::len).max().unwrap_or(1);
     let content_w = widest as f32 * NODE_W + (widest.saturating_sub(1)) as f32 * GAP_X;
 
-    let mut pos: HashMap<&str, Vec2> = HashMap::new();
-    for (&row, members) in &rows {
+    let mut node_x: HashMap<&str, f32> = HashMap::new();
+    for members in rows.values() {
         let row_w =
             members.len() as f32 * NODE_W + (members.len().saturating_sub(1)) as f32 * GAP_X;
         let start_x = PAD + (content_w - row_w) / 2.0;
         for (i, id) in members.iter().enumerate() {
-            pos.insert(
-                id.as_str(),
-                Vec2::new(
-                    start_x + i as f32 * (NODE_W + GAP_X),
-                    PAD + row as f32 * (NODE_H + GAP_Y),
-                ),
-            );
+            node_x.insert(id.as_str(), start_x + i as f32 * (NODE_W + GAP_X));
         }
     }
 
     let bottom_row = rows.keys().copied().max().unwrap_or(0);
+    // 第 0 个间隙在第一层上方，第 r + 1 个间隙在第 r 层下方。
+    let mut gap_ports: Vec<Vec<(f32, usize)>> = vec![Vec::new(); bottom_row + 2];
+    let ports = edge_ports(&edges, &rank, &node_x, &mut gap_ports);
+    let mut gaps = vec![GapTracks::default(); bottom_row + 2];
+    let mut side_lanes: Vec<(usize, usize, f32)> = Vec::new();
+    let mut right_edge = PAD + content_w;
+    let plans: Vec<RoutePlan> = edges
+        .iter()
+        .zip(&ports)
+        .map(|(edge, &(from_x, to_x))| {
+            let from_row = rank[&edge.from];
+            let to_row = rank[&edge.to];
+            let is_back = back.contains(&(edge.from.clone(), edge.to.clone()));
+            match !is_back && to_row == from_row + 1 {
+                true => RoutePlan::Forward {
+                    track: (from_x != to_x).then(|| gaps[to_row].reserve(from_x, to_x)),
+                },
+                false => {
+                    let lo = from_row.min(to_row);
+                    let hi = from_row.max(to_row) + 1;
+                    let mut x = side_lane(&rows, from_row, to_row, content_w);
+                    // 自环会伸入上下两个间隙，邻层通道也可能重叠，按间隙范围判定。
+                    // 避开端口的 x，防止侧通道与邻层较宽节点的短竖线共线。
+                    while side_lanes.iter().any(|&(other_lo, other_hi, other_x)| {
+                        lo <= other_hi && hi >= other_lo && (x - other_x).abs() < LANE_GAP
+                    }) || gap_ports[lo..=hi]
+                        .iter()
+                        .flatten()
+                        .any(|&(port_x, _)| x == port_x)
+                    {
+                        x += LANE_GAP;
+                    }
+                    side_lanes.push((lo, hi, x));
+                    right_edge = right_edge.max(x);
+                    RoutePlan::Side {
+                        x,
+                        leave_track: gaps[from_row + 1].reserve(from_x, x),
+                        enter_track: gaps[to_row].reserve(to_x, x),
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let gap_heights: Vec<f32> = gaps
+        .iter()
+        .enumerate()
+        .map(|(index, gap)| {
+            let minimum = match index == 0 || index == bottom_row + 1 {
+                true => PAD,
+                false => GAP_Y,
+            };
+            minimum.max((gap.tracks.len() + 1) as f32 * LANE_GAP)
+        })
+        .collect();
+    let mut gap_starts = vec![0.0; gaps.len()];
+    let mut row_y = vec![0.0; bottom_row + 1];
+    for row in 0..=bottom_row {
+        row_y[row] = gap_starts[row] + gap_heights[row];
+        gap_starts[row + 1] = row_y[row] + NODE_H;
+    }
+    let track_y = |gap: usize, track: usize| {
+        gap_starts[gap]
+            + gap_heights[gap] * (track + 1) as f32 / (gaps[gap].tracks.len() + 1) as f32
+    };
+
     let nodes: Vec<PlacedNode> = ids
         .iter()
         .map(|id| PlacedNode {
             id: id.clone(),
-            pos: pos[id.as_str()],
+            pos: Vec2::new(node_x[id.as_str()], row_y[rank[id]]),
             slot: match id.as_str() {
                 ENTRY_ID => NodeSlot::Entry,
                 EXIT_ID => NodeSlot::Exit,
@@ -231,53 +345,159 @@ pub fn layout(graph: &SubGraph) -> GraphLayout {
         })
         .collect();
 
-    let mut right_edge = PAD + content_w;
-    let mut lanes: Vec<(usize, usize, f32)> = Vec::new();
     let placed_edges = edges
         .iter()
-        .map(|e| {
-            let a = pos[e.from.as_str()];
-            let b = pos[e.to.as_str()];
+        .zip(&ports)
+        .zip(&plans)
+        .zip(edge_indices)
+        .map(|(((e, &(from_x, to_x)), plan), edge_index)| {
+            let from_row = rank[&e.from];
+            let to_row = rank[&e.to];
+            let start = Vec2::new(from_x, row_y[from_row] + NODE_H);
+            let end = Vec2::new(to_x, row_y[to_row]);
             let is_back = back.contains(&(e.from.clone(), e.to.clone()));
-            let direct = forward_route(a, b);
-            let needs_lane = is_back
-                || nodes.iter().any(|node| {
-                    node.id != e.from && node.id != e.to && route_intersects_node(&direct, node.pos)
-                });
-            let points = match needs_lane {
-                true => {
-                    let from_row = rank[&e.from];
-                    let to_row = rank[&e.to];
-                    let lo = from_row.min(to_row);
-                    let hi = from_row.max(to_row);
-                    let mut lane = side_lane(&rows, from_row, to_row, content_w);
-                    // 共用一条纵线会掩盖跨层依赖，因此重叠区域分配独立通道。
-                    while lanes.iter().any(|&(other_lo, other_hi, other_x)| {
-                        lo <= other_hi && hi >= other_lo && (lane - other_x).abs() < LANE_GAP
-                    }) {
-                        lane += LANE_GAP;
-                    }
-                    lanes.push((lo, hi, lane));
-                    right_edge = right_edge.max(lane);
-                    side_route(a, b, lane)
+            let points = match *plan {
+                RoutePlan::Forward { track: None } => vec![start, end],
+                RoutePlan::Forward { track: Some(track) } => {
+                    let y = track_y(to_row, track);
+                    vec![start, Vec2::new(start.x, y), Vec2::new(end.x, y), end]
                 }
-                false => direct,
+                RoutePlan::Side {
+                    x,
+                    leave_track,
+                    enter_track,
+                } => {
+                    let leave_y = track_y(from_row + 1, leave_track);
+                    let enter_y = track_y(to_row, enter_track);
+                    vec![
+                        start,
+                        Vec2::new(start.x, leave_y),
+                        Vec2::new(x, leave_y),
+                        Vec2::new(x, enter_y),
+                        Vec2::new(end.x, enter_y),
+                        end,
+                    ]
+                }
             };
             PlacedEdge {
+                edge_index,
                 points,
                 back: is_back,
             }
         })
         .collect();
 
-    GraphLayout {
+    Ok(GraphLayout {
         nodes,
         edges: placed_edges,
         size: Vec2::new(
             right_edge + PAD,
-            (bottom_row + 1) as f32 * (NODE_H + GAP_Y) - GAP_Y + PAD * 2.0,
+            gap_starts[bottom_row + 1] + gap_heights[bottom_row + 1],
         ),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum RoutePlan {
+    Forward {
+        track: Option<usize>,
+    },
+    Side {
+        x: f32,
+        leave_track: usize,
+        enter_track: usize,
+    },
+}
+
+/// 不相交的水平区间可以复用高度，有正长度重叠的区间必须占不同轨道。
+#[derive(Clone, Default)]
+struct GapTracks {
+    tracks: Vec<Vec<(f32, f32)>>,
+}
+
+impl GapTracks {
+    fn reserve(&mut self, a: f32, b: f32) -> usize {
+        let (lo, hi) = (a.min(b), a.max(b));
+        for (index, track) in self.tracks.iter_mut().enumerate() {
+            if track
+                .iter()
+                .all(|&(other_lo, other_hi)| lo >= other_hi || hi <= other_lo)
+            {
+                track.push((lo, hi));
+                return index;
+            }
+        }
+        self.tracks.push(vec![(lo, hi)]);
+        self.tracks.len() - 1
     }
+}
+
+/// 同一节点的多条边使用独立端口，间隙内不同边的短竖线也不得互相覆盖。
+fn edge_ports<'a>(
+    edges: &'a [GraphEdge],
+    rank: &HashMap<String, usize>,
+    node_x: &HashMap<&str, f32>,
+    gaps: &mut [Vec<(f32, usize)>],
+) -> Vec<(f32, f32)> {
+    let mut degree: HashMap<(&str, bool), usize> = HashMap::new();
+    for edge in edges {
+        *degree.entry((&edge.from, false)).or_default() += 1;
+        *degree.entry((&edge.to, true)).or_default() += 1;
+    }
+    let mut used: HashMap<(&str, bool), usize> = HashMap::new();
+    edges
+        .iter()
+        .enumerate()
+        .map(|(edge_index, edge)| {
+            let mut port = |id: &'a str, incoming: bool, gap: usize| {
+                let count = degree[&(id, incoming)];
+                let index = used.entry((id, incoming)).or_default();
+                let spacing = LANE_GAP.min((NODE_W - 32.0) / count as f32);
+                let preferred = node_x[id]
+                    + NODE_W / 2.0
+                    + (*index as f32 - (count - 1) as f32 / 2.0) * spacing;
+                *index += 1;
+                reserve_port(&mut gaps[gap], edge_index, preferred, node_x[id])
+            };
+            (
+                port(&edge.from, false, rank[&edge.from] + 1),
+                port(&edge.to, true, rank[&edge.to]),
+            )
+        })
+        .collect()
+}
+
+fn reserve_port(
+    ports: &mut Vec<(f32, usize)>,
+    edge_index: usize,
+    preferred: f32,
+    node_x: f32,
+) -> f32 {
+    let occupied = |candidate| {
+        ports
+            .iter()
+            .any(|&(x, other_edge)| x == candidate && other_edge != edge_index)
+    };
+    let x = match occupied(preferred) {
+        false => preferred,
+        true => {
+            let lo = node_x + 8.0;
+            let hi = node_x + NODE_W - 8.0;
+            let spacing = (LANE_GAP / 4.0).min((hi - lo) / (ports.len() + 2) as f32);
+            // 由近到远找空位；候选数多于已有端口数，且始终留在节点内部。
+            (1..=ports.len() + 2)
+                .flat_map(|offset| {
+                    [
+                        preferred + offset as f32 * spacing,
+                        preferred - offset as f32 * spacing,
+                    ]
+                })
+                .find(|&candidate| candidate >= lo && candidate <= hi && !occupied(candidate))
+                .expect("节点内部的候选端口数多于已占用端口数")
+        }
+    };
+    ports.push((x, edge_index));
+    x
 }
 
 /// 避障通道的 x 坐标
@@ -302,64 +522,6 @@ fn side_lane(
     let span_w = widest as f32 * NODE_W + (widest.saturating_sub(1)) as f32 * GAP_X;
     // 每层都对齐到内容中线，所以这段区域的右边界在中线右侧 span_w/2 处
     PAD + (content_w + span_w) / 2.0 + SIDE_BULGE
-}
-
-/// 顺行边：从上一个节点底边到下一个节点顶边，必要时中途横移
-fn forward_route(a: Vec2, b: Vec2) -> Vec<Vec2> {
-    let x1 = a.x + NODE_W / 2.0;
-    let x2 = b.x + NODE_W / 2.0;
-    let y1 = a.y + NODE_H;
-    let y2 = b.y;
-    if (x1 - x2).abs() < f32::EPSILON {
-        return vec![Vec2::new(x1, y1), Vec2::new(x2, y2)];
-    }
-    let mid = (y1 + y2) / 2.0;
-    vec![
-        Vec2::new(x1, y1),
-        Vec2::new(x1, mid),
-        Vec2::new(x2, mid),
-        Vec2::new(x2, y2),
-    ]
-}
-
-/// 检查正交折线是否碰到节点矩形，边界接触也视为遮挡。
-fn route_intersects_node(points: &[Vec2], pos: Vec2) -> bool {
-    points.windows(2).any(|pair| {
-        let (a, b) = (pair[0], pair[1]);
-        match a.x == b.x {
-            true => {
-                a.x >= pos.x
-                    && a.x <= pos.x + NODE_W
-                    && a.y.max(b.y) >= pos.y
-                    && a.y.min(b.y) <= pos.y + NODE_H
-            }
-            false => {
-                a.y >= pos.y
-                    && a.y <= pos.y + NODE_H
-                    && a.x.max(b.x) >= pos.x
-                    && a.x.min(b.x) <= pos.x + NODE_W
-            }
-        }
-    })
-}
-
-/// 经层间空白绕到右侧：顺行跨层、回边、自环均不横穿同层其他节点。
-///
-/// 离开与进入节点的横线分别放在下方、上方间隙，纵线放在所跨区域外。
-/// 每端只占间隙的三分之一，最顶/最底层仍落在画布留白内。
-fn side_route(a: Vec2, b: Vec2, lane: f32) -> Vec<Vec2> {
-    let start = Vec2::new(a.x + NODE_W / 2.0, a.y + NODE_H);
-    let end = Vec2::new(b.x + NODE_W / 2.0, b.y);
-    let leave_y = start.y + GAP_Y / 3.0;
-    let enter_y = end.y - GAP_Y / 3.0;
-    vec![
-        start,
-        Vec2::new(start.x, leave_y),
-        Vec2::new(lane, leave_y),
-        Vec2::new(lane, enter_y),
-        Vec2::new(end.x, enter_y),
-        end,
-    ]
 }
 
 #[cfg(test)]
@@ -394,6 +556,7 @@ mod tests {
         SubGraph {
             nodes: ids.iter().map(|id| node(id)).collect(),
             edges,
+            ..Default::default()
         }
     }
 
@@ -403,13 +566,65 @@ mod tests {
 
     #[test]
     fn 链式图每层一个节点且自上而下() {
-        let out = layout(&chain(4));
+        let out = layout(&chain(4)).unwrap();
         assert_eq!(out.nodes.len(), 6, "含虚拟入口出口");
         let ys: Vec<f32> = ["_entry", "n0", "n1", "n2", "n3", "_exit"]
             .iter()
             .map(|id| y_of(&out, id))
             .collect();
         assert!(ys.windows(2).all(|w| w[0] < w[1]), "层级应严格递增: {ys:?}");
+        assert!(
+            ys.windows(2).all(|w| w[1] - w[0] == NODE_H + GAP_Y),
+            "出口不应产生额外空层：{ys:?}"
+        );
+        assert!(
+            out.edges.iter().all(|edge| edge.points.len() == 2),
+            "普通单链保留竖直走线"
+        );
+    }
+
+    #[test]
+    fn 重复节点不能进入拓扑排序() {
+        let graph = SubGraph {
+            nodes: vec![node("a"), node("a"), node("b")],
+            edges: vec![edge("a", "b")],
+            ..Default::default()
+        };
+        assert_eq!(
+            layout(&graph).unwrap_err(),
+            LayoutError::Duplicate {
+                first_index: 0,
+                node_index: 1,
+                id: "a".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn 保留和空白节点身份必须拒绝() {
+        for id in [ENTRY_ID, EXIT_ID] {
+            let graph = SubGraph {
+                nodes: vec![node(id)],
+                ..Default::default()
+            };
+            assert_eq!(
+                layout(&graph).unwrap_err(),
+                LayoutError::Reserved {
+                    node_index: 0,
+                    id: id.into(),
+                }
+            );
+        }
+        for id in ["", " ", "\t\n", "　"] {
+            let graph = SubGraph {
+                nodes: vec![node(id)],
+                ..Default::default()
+            };
+            assert_eq!(
+                layout(&graph).unwrap_err(),
+                LayoutError::Empty { node_index: 0 }
+            );
+        }
     }
 
     #[test]
@@ -423,8 +638,9 @@ mod tests {
                 edge("b", "join"),
                 edge("join", EXIT_ID),
             ],
+            ..Default::default()
         };
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         assert_eq!(y_of(&out, "a"), y_of(&out, "b"), "两个分支应同层");
         assert!(y_of(&out, "join") > y_of(&out, "a"), "汇合点在分支之下");
     }
@@ -441,8 +657,9 @@ mod tests {
                 edge(ENTRY_ID, "join"),
                 edge("join", EXIT_ID),
             ],
+            ..Default::default()
         };
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         assert!(y_of(&out, "join") > y_of(&out, "b"));
     }
 
@@ -457,8 +674,9 @@ mod tests {
                 edge("b", "a"),
                 edge("b", EXIT_ID),
             ],
+            ..Default::default()
         };
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         assert!(y_of(&out, "b") > y_of(&out, "a"), "断掉回边后仍分得出层级");
         let backs: Vec<&PlacedEdge> = out.edges.iter().filter(|e| e.back).collect();
         assert_eq!(backs.len(), 1, "恰好一条回边");
@@ -474,8 +692,9 @@ mod tests {
                 edge("b", "a"),
                 edge("b", EXIT_ID),
             ],
+            ..Default::default()
         };
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         let back = out.edges.iter().find(|e| e.back).unwrap();
         let rightmost = out
             .nodes
@@ -490,7 +709,7 @@ mod tests {
 
     #[test]
     fn 折线相邻点保持正交() {
-        let out = layout(&chain(3));
+        let out = layout(&chain(3)).unwrap();
         for e in &out.edges {
             for pair in e.points.windows(2) {
                 let (a, b) = (pair[0], pair[1]);
@@ -508,8 +727,9 @@ mod tests {
         let graph = SubGraph {
             nodes: vec![node("a"), node("dangling")],
             edges: vec![edge(ENTRY_ID, "a"), edge("a", EXIT_ID)],
+            ..Default::default()
         };
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         let exit_y = y_of(&out, "_exit");
         assert!(
             out.nodes
@@ -521,7 +741,7 @@ mod tests {
 
     #[test]
     fn 空图也能布局() {
-        let out = layout(&SubGraph::default());
+        let out = layout(&SubGraph::default()).unwrap();
         assert_eq!(out.nodes.len(), 2, "只剩入口与出口");
         assert!(out.size.x > 0.0 && out.size.y > 0.0);
     }
@@ -530,10 +750,24 @@ mod tests {
     fn 指向未知节点的边被忽略() {
         let graph = SubGraph {
             nodes: vec![node("a")],
-            edges: vec![edge(ENTRY_ID, "a"), edge("a", "nowhere")],
+            edges: vec![
+                edge("a", "nowhere"),
+                edge(ENTRY_ID, "a"),
+                edge("a", "nowhere"),
+                edge("a", EXIT_ID),
+            ],
+            ..Default::default()
         };
-        let out = layout(&graph);
-        assert_eq!(out.edges.len(), 1, "悬空的边不参与布局");
+        let out = layout(&graph).unwrap();
+        assert_eq!(out.edges.len(), 2, "悬空的边不参与布局");
+        assert_eq!(
+            out.edges
+                .iter()
+                .map(|edge| edge.edge_index)
+                .collect::<Vec<_>>(),
+            [1, 3],
+            "过滤不改变原始边身份"
+        );
     }
 
     #[test]
@@ -560,8 +794,9 @@ mod tests {
                 edge("c", "b"),
                 edge("c", EXIT_ID),
             ],
+            ..Default::default()
         };
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         let back: Vec<&PlacedEdge> = out.edges.iter().filter(|e| e.back).collect();
         assert_eq!(back.len(), 1, "应当只有 c→b 一条回边");
 
@@ -593,8 +828,9 @@ mod tests {
                 edge("b", "a"),
                 edge("b", EXIT_ID),
             ],
+            ..Default::default()
         };
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         for n in &out.nodes {
             assert!(n.pos.x + NODE_W <= out.size.x, "节点超出画布宽度");
             assert!(n.pos.y + NODE_H <= out.size.y, "节点超出画布高度");
@@ -608,9 +844,10 @@ mod tests {
 
     /// 独立检查可见性约束：每段折线正交、留在画布内，且避开所有非端点卡片。
     fn assert_clear_routes(graph: &SubGraph) {
-        let out = layout(graph);
+        let out = layout(graph).unwrap();
         assert_eq!(out.edges.len(), graph.edges.len());
-        for (source, placed) in graph.edges.iter().zip(&out.edges) {
+        for placed in &out.edges {
+            let source = &graph.edges[placed.edge_index];
             assert!(placed.points.len() >= 2);
             for pair in placed.points.windows(2) {
                 let (a, b) = (pair[0], pair[1]);
@@ -637,13 +874,92 @@ mod tests {
         }
     }
 
+    /// 交点允许存在；有正长度的共线重叠会掩盖路径身份，必须由通道分配消除。
+    fn assert_distinct_routes(out: &GraphLayout) {
+        for (index, first) in out.edges.iter().enumerate() {
+            for second in &out.edges[index + 1..] {
+                for a in first.points.windows(2) {
+                    for b in second.points.windows(2) {
+                        let horizontal = a[0].y == a[1].y
+                            && b[0].y == b[1].y
+                            && a[0].y == b[0].y
+                            && a[0].x.min(a[1].x).max(b[0].x.min(b[1].x))
+                                < a[0].x.max(a[1].x).min(b[0].x.max(b[1].x));
+                        let vertical = a[0].x == a[1].x
+                            && b[0].x == b[1].x
+                            && a[0].x == b[0].x
+                            && a[0].y.min(a[1].y).max(b[0].y.min(b[1].y))
+                                < a[0].y.max(a[1].y).min(b[0].y.max(b[1].y));
+                        assert!(
+                            !horizontal && !vertical,
+                            "边 {} 和 {} 共线重叠：{a:?} 与 {b:?}",
+                            first.edge_index,
+                            second.edge_index
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 交叉分支使用不同的水平通道() {
+        let graph = SubGraph {
+            nodes: vec![node("a"), node("b"), node("c"), node("d")],
+            edges: vec![
+                edge(ENTRY_ID, "a"),
+                edge(ENTRY_ID, "b"),
+                edge("a", "d"),
+                edge("b", "c"),
+                edge("c", EXIT_ID),
+                edge("d", EXIT_ID),
+            ],
+            ..Default::default()
+        };
+        assert_clear_routes(&graph);
+        assert_distinct_routes(&layout(&graph).unwrap());
+    }
+
+    #[test]
+    fn 同端点平行边自环与回边各自保留身份和路径() {
+        let mut graph = chain(2);
+        graph.edges.extend([
+            edge("n0", "n1"),
+            edge("n0", "n1"),
+            edge("n1", "n0"),
+            edge("n1", "n0"),
+            edge("n1", "n1"),
+            edge("n1", "n1"),
+        ]);
+        assert_clear_routes(&graph);
+        let out = layout(&graph).unwrap();
+        assert_eq!(
+            out.edges
+                .iter()
+                .map(|edge| edge.edge_index)
+                .collect::<Vec<_>>(),
+            (0..graph.edges.len()).collect::<Vec<_>>()
+        );
+        assert_distinct_routes(&out);
+    }
+
+    #[test]
+    fn 密集层间通道自动增加间距而不侵入卡片() {
+        let mut graph = chain(2);
+        graph.edges.extend((0..12).map(|_| edge("n1", "n0")));
+        assert_clear_routes(&graph);
+        let out = layout(&graph).unwrap();
+        assert!(y_of(&out, "n0") - y_of(&out, ENTRY_ID) > NODE_H + GAP_Y);
+        assert_distinct_routes(&out);
+    }
+
     #[test]
     fn 跨层直达边绕过中间卡片且保留独立通道() {
         let mut graph = chain(4);
         graph.edges.push(edge(ENTRY_ID, "n3"));
         graph.edges.push(edge("n0", "n3"));
         assert_clear_routes(&graph);
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         let lanes: Vec<f32> = out
             .edges
             .iter()
@@ -666,6 +982,7 @@ mod tests {
                 edge("c", "a"),
                 edge("d", EXIT_ID),
             ],
+            ..Default::default()
         };
         assert_clear_routes(&graph);
     }
@@ -675,9 +992,10 @@ mod tests {
         let graph = SubGraph {
             nodes: vec![node("a")],
             edges: vec![edge(ENTRY_ID, "a"), edge("a", "a"), edge("a", EXIT_ID)],
+            ..Default::default()
         };
         assert_clear_routes(&graph);
-        let out = layout(&graph);
+        let out = layout(&graph).unwrap();
         let loop_edge = &out.edges[1];
         assert!(loop_edge.back);
         assert!(loop_edge.points.iter().any(|p| p.y < y_of(&out, "a")));
@@ -706,6 +1024,31 @@ mod tests {
                 }
             }
             assert_clear_routes(&graph);
+            assert_distinct_routes(&layout(&graph).unwrap());
+        }
+    }
+
+    #[test]
+    fn 不同层宽孤立节点及虚拟端点闭环保持路径不变量() {
+        let mut seed = 29_u64;
+        for _ in 0..256 {
+            let mut graph = SubGraph {
+                nodes: (0..8).map(|i| node(&format!("n{i}"))).collect(),
+                ..Default::default()
+            };
+            let mut ids = vec![ENTRY_ID.to_string()];
+            ids.extend(graph.nodes.iter().map(|node| node.id.clone()));
+            ids.push(EXIT_ID.to_string());
+            for from in &ids {
+                for to in &ids {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    if (seed >> 32).is_multiple_of(9) {
+                        graph.edges.push(edge(from, to));
+                    }
+                }
+            }
+            assert_clear_routes(&graph);
+            assert_distinct_routes(&layout(&graph).unwrap());
         }
     }
 }

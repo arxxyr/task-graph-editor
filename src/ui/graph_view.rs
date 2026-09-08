@@ -6,7 +6,7 @@
 //!   而正交折线本来就比曲线更适合流程图），终点补一个箭头字符
 //! - 回边（`loop` 的循环体）走右侧通道，用强调色标出
 //!
-//! 流程本身只读——本工具编辑的是 context 参数，流程由机器人端定义。
+//! 编辑模式复用模型命令；手工布局与缩放只属于本地视图状态。
 
 use bevy::feathers::controls::ButtonVariant;
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, ThemeToken};
@@ -17,14 +17,25 @@ use bevy::ui_widgets::{Activate, ScrollArea};
 
 use crate::model::{SubGraph, TaskNode};
 
-use super::graph_layout::{self, GraphLayout, NODE_H, NODE_W, NodeSlot, PlacedEdge};
+use super::document_guard::DocumentGuard;
+use super::graph_edit::{GraphEditPanelSlot, GraphEditToolbarSlot, GraphEditing};
+use super::graph_layout::{self, GraphLayout, NODE_H, NODE_W, NodeSlot};
 use super::shell::{GraphPane, GraphSlot, ParamsPane, ViewSwitchSlot};
 use super::theme;
 use super::widgets::{self, BoxedScene, boxed};
 use super::{Editor, UiSet};
 
+mod canvas_edit;
+mod details;
+
+#[cfg(test)]
+mod regression_tests;
+
 /// 折线粗细
 const EDGE_W: f32 = 1.5;
+
+/// 连线使用独立的透明命中区域，便于选中细线。
+const EDGE_HIT_W: f32 = 10.0;
 
 /// 详情栏宽度
 const DETAIL_W: f32 = 300.0;
@@ -46,6 +57,8 @@ pub struct GraphNav {
     pub path: Vec<String>,
     /// 当前选中的节点
     pub selected: Option<String>,
+    /// 当前选中的边在本层边数组中的索引，同端点的边仍能分别定位。
+    pub selected_edge: Option<usize>,
     /// 版本号：路径或数据变化时递增，驱动重建
     pub version: u64,
 }
@@ -55,6 +68,7 @@ impl GraphNav {
     fn enter(&mut self, id: &str) {
         self.path.push(id.to_string());
         self.selected = None;
+        self.selected_edge = None;
         self.version += 1;
     }
 
@@ -62,6 +76,7 @@ impl GraphNav {
     fn go_to(&mut self, depth: usize) {
         self.path.truncate(depth);
         self.selected = None;
+        self.selected_edge = None;
         self.version += 1;
     }
 
@@ -69,6 +84,7 @@ impl GraphNav {
     fn reset(&mut self) {
         self.path.clear();
         self.selected = None;
+        self.selected_edge = None;
         self.version += 1;
     }
 }
@@ -106,14 +122,45 @@ fn category_token(node_type: &str) -> ThemeToken {
 #[derive(Component, Clone, Default)]
 struct GraphNodeMarker(String);
 
+/// 每批图场景及其详情保留自己的导航版本，旧实体事件不能被新路径重新解释。
+#[derive(Component, Clone, Copy, Default)]
+pub(super) struct GraphSceneVersion(u64);
+
 /// 图卡文字记录未选中时的角色，选中与取消时只切换 token。
 #[derive(Component, Default, Clone)]
 struct GraphNodeLabel(ThemeToken);
 
+#[derive(Component, Clone, Default)]
+struct GraphNodeText {
+    id: String,
+    kind: bool,
+}
+#[derive(Component, Clone, Default)]
+struct GraphNodeCategory(String);
+#[derive(Component, Clone, Default)]
+struct GraphCheckpoint(String);
+
+/// 线段命中目标记录画布版本，跨帧旧画布的输入不能转移到新子图。
+#[derive(Component, Clone, Default)]
+struct GraphEdgeMarker {
+    index: usize,
+    version: u64,
+}
+
+/// 可见线段和箭头共用源边身份，以便整条路径同时高亮。
+#[derive(Component, Clone, Default)]
+struct GraphEdgeVisual {
+    index: usize,
+    back: bool,
+}
+
+#[derive(Resource, Default)]
+struct HoveredEdge(Option<usize>, u64);
+
 /// 详情栏插槽只更新选中节点，画布及其滚动位置保持不变。
 #[derive(Component, Clone, Default)]
 struct GraphDetailSlot {
-    rendered: Option<(u64, Option<String>)>,
+    rendered: Option<(u64, Option<String>, Option<usize>, u64)>,
 }
 
 /// 画布刚建好、水平滚动还停在最左，等布局出尺寸后挪到中间
@@ -141,8 +188,8 @@ struct ViewSwitchBuilt;
 struct RenderedGraph {
     /// 已渲染的浏览版本
     nav: Option<u64>,
-    /// 已渲染时对应的数据结构版本
-    structure: Option<u64>,
+    /// 已渲染时对应的文档加载代次，context 创建位姿不影响流程导航。
+    document: Option<u64>,
 }
 
 // ============================================================
@@ -150,38 +197,89 @@ struct RenderedGraph {
 // ============================================================
 
 /// 整个流程图面板
-fn graph_pane(graph: &SubGraph, nav: &GraphNav) -> Vec<BoxedScene> {
+fn graph_pane(
+    graph: &SubGraph,
+    nav: &GraphNav,
+    state: Option<&canvas_edit::CanvasState>,
+) -> Vec<BoxedScene> {
     let Some(current) = graph.subgraph_at(&nav.path) else {
         return vec![boxed(widgets::hint("这一层已不存在，请返回上一层"))];
     };
     let placed = graph_layout::layout(current);
-    vec![
-        boxed(toolbar(graph, nav, current)),
-        boxed(bsn! {
+    let mut content = vec![boxed(toolbar(graph, nav, current, placed.as_ref().ok()))];
+    content.push(boxed(bsn! {
+        Node { width: percent(100), flex_shrink: 0.0 }
+        GraphEditToolbarSlot
+    }));
+    content.push(boxed(canvas_edit::controls()));
+    if !current.diagnostics.is_empty() {
+        let messages = current
+            .diagnostics
+            .iter()
+            .map(|issue| format!("{}：{}", issue.path, issue.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        content.push(boxed(bsn! {
             Node {
-                width: percent(100),
-                flex_grow: 1.0,
-                flex_direction: FlexDirection::Row,
-                min_height: px(0),
+                max_height: px(160),
+                flex_shrink: 0.0,
+                padding: {UiRect::axes(px(theme::PAD), px(6))},
+                overflow: {Overflow::scroll_y()},
             }
-            Children [
-                (canvas(current, &placed, nav)),
-                (
-                    Node {
-                        display: Display::None,
-                        width: {px(DETAIL_W)},
-                        flex_shrink: 0.0,
-                        height: percent(100),
-                    }
-                    GraphDetailSlot
-                )
-            ]
-        }),
-    ]
+            ScrollArea
+            Children [(details::text_section(
+                format!("结构诊断 · {} 项（原始文件内容保留）", current.diagnostics.len()),
+                messages,
+            ))]
+        }));
+    }
+    let placed = match placed {
+        Ok(placed) => placed,
+        Err(error) => {
+            content.push(boxed(widgets::hint(format!(
+                "本层无法绘制：{error}。请修正源文件后重新加载；其他 context 参数仍可查看和保存。"
+            ))));
+            return content;
+        }
+    };
+    content.push(boxed(bsn! {
+        Node {
+            width: percent(100),
+            flex_grow: 1.0,
+            flex_direction: FlexDirection::Row,
+            min_height: px(0),
+        }
+        Children [
+            (canvas(current, state.filter(|state| state.layout_error.is_none()).map_or(&placed, |state| &state.layout), nav)),
+            (
+                Node {
+                    display: Display::None,
+                    width: {px(DETAIL_W)},
+                    flex_shrink: 0.0,
+                    height: percent(100),
+                }
+                GraphDetailSlot
+            ),
+            (
+                Node {
+                    display: Display::None,
+                    width: {px(DETAIL_W)}, min_width: {px(DETAIL_W)},
+                    flex_shrink: 0.0, height: percent(100), min_height: px(0),
+                }
+                GraphEditPanelSlot
+            )
+        ]
+    }));
+    content
 }
 
 /// 顶部：面包屑 + 本层统计 + 图例
-fn toolbar(graph: &SubGraph, nav: &GraphNav, current: &SubGraph) -> impl Scene {
+fn toolbar(
+    graph: &SubGraph,
+    nav: &GraphNav,
+    current: &SubGraph,
+    placed: Option<&GraphLayout>,
+) -> impl Scene {
     let mut crumbs: Vec<BoxedScene> = vec![boxed(crumb("根", 0, nav.path.is_empty()))];
     for (i, id) in nav.path.iter().enumerate() {
         crumbs.push(boxed(widgets::readonly_value("›")));
@@ -193,14 +291,37 @@ fn toolbar(graph: &SubGraph, nav: &GraphNav, current: &SubGraph) -> impl Scene {
         .iter()
         .filter(|n| n.children.is_some())
         .count();
+    let (source_nodes, source_edges) = current
+        .source_counts
+        .unwrap_or((current.nodes.len(), current.edges.len()));
+    let (drawn_nodes, drawn_edges) = placed.map_or((0, 0), |layout| {
+        (
+            layout
+                .nodes
+                .iter()
+                .filter(|node| node.slot == NodeSlot::Real)
+                .count(),
+            layout.edges.len(),
+        )
+    });
     let summary = format!(
-        "本层 {} 节点 · {} 边 · 可下钻 {}　全图 {} 节点 / {} 层",
-        current.nodes.len(),
-        current.edges.len(),
-        composite,
+        "本层原始 {source_nodes} 节点 / {source_edges} 边 · 可绘制 {drawn_nodes} 节点 / {drawn_edges} 边 · 可下钻 {composite}　全图已识别 {} 节点 / {} 层 · {} 项诊断",
         graph.total_nodes(),
-        graph.depth()
+        graph.depth(),
+        graph.diagnostic_count()
     );
+    let parallel_note: Vec<BoxedScene> = nav
+        .path
+        .split_last()
+        .and_then(|(id, parent)| graph.subgraph_at(parent)?.node(id))
+        .filter(|node| node.node_type == "parallel")
+        .map(|_| {
+            boxed(widgets::hint(
+                "parallel 的直接子节点并行执行；本层连线不控制执行顺序。",
+            ))
+        })
+        .into_iter()
+        .collect();
 
     bsn! {
         Node {
@@ -235,9 +356,10 @@ fn toolbar(graph: &SubGraph, nav: &GraphNav, current: &SubGraph) -> impl Scene {
                 Children [
                     (widgets::hint(summary)),
                     (legend()),
-                    (widgets::hint("点击节点查看输入参数，再点一次进入子图"))
+                    (widgets::hint("点击节点查看参数，详情按钮进入子图；悬停连线追踪路径，点击查看起终点"))
                 ]
-            )
+            ),
+            {parallel_note}
         ]
     }
 }
@@ -306,11 +428,10 @@ fn legend() -> impl Scene {
 
 /// 画布：节点与边都绝对定位在同一个坐标系里
 fn canvas(current: &SubGraph, placed: &GraphLayout, nav: &GraphNav) -> impl Scene {
-    let mut items: Vec<BoxedScene> = Vec::new();
-    // 边先入，压在节点下面
-    for e in &placed.edges {
-        items.extend(edge_scene(e));
-    }
+    let mut items: Vec<BoxedScene> = vec![boxed(bsn! {
+        Node { position_type: PositionType::Absolute, width: percent(100), height: percent(100) }
+        canvas_edit::CanvasEdges
+    })];
     for p in &placed.nodes {
         let node = current.node(&p.id);
         items.push(boxed(node_scene(
@@ -318,6 +439,22 @@ fn canvas(current: &SubGraph, placed: &GraphLayout, nav: &GraphNav) -> impl Scen
             node,
             nav.selected.as_deref() == Some(p.id.as_str()),
         )));
+    }
+    for node in &placed.nodes {
+        if node.slot != NodeSlot::Entry {
+            items.push(canvas_edit::port_scene(
+                &node.id,
+                true,
+                node.pos + Vec2::new(NODE_W / 2.0, 0.0),
+            ));
+        }
+        if node.slot != NodeSlot::Exit {
+            items.push(canvas_edit::port_scene(
+                &node.id,
+                false,
+                node.pos + Vec2::new(NODE_W / 2.0, NODE_H),
+            ));
+        }
     }
 
     let (w, h) = (placed.size.x, placed.size.y);
@@ -328,7 +465,8 @@ fn canvas(current: &SubGraph, placed: &GraphLayout, nav: &GraphNav) -> impl Scen
             min_width: px(0),
             overflow: {Overflow::scroll()},
         }
-        ScrollArea
+        ScrollPosition::default()
+        canvas_edit::CanvasViewport({nav.version})
         CanvasNeedsCenter
         Children [(
             Node {
@@ -336,7 +474,16 @@ fn canvas(current: &SubGraph, placed: &GraphLayout, nav: &GraphNav) -> impl Scen
                 height: {px(h)},
                 flex_shrink: 0.0,
             }
-            Children [{items}]
+            canvas_edit::CanvasExtent
+            Children [(
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0), top: px(0), width: {px(w)}, height: {px(h)},
+                }
+                UiTransform::default()
+                canvas_edit::CanvasContent
+                Children [{items}]
+            )]
         )]
     }
 }
@@ -367,30 +514,35 @@ fn node_scene(
             }
             ThemeBackgroundColor({theme::CARD_HEADER_BG})
             ThemeBorderColor({theme::GRAPH_BORDER})
+            template_value(canvas_edit::CanvasItem(placed.id.clone()))
             Children [(widgets::readonly_value(label))]
         });
     };
 
-    let kids = node.children.as_ref().map(|c| c.nodes.len()).unwrap_or(0);
-    let badge: Vec<BoxedScene> = (kids > 0)
-        .then(|| boxed(widgets::badge(format!("{kids} ▸"))))
-        .into_iter()
-        .collect();
-    let ckpt: Vec<BoxedScene> = node
-        .checkpoint
-        .then(|| {
-            boxed(bsn! {
-                Node {
-                    width: px(7),
-                    height: px(7),
-                    border_radius: {BorderRadius::all(px(4.0))},
-                    flex_shrink: 0.0,
-                }
-                ThemeBackgroundColor({theme::CHECKPOINT_DOT})
-            })
+    let badge: Vec<BoxedScene> = node
+        .children
+        .as_ref()
+        .map(|children| {
+            let issues = children.diagnostic_count();
+            let label = match issues {
+                0 => format!("{} ▸", children.nodes.len()),
+                _ => format!("问题 {issues} ▸"),
+            };
+            boxed(widgets::badge(label))
         })
         .into_iter()
         .collect();
+    let ckpt = boxed(bsn! {
+        Node {
+            display: {if node.checkpoint { Display::Flex } else { Display::None }},
+            width: px(7),
+            height: px(7),
+            border_radius: {BorderRadius::all(px(4.0))},
+            flex_shrink: 0.0,
+        }
+        ThemeBackgroundColor({theme::CHECKPOINT_DOT})
+        template_value(GraphCheckpoint(node.id.clone()))
+    });
 
     let border = match selected {
         true => theme::GRAPH_SELECTED_BORDER,
@@ -418,6 +570,7 @@ fn node_scene(
         }
         Button
         template_value(GraphNodeMarker(node.id.clone()))
+        template_value(canvas_edit::CanvasItem(node.id.clone()))
         ThemeBackgroundColor({background})
         ThemeBorderColor({border})
         Children [
@@ -429,6 +582,7 @@ fn node_scene(
                     flex_shrink: 0.0,
                 }
                 ThemeBackgroundColor({category_token(&node.node_type)})
+                template_value(GraphNodeCategory(node.id.clone()))
             ),
             (
                 Node {
@@ -441,6 +595,7 @@ fn node_scene(
                     (
                         Text({node.id.clone()})
                         GraphNodeLabel({theme::SECTION_TEXT})
+                        template_value(GraphNodeText { id: node.id.clone(), kind: false })
                         ThemeTextColor({theme::SECTION_TEXT})
                         TextFont { font_size: px(11.5) }
                         TextLayout { linebreak: {LineBreak::AnyCharacter} }
@@ -448,196 +603,16 @@ fn node_scene(
                     (
                         Text({node.node_type.clone()})
                         GraphNodeLabel({theme::READONLY_TEXT})
+                        template_value(GraphNodeText { id: node.id.clone(), kind: true })
                         ThemeTextColor({theme::READONLY_TEXT})
                         TextFont { font_size: px(10.0) }
                     )
                 ]
             ),
-            {ckpt},
+            (ckpt),
             {badge}
         ]
     })
-}
-
-/// 一条边：折线拆成若干水平/垂直的细矩形，终点补箭头
-fn edge_scene(edge: &PlacedEdge) -> Vec<BoxedScene> {
-    let token = match edge.back {
-        true => theme::GRAPH_BACK,
-        false => theme::GRAPH_BORDER,
-    };
-    let mut parts: Vec<BoxedScene> = edge
-        .points
-        .windows(2)
-        .map(|pair| {
-            let (a, b) = (pair[0], pair[1]);
-            let left = a.x.min(b.x) - EDGE_W / 2.0;
-            let top = a.y.min(b.y) - EDGE_W / 2.0;
-            let width = (a.x - b.x).abs().max(EDGE_W);
-            let height = (a.y - b.y).abs().max(EDGE_W);
-            boxed(bsn! {
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: {px(left)},
-                    top: {px(top)},
-                    width: {px(width)},
-                    height: {px(height)},
-                }
-                ThemeBackgroundColor({token.clone()})
-            })
-        })
-        .collect();
-
-    // 箭头落在终点，方向取最后一段
-    if let (Some(&end), Some(&prev)) = (
-        edge.points.last(),
-        edge.points.get(edge.points.len().wrapping_sub(2)),
-    ) {
-        let horizontal = (end.y - prev.y).abs() < f32::EPSILON;
-        let (glyph, dx, dy) = match (horizontal, end.x < prev.x, end.y < prev.y) {
-            (true, true, _) => ("◀", -9.0, -6.0),
-            (true, false, _) => ("▶", -3.0, -6.0),
-            (false, _, true) => ("▲", -5.0, -9.0),
-            (false, _, false) => ("▼", -5.0, -4.0),
-        };
-        parts.push(boxed(bsn! {
-            Node {
-                position_type: PositionType::Absolute,
-                left: {px(end.x + dx)},
-                top: {px(end.y + dy)},
-            }
-            Text(glyph)
-            ThemeTextColor({token})
-            TextFont { font_size: px(9.0) }
-        }));
-    }
-    parts
-}
-
-/// 右侧详情：选中节点的输入参数
-fn detail_panel(node: &TaskNode) -> impl Scene {
-    let body: Vec<BoxedScene> = {
-        let mut rows: Vec<BoxedScene> = vec![
-            boxed(wrapping_title(node.id.clone())),
-            boxed(widgets::row(
-                6.0,
-                vec![
-                    boxed(bsn! {
-                        Node {
-                            width: px(9),
-                            height: px(9),
-                            border_radius: {BorderRadius::all(px(2.0))},
-                            flex_shrink: 0.0,
-                        }
-                        ThemeBackgroundColor({category_token(&node.node_type)})
-                    }),
-                    boxed(widgets::readonly_value(node.node_type.clone())),
-                ],
-            )),
-        ];
-        if node.checkpoint {
-            rows.push(boxed(widgets::badge("checkpoint")));
-        }
-        rows.push(boxed(bsn! {
-            Node {
-                width: percent(100),
-                height: px(1),
-                margin: {UiRect::vertical(px(4.0))},
-                flex_shrink: 0.0,
-            }
-            ThemeBackgroundColor({theme::DIVIDER})
-        }));
-
-        match node.inputs.as_object() {
-            Some(map) if !map.is_empty() => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                for k in keys {
-                    let raw = match &map[k] {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    rows.push(boxed(detail_row(k, clip(&raw, 300))));
-                }
-            }
-            _ => rows.push(boxed(widgets::hint("该节点没有输入参数"))),
-        }
-
-        if let Some(children) = &node.children {
-            rows.push(boxed(widgets::button(
-                format!("进入子图 · {} 节点", children.nodes.len()),
-                ButtonVariant::Primary,
-                DrillButton(node.id.clone()),
-            )));
-        }
-        rows
-    };
-
-    bsn! {
-        Node {
-            width: {px(DETAIL_W)},
-            flex_shrink: 0.0,
-            height: percent(100),
-            flex_direction: FlexDirection::Column,
-            row_gap: px(6),
-            padding: {UiRect::all(px(theme::PAD))},
-            border: {UiRect::left(px(1.0))},
-            overflow: {Overflow::scroll_y()},
-        }
-        ScrollArea
-        ThemeBackgroundColor({theme::SIDEBAR_BG})
-        BorderColor::all(Color::NONE)
-        Children [{body}]
-    }
-}
-
-/// 截断过长文本
-/// 详情栏标题：节点 id 是无空格标识符，必须允许逐字符断行，否则顶破面板宽度
-fn wrapping_title(text: impl Into<String>) -> impl Scene {
-    bsn! {
-        Text({text.into()})
-        ThemeTextColor({theme::SECTION_TEXT})
-        TextFont {
-            font_size: px(12.0),
-            weight: {FontWeight::BOLD}
-        }
-        TextLayout { linebreak: {LineBreak::AnyCharacter} }
-    }
-}
-
-/// 详情栏的一行输入参数：标签在上、值在下
-///
-/// 不复用 [`widgets::field_row`]——那是给参数编辑器用的横排布局，
-/// 标签列固定 190px，塞进 300px 的详情栏只剩一条缝给值。
-fn detail_row(key: impl Into<String>, value: impl Into<String>) -> impl Scene {
-    bsn! {
-        Node {
-            flex_direction: FlexDirection::Column,
-            width: percent(100),
-            row_gap: px(1),
-            padding: {UiRect::vertical(px(3.0))},
-        }
-        Children [
-            (
-                Text({key.into()})
-                ThemeTextColor({theme::FIELD_LABEL})
-                TextFont { font_size: px(10.5) }
-                TextLayout { linebreak: {LineBreak::AnyCharacter} }
-            ),
-            (
-                Text({value.into()})
-                ThemeTextColor({theme::READONLY_TEXT})
-                TextFont { font_size: px(11.5) }
-                TextLayout { linebreak: {LineBreak::AnyCharacter} }
-            )
-        ]
-    }
-}
-
-fn clip(text: &str, max: usize) -> String {
-    match text.chars().count() > max {
-        true => text.chars().take(max - 1).chain(['…']).collect(),
-        false => text.to_string(),
-    }
 }
 
 // ============================================================
@@ -667,26 +642,57 @@ fn sync_view_mode(
     }
 }
 
-/// 换文件后回到根层
+/// 文档加载才重置导航；context 的结构和数值变化不影响流程视口。
 fn reset_on_reload(
     editor: Res<Editor>,
     mut nav: ResMut<GraphNav>,
     mut rendered: ResMut<RenderedGraph>,
 ) {
-    if rendered.structure == Some(editor.structure_version) {
+    if rendered.document == Some(editor.document_version) {
+        // 防御性修复失效路径，保留最近仍存在的祖先；普通参数输入不推进导航版本。
+        if editor.is_changed()
+            && let Some(data) = &editor.data
+        {
+            let mut depth = nav.path.len();
+            while data.graph.subgraph_at(&nav.path[..depth]).is_none() && depth > 0 {
+                depth -= 1;
+            }
+            if depth != nav.path.len() {
+                nav.go_to(depth);
+            }
+            if let Some(graph) = data.graph.subgraph_at(&nav.path) {
+                if nav
+                    .selected
+                    .as_deref()
+                    .is_some_and(|id| graph.node(id).is_none())
+                {
+                    nav.selected = None;
+                }
+                if nav
+                    .selected_edge
+                    .is_some_and(|index| index >= graph.edges.len())
+                {
+                    nav.selected_edge = None;
+                }
+            }
+        }
         return;
     }
-    rendered.structure = Some(editor.structure_version);
+    rendered.document = Some(editor.document_version);
     nav.reset();
 }
 
-/// 按浏览状态重建流程图
+/// 按浏览状态重建流程图；后代插槽的异步场景落地前必须保留父树。
+#[allow(clippy::too_many_arguments)]
 fn rebuild_graph(
     editor: Res<Editor>,
+    canvas: Option<Res<canvas_edit::CanvasState>>,
     nav: Res<GraphNav>,
     mut rendered: ResMut<RenderedGraph>,
     slots: Query<Entity, With<GraphSlot>>,
     pending: Query<(), With<widgets::SlotPending>>,
+    children: Query<&Children>,
+    proxy: Option<Res<bevy::winit::EventLoopProxyWrapper>>,
     mut commands: Commands,
 ) {
     let Ok(slot) = slots.single() else {
@@ -695,13 +701,34 @@ fn rebuild_graph(
     if rendered.nav == Some(nav.version) {
         return;
     }
-    if pending.contains(slot) {
+    if pending.contains(slot)
+        || children
+            .iter_descendants(slot)
+            .any(|child| pending.contains(child))
+    {
+        // BSN 队列中的 ChildOf 仍指向旧插槽。先让子场景完成，下一帧再整体销毁，避免孤儿 UI。
+        // SlotPending 在本阶段之后才摘除，主动唤醒下一帧，不能等 reactive 的五秒空闲周期。
+        if let Some(proxy) = &proxy {
+            let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
+        }
         return;
     }
     rendered.nav = Some(nav.version);
 
     let content = match &editor.data {
-        Some(data) => graph_pane(&data.graph, &nav),
+        Some(data) => {
+            let children = graph_pane(&data.graph, &nav, canvas.as_deref());
+            vec![boxed(bsn! {
+                Node {
+                    width: percent(100),
+                    height: percent(100),
+                    min_height: px(0),
+                    flex_direction: FlexDirection::Column,
+                }
+                GraphSceneVersion({nav.version})
+                Children [{children}]
+            })]
+        }
         None => vec![boxed(widgets::hint("请先从左侧选择一个文件"))],
     };
     widgets::replace_slot_children(&mut commands, slot, content);
@@ -710,16 +737,37 @@ fn rebuild_graph(
 /// 选中变化只改颜色，保留画布和输入状态；跨帧新增的图卡与文字也同步当前选择。
 fn sync_node_selection(
     nav: Res<GraphNav>,
+    editor: Option<Res<Editor>>,
+    editing: Option<Res<GraphEditing>>,
     nodes: Query<(Entity, Ref<GraphNodeMarker>)>,
     labels: Query<(Entity, Ref<GraphNodeLabel>)>,
     parents: Query<&ChildOf>,
     mut commands: Commands,
 ) {
+    let selected = |id: &str| {
+        let in_selection = editor
+            .as_ref()
+            .and_then(|editor| editor.data.as_ref())
+            .is_some_and(|data| {
+                data.graph_edit
+                    .graph_key_at(&nav.path)
+                    .and_then(|graph| data.graph_edit.node_key(graph, id))
+                    .is_some_and(|key| {
+                        editing.as_ref().is_some_and(|editing| {
+                            editing.enabled && editing.selected_nodes.contains(&key)
+                        })
+                    })
+            });
+        in_selection || nav.selected.as_deref() == Some(id)
+    };
     for (entity, marker) in &nodes {
-        if !nav.is_changed() && !marker.is_added() {
+        if !nav.is_changed()
+            && !editing.as_ref().is_some_and(|editing| editing.is_changed())
+            && !marker.is_added()
+        {
             continue;
         }
-        let (background, border) = match nav.selected.as_deref() == Some(marker.0.as_str()) {
+        let (background, border) = match selected(&marker.0) {
             true => (theme::GRAPH_SELECTED_BG, theme::GRAPH_SELECTED_BORDER),
             false => (theme::CARD_BG, theme::GRAPH_BORDER),
         };
@@ -728,7 +776,10 @@ fn sync_node_selection(
             .insert((ThemeBackgroundColor(background), ThemeBorderColor(border)));
     }
     for (entity, label) in &labels {
-        if !nav.is_changed() && !label.is_added() {
+        if !nav.is_changed()
+            && !editing.as_ref().is_some_and(|editing| editing.is_changed())
+            && !label.is_added()
+        {
             continue;
         }
         let Some(card) =
@@ -739,7 +790,7 @@ fn sync_node_selection(
         let Ok((_, marker)) = nodes.get(card) else {
             continue;
         };
-        let color = match nav.selected.as_deref() == Some(marker.0.as_str()) {
+        let color = match selected(&marker.0) {
             true => theme::GRAPH_SELECTED_TEXT,
             false => label.0.clone(),
         };
@@ -747,16 +798,92 @@ fn sync_node_selection(
     }
 }
 
+/// 属性编辑只刷新已有标签、类别色条和 checkpoint，不重建卡片或画布。
+fn sync_node_text(
+    editor: Res<Editor>,
+    nav: Res<GraphNav>,
+    mut labels: Query<(&GraphNodeText, &mut Text)>,
+    categories: Query<(Entity, Ref<GraphNodeCategory>)>,
+    mut checkpoints: Query<(&GraphCheckpoint, &mut Node)>,
+    mut commands: Commands,
+) {
+    let Some(graph) = editor
+        .data
+        .as_ref()
+        .and_then(|data| data.graph.subgraph_at(&nav.path))
+    else {
+        return;
+    };
+    for (label, mut text) in &mut labels {
+        if let Some(node) = graph.node(&label.id) {
+            let value = if label.kind {
+                &node.node_type
+            } else {
+                &node.id
+            };
+            if &text.0 != value {
+                text.0.clone_from(value);
+            }
+        }
+    }
+    for (entity, category) in &categories {
+        if (editor.is_changed() || nav.is_changed() || category.is_added())
+            && let Some(node) = graph.node(&category.0)
+        {
+            commands
+                .entity(entity)
+                .insert(ThemeBackgroundColor(category_token(&node.node_type)));
+        }
+    }
+    for (marker, mut panel) in &mut checkpoints {
+        if let Some(node) = graph.node(&marker.0) {
+            let display = if node.checkpoint {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if panel.display != display {
+                panel.display = display;
+            }
+        }
+    }
+}
+
 /// 独立替换详情内容，不重建拥有 ScrollPosition 的画布。
+#[allow(clippy::too_many_arguments)]
 fn rebuild_detail(
     editor: Res<Editor>,
     nav: Res<GraphNav>,
+    editing: Res<GraphEditing>,
     mut slots: Query<(Entity, &mut GraphDetailSlot, &mut Node)>,
     pending: Query<(), With<widgets::SlotPending>>,
+    parents: Query<&ChildOf>,
+    versions: Query<&GraphSceneVersion>,
     mut commands: Commands,
 ) {
-    let state = (nav.version, nav.selected.clone());
+    let revision = editor
+        .data
+        .as_ref()
+        .map_or(0, |data| data.graph_edit.revision());
+    let state = (
+        nav.version,
+        nav.selected.clone(),
+        nav.selected_edge,
+        revision,
+    );
     for (entity, mut slot, mut panel) in &mut slots {
+        if stale_scene(entity, nav.version, &parents, &versions) {
+            panel.display = Display::None;
+            continue;
+        }
+        if editing.enabled {
+            panel.display = Display::None;
+            continue;
+        }
+        panel.display = match nav.selected.is_some() || nav.selected_edge.is_some() {
+            true => Display::Flex,
+            false => Display::None,
+        };
         if slot.rendered.as_ref() == Some(&state) || pending.contains(entity) {
             continue;
         }
@@ -768,11 +895,33 @@ fn rebuild_detail(
         let content = match selected {
             Some(node) => {
                 panel.display = Display::Flex;
-                vec![boxed(detail_panel(node))]
+                let raw = editor.data.as_ref().and_then(|data| {
+                    let graph = data.graph_edit.graph_key_at(&nav.path)?;
+                    let key = data.graph_edit.node_key(graph, &node.id)?;
+                    data.graph_edit.node_json(key)
+                });
+                vec![boxed(details::detail_panel(node, raw))]
             }
             None => {
-                panel.display = Display::None;
-                Vec::new()
+                let edge = editor.data.as_ref().and_then(|data| {
+                    let graph = data.graph.subgraph_at(&nav.path)?;
+                    let index = nav.selected_edge?;
+                    Some((index, graph.edges.get(index)?))
+                });
+                match edge {
+                    Some((index, edge)) => {
+                        panel.display = Display::Flex;
+                        let raw = editor
+                            .data
+                            .as_ref()
+                            .and_then(|data| raw_edge_at(data, &nav.path, index));
+                        vec![boxed(edge_detail_panel(index, edge, raw))]
+                    }
+                    None => {
+                        panel.display = Display::None;
+                        Vec::new()
+                    }
+                }
             }
         };
         widgets::replace_slot_children(&mut commands, entity, content);
@@ -780,40 +929,186 @@ fn rebuild_detail(
     }
 }
 
-/// 点击节点：选中；再点一次带子图的节点则下钻
-fn handle_node_press(
-    nodes: Query<(&Interaction, &GraphNodeMarker), Changed<Interaction>>,
-    editor: Res<Editor>,
+/// 根据已验证的同层 ID 查找原始容器，未知节点字段不需要经过展示模型重建。
+fn raw_subgraph_at<'a>(
+    data: &'a crate::model::TaskGraphData,
+    path: &[String],
+) -> Option<&'a serde_json::Value> {
+    data.graph_edit
+        .graph_key_at(path)
+        .and_then(|key| data.graph_edit.graph_json(key))
+}
+
+/// 展示索引对应解析后边数组；缺失字符串端点的原始条目不进入该数组。
+fn raw_edge_at<'a>(
+    data: &'a crate::model::TaskGraphData,
+    path: &[String],
+    index: usize,
+) -> Option<(usize, &'a serde_json::Value)> {
+    raw_subgraph_at(data, path)?
+        .get("edges")?
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| {
+            value.get("from").and_then(|v| v.as_str()).is_some()
+                && value.get("to").and_then(|v| v.as_str()).is_some()
+        })
+        .nth(index)
+}
+
+fn edge_detail_panel(
+    index: usize,
+    edge: &crate::model::GraphEdge,
+    raw: Option<(usize, &serde_json::Value)>,
+) -> impl Scene {
+    let source_index = raw.map_or(index, |(index, _)| index);
+    let raw_section: Vec<BoxedScene> = raw
+        .map(|(_, value)| {
+            let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+            boxed(details::text_section("原始连接 JSON", text))
+        })
+        .into_iter()
+        .collect();
+    bsn! {
+        Node {
+            width: {px(DETAIL_W)},
+            height: percent(100),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(6),
+            padding: {UiRect::all(px(theme::PAD))},
+            overflow: {Overflow::scroll_y()},
+        }
+        ScrollArea
+        ThemeBackgroundColor({theme::SIDEBAR_BG})
+        Children [
+            (widgets::subheading(format!("连接 · 第 {} 条", source_index + 1))),
+            (details::text_section("起点", edge.from.clone())),
+            (details::text_section("终点", edge.to.clone())),
+            (widgets::hint("高亮路径连接以上两个端点；同端点的多条连接也可分别选择。")),
+            {raw_section}
+        ]
+    }
+}
+
+/// 悬停时追踪整条路径，点击后保留选择；选边不重建画布。
+fn handle_edge_interaction(
+    edges: Query<(&Interaction, &GraphEdgeMarker)>,
     mut nav: ResMut<GraphNav>,
+    mut hovered: ResMut<HoveredEdge>,
+    editing: Option<Res<GraphEditing>>,
+    guard: Option<Res<DocumentGuard>>,
 ) {
-    for (state, marker) in &nodes {
-        if *state != Interaction::Pressed {
+    if guard.as_ref().is_some_and(|guard| guard.active()) {
+        hovered.0 = None;
+        return;
+    }
+    let mut active = None;
+    let mut pressed = None;
+    for (interaction, edge) in &edges {
+        if edge.version != nav.version {
             continue;
         }
-        let already = nav.selected.as_deref() == Some(marker.0.as_str());
-        let composite = editor.data.as_ref().is_some_and(|d| {
-            d.graph
-                .subgraph_at(&nav.path)
-                .and_then(|g| g.node(&marker.0))
-                .is_some_and(|n| n.children.is_some())
-        });
-        // 选中态下再点一次复合节点就进去，省得非要点右边那个按钮
-        match already && composite {
-            true => nav.enter(&marker.0),
+        match interaction {
+            Interaction::Pressed => pressed = Some(edge.index),
+            Interaction::Hovered => active = Some(edge.index),
+            Interaction::None => {}
+        }
+    }
+    if let Some(index) =
+        pressed.filter(|_| !editing.as_ref().is_some_and(|editing| editing.enabled))
+        && (nav.selected.is_some() || nav.selected_edge != Some(index))
+    {
+        nav.selected = None;
+        nav.selected_edge = Some(index);
+    }
+    let active = pressed.or(active);
+    if hovered.0 != active {
+        hovered.0 = active;
+    }
+    if hovered.1 != nav.version {
+        hovered.1 = nav.version;
+    }
+}
+
+fn sync_edge_selection(
+    nav: Res<GraphNav>,
+    hovered: Res<HoveredEdge>,
+    visuals: Query<(Entity, Ref<GraphEdgeVisual>, Has<Text>)>,
+    mut commands: Commands,
+) {
+    let active = match hovered.1 == nav.version {
+        true => hovered.0.or(nav.selected_edge),
+        false => nav.selected_edge,
+    };
+    for (entity, edge, text) in &visuals {
+        if !nav.is_changed() && !hovered.is_changed() && !edge.is_added() {
+            continue;
+        }
+        let token = match (active == Some(edge.index), edge.back) {
+            (true, _) => theme::GRAPH_SELECTED_BORDER,
+            (false, true) => theme::GRAPH_BACK,
+            (false, false) => theme::GRAPH_BORDER,
+        };
+        match text {
+            true => {
+                commands.entity(entity).insert(ThemeTextColor(token));
+            }
             false => {
-                nav.selected = Some(marker.0.clone());
+                commands.entity(entity).insert(ThemeBackgroundColor(token));
             }
         }
     }
 }
 
-/// 面包屑使用原生 UI Button，继续由 Interaction 驱动。
-fn handle_nav_press(
-    crumbs: Query<(&Interaction, &CrumbMarker), Changed<Interaction>>,
+/// 浏览按下仅选中；下钻由完成的双击或详情按钮触发，避免拖动前误进入子图。
+fn handle_node_press(
+    nodes: Query<(Entity, &Interaction, &GraphNodeMarker), Changed<Interaction>>,
+    parents: Query<&ChildOf>,
+    versions: Query<&GraphSceneVersion>,
+    editor: Res<Editor>,
+    editing: Option<Res<GraphEditing>>,
+    guard: Option<Res<DocumentGuard>>,
     mut nav: ResMut<GraphNav>,
 ) {
-    for (state, crumb) in &crumbs {
-        if *state == Interaction::Pressed {
+    if editing.as_ref().is_some_and(|editing| editing.enabled)
+        || guard.as_ref().is_some_and(|guard| guard.active())
+    {
+        return;
+    }
+    for (entity, state, marker) in &nodes {
+        if *state != Interaction::Pressed
+            || !current_scene(entity, nav.version, &parents, &versions)
+        {
+            continue;
+        }
+        let node = editor.data.as_ref().and_then(|d| {
+            d.graph
+                .subgraph_at(&nav.path)
+                .and_then(|g| g.node(&marker.0))
+        });
+        let Some(_) = node else {
+            continue;
+        };
+        nav.selected = Some(marker.0.clone());
+        nav.selected_edge = None;
+    }
+}
+
+/// 面包屑使用原生 UI Button，继续由 Interaction 驱动。
+fn handle_nav_press(
+    crumbs: Query<(Entity, &Interaction, &CrumbMarker), Changed<Interaction>>,
+    parents: Query<&ChildOf>,
+    versions: Query<&GraphSceneVersion>,
+    mut nav: ResMut<GraphNav>,
+    guard: Option<Res<DocumentGuard>>,
+) {
+    if guard.as_ref().is_some_and(|guard| guard.active()) {
+        return;
+    }
+    for (entity, state, crumb) in &crumbs {
+        if *state == Interaction::Pressed && current_scene(entity, nav.version, &parents, &versions)
+        {
             nav.go_to(crumb.0);
         }
     }
@@ -823,12 +1118,21 @@ fn handle_nav_press(
 fn handle_drill_activate(
     event: On<Activate>,
     drills: Query<&DrillButton>,
+    parents: Query<&ChildOf>,
+    versions: Query<&GraphSceneVersion>,
     editor: Res<Editor>,
     mut nav: ResMut<GraphNav>,
+    guard: Option<Res<DocumentGuard>>,
 ) {
+    if guard.as_ref().is_some_and(|guard| guard.active()) {
+        return;
+    }
     let Ok(drill) = drills.get(event.entity) else {
         return;
     };
+    if !current_scene(event.entity, nav.version, &parents, &versions) {
+        return;
+    }
     let exists = editor.data.as_ref().is_some_and(|data| {
         data.graph
             .subgraph_at(&nav.path)
@@ -840,13 +1144,47 @@ fn handle_drill_activate(
     }
 }
 
+fn current_scene(
+    entity: Entity,
+    version: u64,
+    parents: &Query<&ChildOf>,
+    versions: &Query<&GraphSceneVersion>,
+) -> bool {
+    widgets::self_or_ancestor(entity, parents, |entity| versions.contains(entity))
+        .and_then(|entity| versions.get(entity).ok())
+        .is_some_and(|scene| scene.0 == version)
+}
+
+/// 独立插槽没有场景代次；若属于画布，则禁止已切走的旧层继续排队生成子场景。
+pub(super) fn stale_scene(
+    entity: Entity,
+    version: u64,
+    parents: &Query<&ChildOf>,
+    versions: &Query<&GraphSceneVersion>,
+) -> bool {
+    widgets::self_or_ancestor(entity, parents, |entity| versions.contains(entity))
+        .and_then(|entity| versions.get(entity).ok())
+        .is_some_and(|scene| scene.0 != version)
+}
+
+fn graph_is_rendered(nav: Res<GraphNav>, rendered: Res<RenderedGraph>) -> bool {
+    rendered.nav == Some(nav.version)
+}
+
 /// 把画布的水平滚动挪到内容中线
 ///
 /// 分层布局把每一层都对齐到内容中线，而滚动位置默认停在最左：
 /// 内容比视口宽时主干会被推到右边缘，右侧的回边通道整条看不见。
 /// 布局尺寸要等 `ui_layout_system` 跑完才有，所以靠标记组件轮询，量到了就居中并摘掉标记。
+#[allow(clippy::type_complexity)]
 fn center_canvas(
-    mut canvas: Query<(Entity, &ComputedNode, &mut ScrollPosition), With<CanvasNeedsCenter>>,
+    mut canvas: Query<
+        (Entity, &ComputedNode, &mut ScrollPosition),
+        (
+            With<CanvasNeedsCenter>,
+            Without<canvas_edit::CanvasViewport>,
+        ),
+    >,
     mut commands: Commands,
 ) {
     for (entity, computed, mut scroll) in &mut canvas {
@@ -861,13 +1199,33 @@ fn center_canvas(
     }
 }
 
+fn sync_edit_panel_visibility(
+    editing: Res<GraphEditing>,
+    mut panels: Query<&mut Node, With<GraphEditPanelSlot>>,
+) {
+    let display = if editing.enabled {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in &mut panels {
+        if node.display != display {
+            node.display = display;
+        }
+    }
+}
+
 /// FeathersButton 没有旧 Interaction 组件，实际点击及键盘触发均发出 Activate。
 fn handle_view_toggle(
     event: On<Activate>,
     toggles: Query<&ViewToggle>,
     mut variants: Query<(&ViewToggle, &mut ButtonVariant)>,
     mut mode: ResMut<ViewMode>,
+    guard: Option<Res<DocumentGuard>>,
 ) {
+    if guard.as_ref().is_some_and(|guard| guard.active()) {
+        return;
+    }
     let Ok(toggle) = toggles.get(event.entity) else {
         return;
     };
@@ -937,32 +1295,57 @@ fn view_switch(current: ViewMode) -> Vec<BoxedScene> {
 /// 流程图视图插件
 pub struct GraphViewPlugin;
 
+/// 属性面板必须在稳定身份、导航与选择修复完成之后读取当前图层。
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct GraphViewPrepared;
+
+/// 子属性面板必须等待父画布替换及其延迟命令完成，再查询仍然存活的插槽。
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct GraphViewRebuilt;
+
 impl Plugin for GraphViewPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ViewMode>()
             .init_resource::<GraphNav>()
             .init_resource::<RenderedGraph>()
+            .init_resource::<HoveredEdge>()
             .add_observer(handle_view_toggle)
             .add_observer(handle_drill_activate)
             .add_systems(
                 Update,
-                (handle_node_press, handle_nav_press).in_set(UiSet::Input),
+                (
+                    handle_edge_interaction,
+                    handle_node_press,
+                    handle_nav_press,
+                    canvas_edit::handle_input,
+                )
+                    .chain()
+                    .in_set(UiSet::Input),
             )
             .add_systems(
                 Update,
                 (
                     reset_on_reload,
-                    rebuild_graph,
-                    sync_node_selection,
+                    canvas_edit::prepare.in_set(GraphViewPrepared),
+                    rebuild_graph.in_set(GraphViewRebuilt),
+                    canvas_edit::sync_geometry.run_if(graph_is_rendered),
+                    canvas_edit::redraw_edges,
+                    canvas_edit::sync_controls,
+                    sync_node_selection.run_if(graph_is_rendered),
+                    sync_node_text.run_if(graph_is_rendered),
+                    sync_edge_selection.run_if(graph_is_rendered),
                     rebuild_detail,
                     build_view_switch,
                     sync_view_switch,
                     sync_view_mode,
+                    sync_edit_panel_visibility,
                     center_canvas,
                 )
                     .chain()
                     .in_set(UiSet::Rebuild),
             );
+        details::register(app);
+        canvas_edit::register(app);
     }
 }
 
@@ -970,7 +1353,7 @@ impl Plugin for GraphViewPlugin {
 mod tests {
     use super::*;
 
-    fn test_editor() -> Editor {
+    pub(super) fn test_editor() -> Editor {
         Editor {
             data: Some(crate::model::parse_task_graph(
                 r#"{"map_id":"m","task_id":"t","config":{"context":{},"nodes":[{"id":"step","type":"sequence","nodes":[{"id":"child","type":"log"}],"edges":[]}],"edges":[]}}"#,
@@ -1002,6 +1385,7 @@ mod tests {
             .world_mut()
             .spawn((
                 GraphNodeMarker("step".into()),
+                GraphSceneVersion(0),
                 Interaction::None,
                 ThemeBorderColor(theme::GRAPH_BORDER),
                 ChildOf(canvas),
@@ -1065,14 +1449,18 @@ mod tests {
     }
 
     #[test]
-    fn 再次点击已选中复合节点才触发下钻重建() {
+    fn 再次点击复合节点不会在拖动前误下钻() {
         let mut app = App::new();
         app.insert_resource(test_editor())
             .init_resource::<GraphNav>()
             .add_systems(Update, handle_node_press);
         let card = app
             .world_mut()
-            .spawn((GraphNodeMarker("step".into()), Interaction::Pressed))
+            .spawn((
+                GraphNodeMarker("step".into()),
+                GraphSceneVersion(0),
+                Interaction::Pressed,
+            ))
             .id();
         app.update();
         assert_eq!(app.world().resource::<GraphNav>().version, 0);
@@ -1081,9 +1469,9 @@ mod tests {
         *app.world_mut().get_mut::<Interaction>(card).unwrap() = Interaction::Pressed;
         app.update();
         let nav = app.world().resource::<GraphNav>();
-        assert_eq!(nav.path, ["step"]);
-        assert!(nav.selected.is_none());
-        assert_eq!(nav.version, 1);
+        assert!(nav.path.is_empty());
+        assert_eq!(nav.selected.as_deref(), Some("step"));
+        assert_eq!(nav.version, 0);
     }
 
     #[test]
@@ -1104,7 +1492,7 @@ mod tests {
     }
 
     /// 真实 BSN/Feathers 按钮和输入分发；不创建原生窗口，不读取用户配置。
-    fn graph_app(editor: Editor) -> App {
+    pub(super) fn graph_app(editor: Editor) -> App {
         use bevy::input::InputPlugin;
         use bevy::input_focus::{InputDispatchPlugin, InputFocus};
         use bevy::scene::ScenePlugin;
@@ -1134,7 +1522,7 @@ mod tests {
         app
     }
 
-    fn settle_scenes(app: &mut App) {
+    pub(super) fn settle_scenes(app: &mut App) {
         for _ in 0..4 {
             app.update();
         }
@@ -1379,25 +1767,26 @@ mod tests {
     #[test]
     fn 详情feathers按钮文字可下钻且原生面包屑仍能返回() {
         let mut app = graph_app(test_editor());
+        app.world_mut().spawn((GraphSlot, Node::default()));
+        settle_scenes(&mut app);
+        app.world_mut().resource_mut::<GraphNav>().selected = Some("step".into());
+        settle_scenes(&mut app);
         let button = app
             .world_mut()
-            .spawn_scene(widgets::button(
-                "进入子图",
-                ButtonVariant::Primary,
-                DrillButton("step".into()),
-            ))
-            .unwrap()
-            .id();
-        let root_crumb = app
-            .world_mut()
-            .spawn_scene(crumb("根", 0, false))
-            .unwrap()
-            .id();
-        settle_scenes(&mut app);
+            .query_filtered::<Entity, With<DrillButton>>()
+            .single(app.world())
+            .unwrap();
         assert!(app.world().get::<Interaction>(button).is_none());
         click_caption(&mut app, button);
-        app.update();
+        settle_scenes(&mut app);
         assert_eq!(app.world().resource::<GraphNav>().path, ["step"]);
+        let root_crumb = app
+            .world_mut()
+            .query::<(Entity, &CrumbMarker)>()
+            .iter(app.world())
+            .find(|(_, crumb)| crumb.0 == 0)
+            .unwrap()
+            .0;
         *app.world_mut().get_mut::<Interaction>(root_crumb).unwrap() = Interaction::Pressed;
         app.update();
         assert!(app.world().resource::<GraphNav>().path.is_empty());

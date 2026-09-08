@@ -553,6 +553,8 @@ pub enum ButtonGate {
     /// 始终可用
     #[default]
     Always,
+    /// 禁用态只由所属业务系统管理；通用门控不能与业务争写 InteractionDisabled。
+    Managed,
     /// 空闲时可用（忙碌则灰显）
     WhenIdle,
     /// 空闲且已选中位姿时可用
@@ -579,7 +581,7 @@ pub fn button_gated(
 /// 按可用条件增删 `InteractionDisabled`
 ///
 /// Feathers 见到该组件会切灰显样式并拦掉交互，与旧版 `add_enabled(false, ..)` 一致。
-fn sync_button_gates(
+pub(super) fn sync_button_gates(
     session: Res<super::Session>,
     editor: Res<super::Editor>,
     buttons: Query<(Entity, Ref<ButtonGate>, Has<InteractionDisabled>)>,
@@ -594,6 +596,7 @@ fn sync_button_gates(
             continue;
         }
         let enabled = match *gate {
+            ButtonGate::Managed => continue,
             ButtonGate::Always => true,
             ButtonGate::WhenIdle => idle,
             ButtonGate::WhenIdleAndPose => idle && has_pose,
@@ -668,11 +671,13 @@ pub struct WidgetsPlugin;
 
 impl Plugin for WidgetsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_observer(on_header_click).add_systems(
-            Update,
-            (sync_collapse_state, clear_slot_pending, sync_button_gates)
-                .in_set(super::UiSet::Rebuild),
-        );
+        app.add_observer(on_header_click)
+            .add_systems(Update, sync_collapse_state.in_set(super::UiSet::Rebuild))
+            .add_systems(
+                Update,
+                // 等全部重建命令通过 ApplyDeferred 落地后再查询，避免给旧按钮或旧插槽排命令。
+                (clear_slot_pending, sync_button_gates).after(super::UiSet::Rebuild),
+            );
     }
 }
 
@@ -766,5 +771,226 @@ mod tests {
                 .get::<InteractionDisabled>(reconnect_button)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn 连接按钮经历连接失败取消和成功仍复用原实体() {
+        use crate::ui::connect::{ActionButton, ConnectPanelPlugin};
+        use crate::ui::shell::ConnectSlot;
+        use crate::ui::worker_bridge::AppAction;
+        use crate::ui::{Editor, Session, StatusLine, UiSet};
+        use crate::worker::BusyState;
+        use bevy::input::InputPlugin;
+        use bevy::input_focus::tab_navigation::TabIndex;
+        use bevy::input_focus::{FocusCause, InputDispatchPlugin, InputFocus};
+        use bevy::scene::ScenePlugin;
+        use bevy::text::{FontCx, LayoutCx};
+        use bevy::ui::Pressed;
+        use bevy::ui_widgets::{Activate, MenuPlugin};
+
+        fn settle(app: &mut App) {
+            for _ in 0..5 {
+                app.update();
+            }
+        }
+        fn button(app: &mut App, connecting: bool) -> Entity {
+            app.world_mut()
+                .query::<(Entity, &ActionButton)>()
+                .iter(app.world())
+                .find_map(|(entity, action)| {
+                    matches!(
+                        (&action.0, connecting),
+                        (AppAction::Disconnect, true) | (AppAction::Connect, false)
+                    )
+                    .then_some(entity)
+                })
+                .expect("实际连接按钮必须存在")
+        }
+
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            ScenePlugin,
+            InputPlugin,
+            InputDispatchPlugin,
+            MenuPlugin,
+        ))
+        .init_asset::<Font>()
+        .init_asset::<Image>()
+        .init_resource::<InputFocus>()
+        .init_resource::<FontCx>()
+        .init_resource::<LayoutCx>()
+        .init_resource::<bevy::clipboard::Clipboard>()
+        .init_resource::<Editor>()
+        .init_resource::<StatusLine>()
+        .insert_resource(Session::new(
+            crate::model::LoginConfig::default(),
+            Vec::new(),
+        ))
+        .add_message::<AppAction>()
+        .configure_sets(
+            Update,
+            (UiSet::Input, UiSet::Update, UiSet::Rebuild).chain(),
+        )
+        .add_plugins((WidgetsPlugin, ConnectPanelPlugin));
+        app.world_mut()
+            .spawn((Window::default(), bevy::window::PrimaryWindow));
+        app.world_mut().spawn((ConnectSlot, Node::default()));
+        settle(&mut app);
+        let originals: Vec<Entity> = app
+            .world_mut()
+            .query_filtered::<Entity, With<ActionButton>>()
+            .iter(app.world())
+            .collect();
+        assert_eq!(originals.len(), 4);
+        let descendants: Vec<_> = originals
+            .iter()
+            .map(|&entity| {
+                app.world()
+                    .get::<Children>(entity)
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for cancelled in [false, true] {
+            let old = button(&mut app, false);
+            assert!(app.world().get::<InteractionDisabled>(old).is_none());
+            app.world_mut()
+                .resource_mut::<InputFocus>()
+                .set(old, FocusCause::Navigated);
+            app.world_mut().trigger(Activate { entity: old });
+            assert!(
+                app.world_mut()
+                    .resource_mut::<Messages<AppAction>>()
+                    .drain()
+                    .any(|action| matches!(action, AppAction::Connect))
+            );
+            // 无事件循环/worker的夹具只注入生产Connect分支确认后的状态，不访问SSH或用户配置。
+            app.world_mut().entity_mut(old).insert(Pressed);
+            app.world_mut().resource_mut::<Session>().busy = BusyState::Connecting;
+            app.world_mut().resource_mut::<Editor>().load(None);
+            settle(&mut app);
+            assert!(
+                app.world().get::<Node>(old).unwrap().display == Display::None,
+                "连接中隐藏原连接按钮，不销毁实体"
+            );
+            assert!(app.world().get::<InteractionDisabled>(old).is_some());
+            assert!(app.world().get::<Pressed>(old).is_none());
+            let disconnect = button(&mut app, true);
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(disconnect));
+            assert_eq!(app.world().get::<TabIndex>(old).unwrap().0, -1);
+            app.world_mut().trigger(Activate { entity: old });
+            assert_eq!(
+                app.world_mut()
+                    .resource_mut::<Messages<AppAction>>()
+                    .drain()
+                    .count(),
+                0,
+                "隐藏按钮即使收到直接激活，也不能再次连接"
+            );
+            assert!(
+                app.world().get::<InteractionDisabled>(disconnect).is_none(),
+                "连接期间应可取消"
+            );
+            if cancelled {
+                app.world_mut().trigger(Activate { entity: disconnect });
+                assert!(
+                    app.world_mut()
+                        .resource_mut::<Messages<AppAction>>()
+                        .drain()
+                        .any(|action| matches!(action, AppAction::Disconnect))
+                );
+            }
+            // 连接失败回执和主动取消均回到空闲，恢复原来的连接按钮。
+            app.world_mut().resource_mut::<Session>().busy = BusyState::Idle;
+            app.world_mut().resource_mut::<Editor>().load(None);
+            settle(&mut app);
+            assert_eq!(
+                app.world().get::<Node>(disconnect).unwrap().display,
+                Display::None
+            );
+            let restored = button(&mut app, false);
+            assert_eq!(old, restored);
+            assert!(app.world().get::<Pressed>(restored).is_none());
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(restored));
+            assert!(app.world().get::<InteractionDisabled>(restored).is_none());
+        }
+        app.world_mut().resource_mut::<Session>().is_connected = true;
+        settle(&mut app);
+        let disconnect = button(&mut app, true);
+        assert_eq!(
+            app.world().get::<Node>(disconnect).unwrap().display,
+            Display::Flex
+        );
+        let refresh = app
+            .world_mut()
+            .query::<(Entity, &ActionButton)>()
+            .iter(app.world())
+            .find_map(|(entity, action)| {
+                matches!(action.0, AppAction::RefreshFiles).then_some(entity)
+            })
+            .unwrap();
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(refresh, FocusCause::Navigated);
+        app.world_mut().resource_mut::<Session>().busy = BusyState::Refreshing;
+        app.world_mut().entity_mut(refresh).insert(Pressed);
+        // 同帧状态已经变化但禁用组件尚未更新，激活也必须被拒绝。
+        app.world_mut().trigger(Activate { entity: refresh });
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<AppAction>>()
+                .drain()
+                .count(),
+            0
+        );
+        settle(&mut app);
+        assert!(app.world().get::<InteractionDisabled>(refresh).is_some());
+        assert!(app.world().get::<Pressed>(refresh).is_none());
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(disconnect));
+        app.world_mut().resource_mut::<Session>().is_connected = false;
+        app.world_mut().resource_mut::<Session>().busy = BusyState::Idle;
+        app.world_mut().resource_mut::<Session>().reconnect_status = Some("重连中".into());
+        settle(&mut app);
+        assert_eq!(
+            app.world().get::<Node>(disconnect).unwrap().display,
+            Display::Flex
+        );
+        assert!(app.world().get::<InteractionDisabled>(disconnect).is_none());
+        assert_eq!(
+            app.world().get::<Node>(refresh).unwrap().display,
+            Display::None
+        );
+        let text_field = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(text_field, FocusCause::Navigated);
+        app.world_mut().resource_mut::<Session>().reconnect_status = None;
+        settle(&mut app);
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            Some(text_field),
+            "连接状态改变不能抢走表单或其他控件的焦点"
+        );
+        for (index, &entity) in originals.iter().enumerate() {
+            assert_eq!(
+                app.world()
+                    .get::<Children>(entity)
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                descendants[index]
+            );
+        }
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<Entity, With<ActionButton>>()
+                .iter(app.world())
+                .count(),
+            4
+        );
+        assert!(app.world().resource::<Session>().worker.is_none());
     }
 }

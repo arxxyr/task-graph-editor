@@ -9,6 +9,33 @@ use bevy::platform::sync::Mutex;
 use bevy::scene::ScenePlugin;
 use bevy::text::{EditableText, FontCx, LayoutCx, TextEdit};
 
+fn respond(
+    response: WorkerResponse,
+    session: &mut Session,
+    status: &mut StatusLine,
+    browser: &mut FileBrowser,
+    editor: &mut Editor,
+) {
+    handle_response(
+        response,
+        session,
+        status,
+        browser,
+        editor,
+        &DocumentInputSnapshot::default(),
+    );
+}
+
+fn begin_read(session: &mut Session, editor: &mut Editor) -> crate::worker::DocumentReadTicket {
+    let ticket = editor.begin_read(
+        session.connection_generation,
+        DocumentInputSnapshot::default(),
+    );
+    session.pending_read_ticket = Some(ticket);
+    session.busy = BusyState::Loading("next.json".into());
+    ticket
+}
+
 fn session() -> Session {
     let mut session = Session::new(model::LoginConfig::default(), Vec::new());
     session.is_connected = true;
@@ -474,6 +501,72 @@ fn 同帧非法输入不能被创建位姿重建丢弃() {
 }
 
 #[test]
+fn 创建位姿经过真实动作排程保留流程导航而重载同份文档回根() {
+    use crate::ui::graph_view::{GraphNav, GraphViewPlugin};
+
+    let data = model::parse_task_graph(
+        r#"{
+            "map_id": "m", "task_id": "task",
+            "config": {
+                "context": {"waypoint": null},
+                "nodes": [{
+                    "id": "group", "type": "sequence",
+                    "nodes": [{"id": "child", "type": "log", "inputs": {"message": "保留导航"}}],
+                    "edges": [{"from": "_entry", "to": "child"}, {"from": "child", "to": "_exit"}]
+                }],
+                "edges": [{"from": "_entry", "to": "group"}, {"from": "group", "to": "_exit"}]
+            }
+        }"#,
+    )
+    .unwrap();
+    let field_path = context_path(&data, &["waypoint"]);
+    let mut app = submission_app();
+    app.add_plugins(GraphViewPlugin);
+    app.world_mut().resource_mut::<Editor>().load(Some(data));
+    // 先让真实文档加载进入 Rebuild，再模拟使用者已经下钻和选中的状态。
+    app.update();
+    {
+        let mut nav = app.world_mut().resource_mut::<GraphNav>();
+        nav.path = vec!["group".into()];
+        nav.selected = Some("child".into());
+        nav.version += 1;
+    }
+    let editor = app.world().resource::<Editor>();
+    let document_version = editor.document_version;
+    let structure_version = editor.structure_version;
+    let nav_version = app.world().resource::<GraphNav>().version;
+
+    // 写入原始 AppAction，必须经过 InputFlush 放行及 handle_actions 才能创建位姿。
+    app.world_mut()
+        .write_message(AppAction::CreatePose(field_path.clone()));
+    app.update();
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.document_version, document_version);
+    assert_eq!(editor.structure_version, structure_version + 1);
+    let field =
+        model::field_at_path(&editor.data.as_ref().unwrap().context_fields, &field_path).unwrap();
+    assert_eq!(field.value, ContextValue::Pose(RobotPose::default()));
+    assert!(app.world().resource::<PendingActions>().actions.is_empty());
+    let nav = app.world().resource::<GraphNav>();
+    assert_eq!(nav.path, ["group"]);
+    assert_eq!(nav.selected.as_deref(), Some("child"));
+    assert_eq!(nav.version, nav_version);
+
+    // 同内容重新加载仍是新文档代次，不能因为图没变化就沿用旧浏览状态。
+    let same_data = editor.data.clone();
+    app.world_mut().resource_mut::<Editor>().load(same_data);
+    app.update();
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.document_version, document_version + 1);
+    assert_eq!(editor.structure_version, structure_version + 2);
+    let nav = app.world().resource::<GraphNav>();
+    assert!(nav.path.is_empty());
+    assert!(nav.selected.is_none());
+    assert!(nav.selected_edge.is_none());
+    assert_eq!(nav.version, nav_version + 1);
+}
+
+#[test]
 fn 同帧密码和表单输入在认证参数读取前同步() {
     let mut app = submission_app();
     #[derive(Resource, Default)]
@@ -617,8 +710,11 @@ fn 保存旧目录不会把新列表切回去且同步改名来源() {
         selected: None,
         ..default()
     };
-    handle_response(
+    let ticket = editor.next_save_ticket();
+    assert!(editor.begin_save(ticket));
+    respond(
         WorkerResponse::FileSaved {
+            ticket,
             remote_dir: "/A".into(),
             old_filename: "task.json".into(),
             new_filename: Some("renamed.json".into()),
@@ -644,8 +740,10 @@ fn 删除其他目录的同名文件不清空文档() {
         remote_dir: Some("/B".into()),
         ..default()
     };
-    handle_response(
+    let ticket = begin_read(&mut session, &mut editor);
+    respond(
         WorkerResponse::FileDeleted {
+            ticket,
             remote_dir: "/B".into(),
             filename: "task.json".into(),
             file_list: listing("/B", &[]),
@@ -663,8 +761,10 @@ fn 删除其他目录的同名文件不清空文档() {
 fn 加载响应绑定实际目录和连接代次() {
     let mut session = session();
     let mut editor = Editor::default();
-    handle_response(
+    let ticket = begin_read(&mut session, &mut editor);
+    respond(
         WorkerResponse::FileLoaded {
+            ticket,
             remote_dir: "/actual/home/graphs".into(),
             filename: "task.json".into(),
             result: Ok(r#"{"map_id":"m","task_id":"task","config":{"context":{}}}"#.into()),
@@ -688,7 +788,7 @@ fn 加载响应绑定实际目录和连接代次() {
 fn 重连读取域值同时推进表单版本() {
     let mut session = session();
     let version = session.form_version;
-    handle_response(
+    respond(
         WorkerResponse::Reconnected {
             ros_domain_id: Some("56".into()),
             file_list: listing("/A", &["task.json"]),
@@ -709,8 +809,11 @@ fn 保存成功但清理失败保持来源并明确提示() {
     let mut session = session();
     let mut editor = editor();
     let mut status = StatusLine::default();
-    handle_response(
+    let ticket = editor.next_save_ticket();
+    assert!(editor.begin_save(ticket));
+    respond(
         WorkerResponse::FileSaved {
+            ticket,
             remote_dir: "/A".into(),
             old_filename: "task.json".into(),
             new_filename: Some("new.json".into()),
@@ -787,7 +890,7 @@ fn 位姿数组三个取数动作固定原目标且保留其他元素与原始�
                     expected_pose.waist_pose.position.y = 0.299999416;
                 }
             }
-            handle_response(
+            respond(
                 WorkerResponse::CommandOutput(Ok(output.into())),
                 &mut session,
                 &mut status,
@@ -850,7 +953,7 @@ fn 独立与嵌套位姿及嵌套数组均可通过取数动作回填() {
         let (mut session, mut editor, mut status) =
             request_pose(editor, target.clone(), AppAction::FetchChassisPose);
         assert!(editor.has_pose_selection());
-        handle_response(
+        respond(
             WorkerResponse::CommandOutput(Ok(TRACKED_POSE_OUTPUT.into())),
             &mut session,
             &mut status,
@@ -912,7 +1015,7 @@ fn 位姿回填拒绝重载同名同形文档及字段结构变化后的旧响�
                 ),
                 false => editor.mark_structure_changed(),
             }
-            handle_response(
+            respond(
                 WorkerResponse::CommandOutput(Ok(output.into())),
                 &mut session,
                 &mut status,
@@ -948,7 +1051,7 @@ fn 位姿回填拒绝已经删除或改变类型的目标() {
         }
         let expected = data.context_fields.clone();
         let value_version = editor.value_version;
-        handle_response(
+        respond(
             WorkerResponse::CommandOutput(Ok(TRACKED_POSE_OUTPUT.into())),
             &mut session,
             &mut status,
@@ -974,7 +1077,7 @@ fn 位姿获取失败或无法解析时不改变任何数据() {
                 request_pose(editor, target, action.clone());
             let expected = editor.data.as_ref().unwrap().context_fields.clone();
             let value_version = editor.value_version;
-            handle_response(
+            respond(
                 WorkerResponse::CommandOutput(result),
                 &mut session,
                 &mut status,
@@ -1021,7 +1124,7 @@ fn 真实文件位姿数组选择后使用真实底盘输出逐项回填往返()
             path.clone(),
             (index + 1) % poses.len(),
         ));
-        handle_response(
+        respond(
             WorkerResponse::CommandOutput(Ok(output.clone())),
             &mut session,
             &mut status,
@@ -1071,4 +1174,493 @@ fn 真实文件位姿数组选择后使用真实底盘输出逐项回填往返()
         poses.len(),
         poses.len() * 7
     );
+}
+
+fn loaded(
+    ticket: crate::worker::DocumentReadTicket,
+    result: Result<String, String>,
+) -> WorkerResponse {
+    WorkerResponse::FileLoaded {
+        ticket,
+        remote_dir: "/A".into(),
+        filename: "next.json".into(),
+        result,
+    }
+}
+
+fn loaded_content() -> String {
+    r#"{"map_id":"next_map","task_id":"next","config":{"context":{"speed":2}}}"#.into()
+}
+
+fn graph_control(
+    editing: &mut super::super::graph_edit::GraphEditing,
+    editor: &mut Editor,
+    control: super::super::graph_edit::GraphControl,
+) {
+    use super::super::graph_edit::{GraphIntent, GraphOperation};
+    let intent = GraphIntent {
+        document_version: editor.document_version,
+        revision: editor.data.as_ref().unwrap().graph_edit.revision(),
+        operation: GraphOperation::Control(control),
+    };
+    editing
+        .handle(
+            &intent,
+            editor,
+            &mut super::super::graph_view::GraphNav::default(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn 加载成功读取失败和解析失败均不覆盖等待期间的新修改或流程历史() {
+    use crate::model::graph_edit::GraphCommand;
+    for outcome in [
+        Ok(loaded_content()),
+        Ok("不是合法JSON".into()),
+        Err("读取失败".into()),
+    ] {
+        for changed in ["graph", "context", "task_id", "map_id"] {
+            let mut session = session();
+            let mut editor = editor();
+            let ticket = begin_read(&mut session, &mut editor);
+            let version = editor.document_version;
+            let original_source = editor.document.clone();
+            match changed {
+                "graph" => {
+                    let data = editor.data.as_mut().unwrap();
+                    data.apply_graph_command(
+                        0,
+                        GraphCommand::AddNode {
+                            graph: data.graph_edit.root_key(),
+                            value: serde_json::json!({"id":"new","type":"custom"}),
+                        },
+                    )
+                    .unwrap();
+                }
+                "context" => {
+                    editor.data.as_mut().unwrap().context_fields[0].value = ContextValue::Float(9.5)
+                }
+                "task_id" => editor.data.as_mut().unwrap().task_id = "edited".into(),
+                "map_id" => editor.data.as_mut().unwrap().map_id = "edited".into(),
+                _ => unreachable!(),
+            }
+            let before = super::super::document_state::DocumentSnapshot::capture(
+                editor.data.as_ref().unwrap(),
+            );
+            let mut status = StatusLine::default();
+            let mut browser = FileBrowser {
+                remote_dir: Some("/A".into()),
+                selected: Some("next.json".into()),
+                ..default()
+            };
+            respond(
+                loaded(ticket, outcome.clone()),
+                &mut session,
+                &mut status,
+                &mut browser,
+                &mut editor,
+            );
+            assert!(
+                before
+                    == super::super::document_state::DocumentSnapshot::capture(
+                        editor.data.as_ref().unwrap()
+                    )
+            );
+            assert_eq!(editor.document_version, version);
+            assert_eq!(editor.document, original_source);
+            assert_eq!(browser.selected.as_deref(), Some("task.json"));
+            assert!(status.text.contains("已保留当前修改"));
+            assert!(matches!(session.busy, BusyState::Idle));
+            assert!(session.pending_read_ticket.is_none());
+            if changed == "graph" {
+                assert!(editor.data.as_ref().unwrap().graph_edit.can_undo());
+            }
+        }
+    }
+}
+
+#[test]
+fn 加载失败保留原文档而发起前已确认放弃的脏内容不阻止成功切换() {
+    for outcome in [
+        Ok(loaded_content()),
+        Ok("解析错误".into()),
+        Err("读取错误".into()),
+    ] {
+        let success = outcome.as_ref().is_ok_and(|text| text == &loaded_content());
+        let mut session = session();
+        let mut editor = editor();
+        editor.data.as_mut().unwrap().task_id = "发起前的旧修改".into();
+        let version = editor.document_version;
+        let ticket = begin_read(&mut session, &mut editor);
+        let mut status = StatusLine::default();
+        respond(
+            loaded(ticket, outcome),
+            &mut session,
+            &mut status,
+            &mut FileBrowser::default(),
+            &mut editor,
+        );
+        match success {
+            true => {
+                assert_eq!(editor.data.as_ref().unwrap().task_id, "next");
+                assert_eq!(editor.document_version, version + 1);
+                assert_eq!(editor.document.as_ref().unwrap().filename, "next.json");
+            }
+            false => {
+                assert_eq!(editor.data.as_ref().unwrap().task_id, "发起前的旧修改");
+                assert_eq!(editor.document_version, version);
+                assert!(status.text.contains("当前文档已保留"));
+            }
+        }
+        assert!(matches!(session.busy, BusyState::Idle));
+    }
+}
+
+#[test]
+fn 过期加载回执不清新请求忙碌状态而重载使原回执失效时正常结束忙碌() {
+    let mut session = session();
+    let mut editor = editor();
+    let old = begin_read(&mut session, &mut editor);
+    let new = begin_read(&mut session, &mut editor);
+    let mut status = StatusLine::default();
+    respond(
+        loaded(old, Ok(loaded_content())),
+        &mut session,
+        &mut status,
+        &mut FileBrowser::default(),
+        &mut editor,
+    );
+    assert_eq!(session.pending_read_ticket, Some(new));
+    assert!(matches!(session.busy, BusyState::Loading(_)));
+    assert_eq!(editor.document.as_ref().unwrap().filename, "task.json");
+    let source = editor.document.clone().unwrap();
+    editor.load_remote(model::parse_task_graph(&loaded_content()).unwrap(), source);
+    respond(
+        loaded(new, Ok(loaded_content())),
+        &mut session,
+        &mut status,
+        &mut FileBrowser::default(),
+        &mut editor,
+    );
+    assert!(session.pending_read_ticket.is_none());
+    assert!(matches!(session.busy, BusyState::Idle));
+    assert!(status.text.contains("回执已过期"));
+    assert_eq!(editor.document.as_ref().unwrap().filename, "task.json");
+}
+
+#[test]
+fn 加载期间新草稿或已确认放弃草稿的后续变化仍保留() {
+    use super::super::graph_edit::{GraphControl, GraphEditing};
+    for existing_draft in [false, true] {
+        let mut session = session();
+        let mut editor = editor();
+        let mut editing = GraphEditing::default();
+        graph_control(&mut editing, &mut editor, GraphControl::Toggle);
+        if existing_draft {
+            graph_control(&mut editing, &mut editor, GraphControl::NewNode);
+        }
+        let validation = InputValidation::default();
+        let input = DocumentInputSnapshot::capture(Some(&editing), &validation);
+        let ticket = editor.begin_read(session.connection_generation, input);
+        session.pending_read_ticket = Some(ticket);
+        session.busy = BusyState::Loading("next.json".into());
+        match existing_draft {
+            true => graph_control(&mut editing, &mut editor, GraphControl::RemoveProperty(2)),
+            false => graph_control(&mut editing, &mut editor, GraphControl::NewNode),
+        }
+        let input = DocumentInputSnapshot::capture(Some(&editing), &validation);
+        let mut status = StatusLine::default();
+        handle_response(
+            loaded(ticket, Ok(loaded_content())),
+            &mut session,
+            &mut status,
+            &mut FileBrowser::default(),
+            &mut editor,
+            &input,
+        );
+        assert!(editing.has_draft_changes());
+        assert_eq!(editor.document.as_ref().unwrap().filename, "task.json");
+        assert!(status.text.contains("已保留当前修改"));
+    }
+}
+
+#[test]
+fn 加载期间同一个非法数字框继续输入也被回执守卫识别() {
+    let mut app = submission_app();
+    let number = float_widget(&mut app);
+    app.update();
+    let field = child_text(&app, number);
+    queue_text(&mut app, field, "1e");
+    app.update();
+    assert!(
+        app.world()
+            .resource::<InputValidation>()
+            .has_errors(app.world().resource::<Editor>())
+    );
+    let input = DocumentInputSnapshot::capture(None, app.world().resource::<InputValidation>());
+    let generation = app.world().resource::<Session>().connection_generation;
+    let ticket = app
+        .world_mut()
+        .resource_mut::<Editor>()
+        .begin_read(generation, input);
+    app.world_mut()
+        .resource_mut::<Session>()
+        .pending_read_ticket = Some(ticket);
+    app.world_mut().resource_mut::<Session>().busy = BusyState::Loading("next.json".into());
+    queue_text(&mut app, field, "1e-");
+    app.update();
+    let input = DocumentInputSnapshot::capture(None, app.world().resource::<InputValidation>());
+    let mut session = app.world_mut().remove_resource::<Session>().unwrap();
+    let mut editor = app.world_mut().remove_resource::<Editor>().unwrap();
+    let mut status = StatusLine::default();
+    handle_response(
+        loaded(ticket, Ok(loaded_content())),
+        &mut session,
+        &mut status,
+        &mut FileBrowser::default(),
+        &mut editor,
+        &input,
+    );
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(field)
+            .unwrap()
+            .value()
+            .to_string(),
+        "1e-"
+    );
+    assert_eq!(editor.document.as_ref().unwrap().filename, "task.json");
+    assert!(status.text.contains("已保留当前修改"));
+    assert!(matches!(session.busy, BusyState::Idle));
+}
+
+#[test]
+fn 删除当前文件时等待期间的新修改保留且解除已删除来源但未变化可正常清空() {
+    for changed in [false, true] {
+        let mut session = session();
+        let mut editor = editor();
+        let ticket = begin_read(&mut session, &mut editor);
+        let version = editor.document_version;
+        if changed {
+            editor.data.as_mut().unwrap().map_id = "等待期间的新修改".into();
+        }
+        let mut status = StatusLine::default();
+        respond(
+            WorkerResponse::FileDeleted {
+                ticket,
+                remote_dir: "/A".into(),
+                filename: "task.json".into(),
+                file_list: listing("/A", &[]),
+            },
+            &mut session,
+            &mut status,
+            &mut FileBrowser::default(),
+            &mut editor,
+        );
+        match changed {
+            true => {
+                assert_eq!(editor.data.as_ref().unwrap().map_id, "等待期间的新修改");
+                assert_eq!(editor.document_version, version);
+                assert!(editor.document.is_none());
+                assert!(editor.has_unsaved_changes());
+                assert!(save_request(&session, &editor).is_err());
+                assert!(status.text.contains("新修改已保留在内存"));
+            }
+            false => {
+                assert!(editor.data.is_none());
+                assert_eq!(editor.document_version, version + 1);
+            }
+        }
+        assert!(matches!(session.busy, BusyState::Idle));
+        assert!(session.pending_read_ticket.is_none());
+    }
+}
+
+#[test]
+fn 删除失败保留修改且旧删除回执不清新加载请求() {
+    let mut session = session();
+    let mut editor = editor();
+    let old = begin_read(&mut session, &mut editor);
+    let current = begin_read(&mut session, &mut editor);
+    let mut status = StatusLine::default();
+    respond(
+        WorkerResponse::DeleteFailed {
+            ticket: old,
+            error: "旧失败".into(),
+        },
+        &mut session,
+        &mut status,
+        &mut FileBrowser::default(),
+        &mut editor,
+    );
+    assert_eq!(session.pending_read_ticket, Some(current));
+    assert!(matches!(session.busy, BusyState::Loading(_)));
+    editor.data.as_mut().unwrap().map_id = "新地图".into();
+    respond(
+        WorkerResponse::DeleteFailed {
+            ticket: current,
+            error: "未删除".into(),
+        },
+        &mut session,
+        &mut status,
+        &mut FileBrowser::default(),
+        &mut editor,
+    );
+    assert_eq!(editor.data.as_ref().unwrap().map_id, "新地图");
+    assert!(editor.document.is_some());
+    assert!(session.pending_read_ticket.is_none());
+    assert!(matches!(session.busy, BusyState::Idle));
+}
+
+#[test]
+fn 加载回执不能丢弃等待期间尚未完成的异步粘贴() {
+    let mut app = submission_app();
+    let number = float_widget(&mut app);
+    app.update();
+    let field = child_text(&app, number);
+    let input = DocumentInputSnapshot::capture(None, app.world().resource::<InputValidation>());
+    let generation = app.world().resource::<Session>().connection_generation;
+    let ticket = app
+        .world_mut()
+        .resource_mut::<Editor>()
+        .begin_read(generation, input);
+    app.world_mut()
+        .resource_mut::<Session>()
+        .pending_read_ticket = Some(ticket);
+    app.world_mut().resource_mut::<Session>().busy = BusyState::Loading("next.json".into());
+    let clipboard = start_pending_paste(&mut app, field);
+    let input = DocumentInputSnapshot::capture(None, app.world().resource::<InputValidation>())
+        .with_pending_input(
+            app.world()
+                .get::<EditableText>(field)
+                .unwrap()
+                .pending_paste
+                .is_some(),
+        );
+    let mut session = app.world_mut().remove_resource::<Session>().unwrap();
+    let mut editor = app.world_mut().remove_resource::<Editor>().unwrap();
+    let mut status = StatusLine::default();
+    handle_response(
+        loaded(ticket, Ok(loaded_content())),
+        &mut session,
+        &mut status,
+        &mut FileBrowser::default(),
+        &mut editor,
+        &input,
+    );
+    assert!(status.text.contains("已保留当前修改"));
+    assert_eq!(editor.document.as_ref().unwrap().filename, "task.json");
+    app.insert_resource(session).insert_resource(editor);
+    *clipboard.lock().unwrap() = Some(Ok("3.5".into()));
+    app.update();
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(field)
+            .unwrap()
+            .value()
+            .to_string(),
+        "3.5"
+    );
+    assert_eq!(
+        app.world()
+            .resource::<Editor>()
+            .data
+            .as_ref()
+            .unwrap()
+            .context_fields[0]
+            .value,
+        ContextValue::Float(3.5)
+    );
+}
+
+#[derive(Resource)]
+struct InjectedReadResponse(Option<WorkerResponse>);
+
+/// 在真实 InputFlush 之后、动作处理之前注入回执，覆盖单帧队列与后台完成同时到达。
+fn inject_read_response(
+    mut response: ResMut<InjectedReadResponse>,
+    mut session: ResMut<Session>,
+    mut status: ResMut<StatusLine>,
+    mut browser: ResMut<FileBrowser>,
+    mut editor: ResMut<Editor>,
+    inputs: ResponseInputs,
+) {
+    if let Some(response) = response.0.take() {
+        handle_response(
+            response,
+            &mut session,
+            &mut status,
+            &mut browser,
+            &mut editor,
+            &inputs.snapshot(),
+        );
+    }
+}
+
+#[test]
+fn 同帧加载回执不能将已排队保存或流程操作转移到新文档() {
+    use super::super::graph_edit::{GraphEditing, GraphIntent, GraphOperation};
+    use crate::model::graph_edit::GraphCommand;
+    for save in [true, false] {
+        let mut app = submission_app();
+        let mut editing = GraphEditing::default();
+        graph_control(
+            &mut editing,
+            &mut app.world_mut().resource_mut::<Editor>(),
+            super::super::graph_edit::GraphControl::Toggle,
+        );
+        app.insert_resource(editing)
+            .init_resource::<super::super::graph_view::GraphNav>()
+            .insert_resource(InjectedReadResponse(None))
+            .add_systems(
+                Update,
+                inject_read_response.after(InputFlush).before(UiSet::Update),
+            );
+        let document_version = app.world().resource::<Editor>().document_version;
+        let generation = app.world().resource::<Session>().connection_generation;
+        let ticket = app
+            .world_mut()
+            .resource_mut::<Editor>()
+            .begin_read(generation, DocumentInputSnapshot::default());
+        app.world_mut()
+            .resource_mut::<Session>()
+            .pending_read_ticket = Some(ticket);
+        app.world_mut().resource_mut::<Session>().busy = BusyState::Loading("next.json".into());
+        app.world_mut().resource_mut::<InjectedReadResponse>().0 =
+            Some(loaded(ticket, Ok(loaded_content())));
+        let action = match save {
+            true => AppAction::SaveToRemote,
+            false => AppAction::GraphEdit(GraphIntent {
+                document_version,
+                revision: 0,
+                operation: GraphOperation::Command(GraphCommand::AddNode {
+                    graph: app
+                        .world()
+                        .resource::<Editor>()
+                        .data
+                        .as_ref()
+                        .unwrap()
+                        .graph_edit
+                        .root_key(),
+                    value: serde_json::json!({"id":"old_document_edit","type":"custom"}),
+                }),
+            }),
+        };
+        app.world_mut().write_message(action);
+        app.update();
+        let editor = app.world().resource::<Editor>();
+        assert_eq!(editor.document_version, document_version);
+        assert_eq!(editor.document.as_ref().unwrap().filename, "task.json");
+        match save {
+            true => assert!(editor.pending_save.is_some()),
+            false => {
+                assert_eq!(
+                    editor.data.as_ref().unwrap().graph.nodes[0].id,
+                    "old_document_edit"
+                );
+                assert_eq!(editor.data.as_ref().unwrap().graph_edit.revision(), 1);
+            }
+        }
+    }
 }

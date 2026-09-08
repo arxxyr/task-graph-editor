@@ -13,9 +13,12 @@ use binding::PoseTarget;
 
 pub mod binding;
 pub mod connect;
+pub mod document_guard;
+mod document_state;
 pub mod editor;
 pub mod files;
 pub mod fonts;
+pub mod graph_edit;
 pub mod graph_layout;
 pub mod graph_view;
 pub mod password;
@@ -90,6 +93,8 @@ pub struct Session {
     pub reconnect_status: Option<String>,
     /// 等待中的远程命令
     pub pending_command: Option<PendingCommand>,
+    /// 忙碌状态所对应的加载或删除请求，不随编辑器文档重载而丢失。
+    pub pending_read_ticket: Option<crate::worker::DocumentReadTicket>,
     /// `~/.ssh/config` 中解析出的主机列表（启动时读取，每次打开下拉菜单时刷新）
     pub ssh_hosts: Vec<SshHostEntry>,
     /// 主机下拉菜单版本号：刷新主机列表后递增，驱动菜单项重建
@@ -120,6 +125,7 @@ impl Session {
             is_connected: false,
             reconnect_status: None,
             pending_command: None,
+            pending_read_ticket: None,
             ssh_hosts,
             hosts_version: 0,
             form_version: 0,
@@ -230,10 +236,19 @@ impl FileBrowser {
 /// 任务图编辑状态
 #[derive(Resource, Default)]
 pub struct Editor {
+    /// 已确认保存的内容，独立于图撤销历史。
+    saved_snapshot: Option<document_state::DocumentSnapshot>,
+    /// 保存尝试的单调序号，文档重载也不复用。
+    save_sequence: u64,
+    pending_save: Option<document_state::PendingSave>,
+    read_sequence: u64,
+    pending_read: Option<document_state::PendingDocumentRead>,
     /// 当前编辑的数据
     pub data: Option<TaskGraphData>,
     /// 当前文档绑定的远程来源，与侧栏正在浏览的目录相互独立。
     pub document: Option<RemoteDocument>,
+    /// 文档加载代次：重载同一路径或清空文档也递增，独立于 context 结构变化。
+    pub document_version: u64,
     /// 当前选中的独立位姿或位姿数组元素，支持嵌套分组下钻。
     pub selected_pose: Option<PoseTarget>,
     /// 结构版本号：字段树形状变化时递增（加载文件、创建位姿），驱动编辑器重建
@@ -248,9 +263,13 @@ pub struct Editor {
 impl Editor {
     /// 载入新数据（重置选中并递增结构版本）
     pub fn load(&mut self, data: Option<TaskGraphData>) {
+        self.saved_snapshot = data.as_ref().map(document_state::DocumentSnapshot::capture);
+        self.pending_save = None;
+        self.pending_read = None;
         self.data = data;
         self.document = None;
         self.selected_pose = None;
+        self.document_version += 1;
         self.structure_version += 1;
     }
 
@@ -322,6 +341,8 @@ impl Plugin for EditorUiPlugin {
                 files::FileListPlugin,
                 editor::EditorPanelPlugin,
                 graph_view::GraphViewPlugin,
+                graph_edit::GraphEditPlugin,
+                document_guard::DocumentGuardPlugin,
             ));
     }
 }

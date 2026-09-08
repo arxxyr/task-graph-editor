@@ -43,9 +43,14 @@ use super::{Editor, Session, StatusLine, UiSet};
 pub struct InputValidation {
     structure_version: u64,
     invalid_fields: HashSet<Entity>,
+    /// 同一非法字段继续输入也递增，不能只比较“是否有错误”。
+    invalid_revision: u64,
 }
 
 impl InputValidation {
+    pub(super) fn invalid_revision(&self) -> u64 {
+        self.invalid_revision
+    }
     /// 是否仍有属于当前字段树的输入错误。
     pub fn has_errors(&self, editor: &Editor) -> bool {
         self.structure_version == editor.structure_version && !self.invalid_fields.is_empty()
@@ -64,6 +69,9 @@ impl InputValidation {
 
     fn set_invalid(&mut self, editor: &Editor, entity: Entity, invalid: bool) -> bool {
         self.reset_for(editor);
+        if invalid || self.invalid_fields.contains(&entity) {
+            self.invalid_revision += 1;
+        }
         match invalid {
             true => self.invalid_fields.insert(entity),
             false => self.invalid_fields.remove(&entity),
@@ -1269,18 +1277,26 @@ impl Plugin for EditorPanelPlugin {
                 (
                     rebuild_editor,
                     rebuild_action_bar,
-                    sync_pose_selection,
-                    sync_pose_hint,
-                    sync_document_source,
-                    fill_lazy_bodies,
-                    push_initial_values,
-                    push_refreshed_values,
-                    clear_stale_input_errors,
+                    // 先提交旧树销毁，再查询现存控件；共享资源只限制并行，不会刷新延迟命令。
+                    (
+                        sync_pose_selection,
+                        sync_pose_hint,
+                        sync_document_source,
+                        fill_lazy_bodies,
+                        push_initial_values,
+                        push_refreshed_values,
+                        clear_stale_input_errors,
+                    )
+                        .after(rebuild_editor),
                 )
                     .in_set(UiSet::Rebuild),
             );
     }
 }
+
+#[cfg(test)]
+#[path = "editor/lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 #[path = "editor/pose_selection_tests.rs"]

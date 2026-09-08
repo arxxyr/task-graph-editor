@@ -66,6 +66,7 @@ fn main() -> AppExit {
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
+                    close_when_requested: false,
                     primary_window: Some(Window {
                         title: "任务图编辑器".into(),
                         // app id 用 ASCII，避免部分 Linux WM 对非 ASCII 值乱码

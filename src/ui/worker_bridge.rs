@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bevy::ecs::system::NonSendMarker;
+use bevy::ecs::system::{NonSendMarker, SystemParam};
 use bevy::prelude::*;
 use bevy::text::EditableText;
 use bevy::winit::{EventLoopProxyWrapper, UpdateMode, WinitSettings, WinitUserEvent};
@@ -21,6 +21,7 @@ use crate::ssh_config;
 use crate::worker::{BusyState, WakeFn, WorkerHandle, WorkerRequest, WorkerResponse};
 
 use super::binding::PoseTarget;
+use super::document_state::DocumentInputSnapshot;
 use super::editor::InputValidation;
 use super::{
     ConnectionTarget, Editor, FileBrowser, PendingCommand, RemoteDocument, Session, StatusLine,
@@ -84,6 +85,12 @@ if __name__ == "__main__":
 /// 避免副作用散落在各个 observer 里。
 #[derive(Message, Debug, Clone)]
 pub enum AppAction {
+    CloseWindow,
+    ConfirmDiscard(u64),
+    CancelDiscard,
+    SaveAndContinue,
+    /// 流程命令和属性草稿也等待本帧输入完成。
+    GraphEdit(super::graph_edit::GraphIntent),
     /// 连接远程主机
     Connect,
     /// 断开连接（同时取消自动重连）
@@ -125,6 +132,8 @@ struct DispatchAction(AppAction);
 struct PendingActions {
     actions: VecDeque<AppAction>,
     update_settings: Option<WinitSettings>,
+    /// 本帧已排入处理队列但尚未写回模型的当前文档操作。
+    protects_document: bool,
 }
 
 const CLIPBOARD_WAIT_MESSAGE: &str = "正在读取剪贴板，完成后自动继续操作...";
@@ -139,6 +148,7 @@ fn dispatch_after_text_input(
     mut dispatched: MessageWriter<DispatchAction>,
     settings: Option<ResMut<WinitSettings>>,
 ) {
+    pending.protects_document = false;
     for action in incoming.read() {
         match action {
             AppAction::Disconnect => {
@@ -174,6 +184,12 @@ fn dispatch_after_text_input(
     if status.text == CLIPBOARD_WAIT_MESSAGE {
         status.set("剪贴板读取完成");
     }
+    pending.protects_document = pending.actions.iter().any(|action| {
+        matches!(
+            action,
+            AppAction::GraphEdit(_) | AppAction::SaveToRemote | AppAction::CreatePose(_)
+        )
+    });
     for action in pending.actions.drain(..) {
         dispatched.write(DispatchAction(action));
     }
@@ -305,6 +321,7 @@ fn save_request(session: &Session, editor: &Editor) -> Result<WorkerRequest, Str
     crate::worker::validate_filename(&new_name)?;
     let content = model::serialize_task_graph(data).map_err(|e| format!("序列化失败: {e}"))?;
     Ok(WorkerRequest::SaveFile {
+        ticket: editor.next_save_ticket(),
         remote_dir: document.remote_dir.clone(),
         current_filename: document.filename.clone(),
         content,
@@ -321,6 +338,7 @@ fn disconnect(session: &mut Session, browser: &mut FileBrowser, editor: &mut Edi
     session.is_connected = false;
     session.reconnect_status = None;
     session.pending_command = None;
+    session.pending_read_ticket = None;
     session.busy = BusyState::Idle;
     browser.set_files(Vec::new());
     browser.remote_dir = None;
@@ -329,22 +347,116 @@ fn disconnect(session: &mut Session, browser: &mut FileBrowser, editor: &mut Edi
 }
 
 /// 处理界面操作意图
+#[derive(SystemParam)]
+struct ActionContext<'w> {
+    session: ResMut<'w, Session>,
+    status: ResMut<'w, StatusLine>,
+    browser: ResMut<'w, FileBrowser>,
+    editor: ResMut<'w, Editor>,
+    validation: Res<'w, InputValidation>,
+    graph_editing: Option<ResMut<'w, super::graph_edit::GraphEditing>>,
+    graph_nav: Option<ResMut<'w, super::graph_view::GraphNav>>,
+    document_guard: Option<ResMut<'w, super::document_guard::DocumentGuard>>,
+    proxy: Option<Res<'w, EventLoopProxyWrapper>>,
+}
+
 fn handle_actions(
     mut actions: MessageReader<DispatchAction>,
-    mut session: ResMut<Session>,
-    mut status: ResMut<StatusLine>,
-    mut browser: ResMut<FileBrowser>,
-    mut editor: ResMut<Editor>,
-    validation: Res<InputValidation>,
-    proxy: Option<Res<EventLoopProxyWrapper>>,
+    context: ActionContext,
+    mut commands: Commands,
 ) {
-    for DispatchAction(action) in actions.read() {
-        debug!(?action, "处理界面操作");
+    let ActionContext {
+        mut session,
+        mut status,
+        mut browser,
+        mut editor,
+        validation,
+        mut graph_editing,
+        mut graph_nav,
+        mut document_guard,
+        proxy,
+    } = context;
+    let mut ready: VecDeque<_> = actions
+        .read()
+        .map(|DispatchAction(action)| (action.clone(), false))
+        .collect();
+    while let Some((action, discard_confirmed)) = ready.pop_front() {
+        let action = &action;
+        match action {
+            AppAction::ConfirmDiscard(version) => {
+                if let Some(guard) = document_guard.as_deref_mut()
+                    && let Some(action) = guard.confirm(*version, &editor)
+                {
+                    ready.push_front((action, true));
+                }
+                continue;
+            }
+            AppAction::CancelDiscard => {
+                if let Some(guard) = document_guard.as_deref_mut() {
+                    guard.cancel();
+                }
+                continue;
+            }
+            AppAction::SaveAndContinue => {
+                if let Some(guard) = document_guard.as_deref_mut()
+                    && guard.active()
+                {
+                    guard.awaiting_save = true;
+                    ready.push_front((AppAction::SaveToRemote, false));
+                }
+                continue;
+            }
+            AppAction::GraphEdit(_) => debug!("处理流程编辑意图"),
+            _ => debug!(?action, "处理界面操作"),
+        }
         if needs_connection(action) && (!session.is_connected || !session.interactive()) {
             status.set("当前连接不可操作，请等待操作完成或重新连接");
             continue;
         }
+        let changing_document = super::document_guard::replaces_document(action, &editor)
+            && (!matches!(action, AppAction::DeleteFile(_))
+                || editor.document.as_ref().is_some_and(|document| {
+                    browser.remote_dir.as_deref() == Some(document.remote_dir.as_str())
+                }));
+        if !discard_confirmed
+            && changing_document
+            && (editor.has_unsaved_changes()
+                || validation.has_errors(&editor)
+                || graph_editing
+                    .as_ref()
+                    .is_some_and(|editing| editing.has_draft_changes()))
+            && let Some(guard) = document_guard.as_deref_mut()
+        {
+            guard.request(&editor, action.clone());
+            continue;
+        }
         match action {
+            AppAction::CloseWindow => {
+                if session.worker.is_some() {
+                    session.send(WorkerRequest::Disconnect);
+                }
+                commands.write_message(AppExit::Success);
+            }
+            AppAction::ConfirmDiscard(_)
+            | AppAction::CancelDiscard
+            | AppAction::SaveAndContinue => {}
+            AppAction::GraphEdit(intent) => {
+                if document_guard.as_ref().is_some_and(|guard| guard.active()) {
+                    continue;
+                }
+                if let (Some(editing), Some(nav)) =
+                    (graph_editing.as_deref_mut(), graph_nav.as_deref_mut())
+                {
+                    match editing.handle(intent, &mut editor, nav) {
+                        Ok(true) => status.set("流程修改已应用，可撤销；保存后生效。改名会同步结构引用并保持条件分支顺序。"),
+                        Ok(false) => {}
+                        Err(error) => {
+                            editing.report_error(&error);
+                            status.set(format!("流程编辑失败：{error}"));
+                        }
+                    }
+                }
+            }
             AppAction::Connect => {
                 if !session.interactive() || session.is_connected {
                     continue;
@@ -410,7 +522,13 @@ fn handle_actions(
                 session.busy = BusyState::Loading(filename.clone());
                 status.set("");
                 browser.selected = Some(filename.clone());
+                let ticket = editor.begin_read(
+                    session.connection_generation,
+                    DocumentInputSnapshot::capture(graph_editing.as_deref(), &validation),
+                );
+                session.pending_read_ticket = Some(ticket);
                 session.send(WorkerRequest::LoadFile {
+                    ticket,
                     remote_dir,
                     filename: filename.clone(),
                 });
@@ -437,7 +555,13 @@ fn handle_actions(
                 };
                 session.busy = BusyState::Working(format!("正在删除 {filename}"));
                 status.set("");
+                let ticket = editor.begin_read(
+                    session.connection_generation,
+                    DocumentInputSnapshot::capture(graph_editing.as_deref(), &validation),
+                );
+                session.pending_read_ticket = Some(ticket);
                 session.send(WorkerRequest::DeleteFile {
+                    ticket,
                     remote_dir,
                     filename: filename.clone(),
                 });
@@ -447,6 +571,13 @@ fn handle_actions(
             AppAction::UploadFile => {}
 
             AppAction::SaveToRemote => {
+                if let Some(editing) = graph_editing.as_deref_mut()
+                    && let Err(error) = editing.apply_draft(&mut editor)
+                {
+                    editing.report_error(&error);
+                    status.set(format!("保存失败：{error}"));
+                    continue;
+                }
                 if validation.has_errors(&editor) {
                     status.set("输入错误：请修正标红的数值后再保存");
                     continue;
@@ -458,6 +589,12 @@ fn handle_actions(
                         continue;
                     }
                 };
+                if let WorkerRequest::SaveFile { ticket, .. } = &request
+                    && !editor.begin_save(*ticket)
+                {
+                    status.set("保存失败：文档来源或提交序号已变化");
+                    continue;
+                }
                 session.busy = BusyState::Working("正在保存".into());
                 status.set("");
                 session.send(request);
@@ -692,11 +829,11 @@ fn response_kind(response: &WorkerResponse) -> &'static str {
         WorkerResponse::FileList(_) => "FileList",
         WorkerResponse::FileLoaded { .. } => "FileLoaded",
         WorkerResponse::FileSaved { .. } => "FileSaved",
-        WorkerResponse::SaveFailed(_) => "SaveFailed",
+        WorkerResponse::SaveFailed { .. } => "SaveFailed",
         WorkerResponse::BackupDone { .. } => "BackupDone",
         WorkerResponse::BackupFailed(_) => "BackupFailed",
         WorkerResponse::FileDeleted { .. } => "FileDeleted",
-        WorkerResponse::DeleteFailed(_) => "DeleteFailed",
+        WorkerResponse::DeleteFailed { .. } => "DeleteFailed",
         WorkerResponse::FileUploaded { .. } => "FileUploaded",
         WorkerResponse::UploadFailed(_) => "UploadFailed",
         WorkerResponse::CommandOutput(_) => "CommandOutput",
@@ -706,13 +843,37 @@ fn response_kind(response: &WorkerResponse) -> &'static str {
     }
 }
 
-/// 处理一条后台线程返回的响应
+/// 加载失败或新编辑使加载失效时，让文件选中恢复到实际仍打开的文档。
+fn restore_document_selection(browser: &mut FileBrowser, editor: &Editor) {
+    browser.selected = editor
+        .document
+        .as_ref()
+        .filter(|document| browser.remote_dir.as_deref() == Some(document.remote_dir.as_str()))
+        .map(|document| document.filename.clone());
+}
+
+fn finish_document_read(
+    ticket: crate::worker::DocumentReadTicket,
+    session: &mut Session,
+    editor: &mut Editor,
+    input: &DocumentInputSnapshot,
+) -> Option<bool> {
+    if session.pending_read_ticket != Some(ticket) {
+        return None;
+    }
+    session.pending_read_ticket = None;
+    session.busy = BusyState::Idle;
+    editor.finish_read(ticket, session.connection_generation, input)
+}
+
+/// 回执合并前比较请求快照，等待期间的输入优先于异步切换结果。
 fn handle_response(
     response: WorkerResponse,
     session: &mut Session,
     status: &mut StatusLine,
     browser: &mut FileBrowser,
     editor: &mut Editor,
+    input: &DocumentInputSnapshot,
 ) {
     match response {
         WorkerResponse::Connected {
@@ -750,11 +911,24 @@ fn handle_response(
         }
 
         WorkerResponse::FileLoaded {
+            ticket,
             remote_dir,
             filename,
             result,
         } => {
+            let unchanged = match finish_document_read(ticket, session, editor, input) {
+                Some(unchanged) => unchanged,
+                None => {
+                    status.set("加载回执已过期，当前文档已保留；如需切换请重新加载");
+                    return;
+                }
+            };
             session.busy = BusyState::Idle;
+            if !unchanged {
+                restore_document_selection(browser, editor);
+                status.set("加载期间文档或输入已变化，已保留当前修改；请处理修改后重新加载");
+                return;
+            }
             match result {
                 Ok(content) => match model::parse_task_graph(&content) {
                     Ok(data) => {
@@ -769,24 +943,29 @@ fn handle_response(
                         status.set(format!("已加载: {filename}"));
                     }
                     Err(e) => {
-                        status.set(format!("解析失败: {e}"));
-                        editor.load(None);
+                        restore_document_selection(browser, editor);
+                        status.set(format!("解析失败: {e}；当前文档已保留"));
                     }
                 },
                 Err(e) => {
-                    status.set(format!("读取失败: {e}"));
-                    editor.load(None);
+                    restore_document_selection(browser, editor);
+                    status.set(format!("读取失败: {e}；当前文档已保留"));
                 }
             }
         }
 
         WorkerResponse::FileSaved {
+            ticket,
             remote_dir,
             old_filename,
             new_filename,
             cleanup_warning,
             file_list,
         } => {
+            if !editor.confirm_save(ticket) {
+                debug!(?ticket, "忽略过期的保存成功回执");
+                return;
+            }
             session.busy = BusyState::Idle;
             match &new_filename {
                 Some(new_name) => {
@@ -809,9 +988,13 @@ fn handle_response(
             }
         }
 
-        WorkerResponse::SaveFailed(e) => {
+        WorkerResponse::SaveFailed { ticket, error } => {
+            if !editor.fail_save(ticket) {
+                debug!(?ticket, "忽略过期的保存失败回执");
+                return;
+            }
             session.busy = BusyState::Idle;
-            status.set(format!("保存失败: {e}"));
+            status.set(format!("保存失败: {error}"));
         }
 
         WorkerResponse::BackupDone {
@@ -830,10 +1013,18 @@ fn handle_response(
         }
 
         WorkerResponse::FileDeleted {
+            ticket,
             remote_dir,
             filename,
             file_list,
         } => {
+            let unchanged = match finish_document_read(ticket, session, editor, input) {
+                Some(unchanged) => unchanged,
+                None => {
+                    status.set("删除回执已过期，当前文档已保留；请刷新目录确认远端状态");
+                    return;
+                }
+            };
             session.busy = BusyState::Idle;
             status.set(format!("已删除: {filename}"));
             if browser.remote_dir.as_deref() == Some(remote_dir.as_str())
@@ -844,14 +1035,28 @@ fn handle_response(
             if editor.document.as_ref().is_some_and(|document| {
                 document.remote_dir == remote_dir && document.filename == filename
             }) {
-                editor.load(None);
+                match unchanged {
+                    true => editor.load(None),
+                    false => {
+                        // 远端删除已完成，但等待期间的新编辑还在内存中，不能一并丢掉。
+                        editor.document = None;
+                        editor.saved_snapshot = None;
+                    }
+                }
             }
             apply_operation_file_list(browser, status, file_list);
+            if !unchanged && editor.document.is_none() && editor.data.is_some() {
+                status.set("远程文件已删除；等待期间的新修改已保留在内存，已解除原远程来源");
+            }
         }
 
-        WorkerResponse::DeleteFailed(e) => {
+        WorkerResponse::DeleteFailed { ticket, error } => {
+            if finish_document_read(ticket, session, editor, input).is_none() {
+                status.set("删除失败回执已过期，当前文档已保留；请刷新目录确认远端状态");
+                return;
+            }
             session.busy = BusyState::Idle;
-            status.set(format!("删除失败: {e}"));
+            status.set(format!("删除失败: {error}；当前文档已保留"));
         }
 
         WorkerResponse::FileUploaded {
@@ -994,11 +1199,30 @@ fn handle_command_output(
 }
 
 /// 轮询后台线程响应
+#[derive(SystemParam)]
+struct ResponseInputs<'w, 's> {
+    graph_editing: Option<Res<'w, super::graph_edit::GraphEditing>>,
+    validation: Res<'w, InputValidation>,
+    pending: Res<'w, PendingActions>,
+    texts: Query<'w, 's, &'static EditableText>,
+}
+
+impl ResponseInputs<'_, '_> {
+    fn snapshot(&self) -> DocumentInputSnapshot {
+        DocumentInputSnapshot::capture(self.graph_editing.as_deref(), &self.validation)
+            .with_pending_input(
+                self.pending.protects_document
+                    || self.texts.iter().any(|text| text.pending_paste.is_some()),
+            )
+    }
+}
+
 fn poll_worker(
     mut session: ResMut<Session>,
     mut status: ResMut<StatusLine>,
     mut browser: ResMut<FileBrowser>,
     mut editor: ResMut<Editor>,
+    inputs: ResponseInputs,
 ) {
     let responses: Vec<_> = session
         .worker
@@ -1014,6 +1238,7 @@ fn poll_worker(
             &mut status,
             &mut browser,
             &mut editor,
+            &inputs.snapshot(),
         );
     }
 }

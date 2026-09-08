@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-任务图编辑器（task-graph-editor）—— 基于 **Bevy 0.19 + BSN + Feathers** 的跨平台桌面 GUI 应用，通过 SSH 连接远程 Linux 主机，编辑机器人任务图 JSON 文件中的所有 context 全局变量（位姿、轨迹、数组、标量、布尔等），并支持从 ROS2 话题实时获取底盘位姿和关节角。
+任务图编辑器（task-graph-editor）—— 基于 **Bevy 0.19 + BSN + Feathers** 的跨平台桌面 GUI 应用，通过 SSH 连接远程 Linux 主机，编辑机器人任务图 JSON 文件中的 context 全局变量与执行流程，并支持从 ROS2 话题实时获取底盘位姿和关节角。
 
 ## 项目结构
 
@@ -18,6 +18,9 @@ task-graph-editor/
 ├─ src/
 │  ├─ main.rs                  # 入口：mimalloc、Bevy App 装配、窗口与日志配置
 │  ├─ model.rs                 # 数据模型：ContextValue（12 种变体）、JSON 解析/序列化、ROS2 输出解析、登录持久化
+│  ├─ model/graph.rs           # 只读流程模型解析、逐层结构诊断与原始条数
+│  ├─ model/graph_edit.rs      # 完整图工作副本、稳定身份、事务、撤销与合并保存
+│  ├─ model/graph_schema.rs    # 执行器 44 种节点定义、创建草稿与静态校验
 │  ├─ ssh.rs                   # SSH/SFTP 封装：连接、认证（密码 / ssh-agent / 私钥）、文件操作、命令执行
 │  ├─ ssh/                     # 原子写入、agent 认证与连接取消
 │  ├─ ssh_config.rs            # ~/.ssh/config 解析：Host/Match/Include、首值生效、token 展开
@@ -37,10 +40,16 @@ task-graph-editor/
 │     ├─ shell.rs              # 界面骨架：顶栏 / 侧栏 / 内容区 / 状态栏 / 右键菜单层
 │     ├─ connect.rs            # 连接面板：SSH 表单、ssh config 主机下拉、连接按钮组
 │     ├─ worker_bridge.rs      # UI 动作、文档来源与后台响应
+│     ├─ document_state.rs    # 已保存快照、未保存状态及保存回执匹配
+│     ├─ document_guard.rs    # 切换、断开和关闭窗口前保护未保存内容
 │     ├─ files.rs              # 文件列表：选中、右键菜单（上传/备份/删除）
 │     ├─ editor.rs             # 字段树编辑器：六个分组、递归嵌套、懒加载
 │     ├─ graph_layout.rs       # 流程图布局：拓扑分层、正交折线走线（纯逻辑，带单测）
 │     ├─ graph_view.rs         # 流程图视图：节点卡片、边、面包屑下钻、详情栏
+│     ├─ graph_view/details.rs # 参数全文展开、复制和原始节点 JSON
+│     ├─ graph_view/canvas_edit.rs # 节点拖动、端口手势、多选、缩放与平移
+│     ├─ graph_edit.rs         # 图属性草稿、命令路由、同帧输入与快捷键
+│     ├─ graph_edit/form.rs    # 编辑工具栏与完整属性表单
 │     └─ screenshot.rs         # 截图：F12 手动 / TGE_SCREENSHOT 自动（CI 视觉回归）
 ├─ assets/fonts/               # 更纱黑体（SarasaTermSCNerd，编译时嵌入）
 ├─ assets/themes/palettes.json # 四套主题色板的唯一权威源，编译时嵌入
@@ -127,8 +136,9 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
   `TGE_TRACKED_POSE_FILE=<tracked_pose 输出副本>`，运行
   `cargo test 真实文件位姿数组选择后使用真实底盘输出逐项回填往返 -- --ignored --nocapture`，
   逐项验证选择、请求目标、底盘分量精度和其他元素的无损保留；全程不写远端。
-- `config.nodes` / `config.edges` 另外解析成 `SubGraph`/`TaskNode` 供流程图展示，
-  纯增量、不参与序列化（见 [流程图视图](#流程图视图)）
+- `GraphDocument` 保存完整图工作副本，`SubGraph`/`TaskNode` 仅为派生展示；
+  序列化只合并确实修改的根 `nodes`/`edges`/`entry_point`，保留未修改图字段和 context 合并基线
+  （见 [流程图视图](#流程图视图)）。内部 key、手工坐标和视口状态不写入机器人 JSON。
 - 修改 `task_id` 后远程文件自动重命名为 `{task_id}.json`，拒绝路径分隔符与同名覆盖
 
 ### 文档来源与远程保存
@@ -154,8 +164,9 @@ Bevy 是保留模式 UI，控件是实体而非每帧重绘的立即模式绘制
 | 输入框里改数值 | **不重建**，由 observer 按绑定写回数据 | 重建会让输入焦点每敲一个字符就丢失 |
 | ROS2 回填位姿 | `Editor::value_version` 递增 → 只推新值给已有控件 | 数据被 UI 之外的来源改动 |
 | 选中位姿 | 只换 `ThemeBackgroundColor` / `ThemeTextColor` | 高亮不涉及结构 |
-| 文件列表变化 | `FileBrowser::list_version` 递增 → 重建行 | 行数变了 |
+| 文件列表变化 | `FileBrowser::list_version` 递增 → 按来源和文件名增量协调行 | 保留未变化的行和滚动容器 |
 | 文件选中变化 | 只加减 `Selected` 组件 | 避免重建打断滚动位置 |
+| 连接状态变化 | 四个连接按钮常驻，只更新显示、文案和禁用态 | 保留实体及文字子节点，避免反复排队生成 |
 
 - 每个重建 system 都用「已渲染版本号」做守卫（`RenderedEditor` / `RenderedList` / `RenderedVersions`），
   避免每帧重复重建。**已渲染版本一律用 `Option<u64>`，不要拿 0 当"还没建过"的哨兵** ——
@@ -187,6 +198,22 @@ Bevy 是保留模式 UI，控件是实体而非每帧重绘的立即模式绘制
   （`widgets::ButtonGate` → `InteractionDisabled`）。把它们塞进重建条件会让状态一翻转就重建整块，
   正好撞上上面那个竞态——"点一下刷新列表冒出六个按钮"就是这么来的
 - `ButtonGate` 同步也要覆盖跨帧新增按钮；不能只在状态资源变化时执行。
+- `sync_button_gates` 和插槽待生成标记清理排在 `UiSet::Rebuild` **之后**，通过 `.after` 的
+  自动 `ApplyDeferred` 屏障先完成重建再查询实体；不能与重建并列排队。
+  曾因点击连接整组删除旧按钮，再向旧 `WhenIdle` 按钮延迟插入 `InteractionDisabled` 而崩溃。
+  连接按钮现已常驻，但其他确实需要删除实体的区域仍须遵守该顺序；`Managed` 只解决状态写入方冲突。
+- 连接按钮由 `sync_connect_buttons` 唯一维护显隐、禁用、Tab 顺序和取消文案。隐藏或禁用当前焦点按钮时，
+  将焦点移到可用的连接/断开入口，不干扰其他控件焦点；直接 `Activate` 也按实际 Session 状态检查。
+- 文件行身份由连接代次、规范目录和文件名共同确定，同源刷新保留行及文字子实体，换来源不复用同名文件。
+  新行先登记固定根实体，再用 `queue_spawn_scene` 填充，BSN 未落地也能追踪；空提示和底部空白区常驻。
+- 局部同步也必须依赖所属结构更新：文件行选择在 `reconcile_file_rows` 后、菜单样式在
+  `rebuild_context_menu` 后，参数树的选择、数值初始化与懒加载在 `rebuild_editor` 后。
+  流程属性插件依赖 `GraphViewRebuilt`，确保父画布已替换旧表单插槽；仅等待身份/导航准备不足以保证实体存活。
+- 流程图切层或重载前，父画布还须等待后代插槽的 `SlotPending` 全部结束；等待时唤醒 reactive 窗口。
+  已过期的详情与属性插槽不能排新场景，否则排队中的子控件可能在父容器删除后生成无父节点。
+- 流程撤销、重做、重连等由业务系统维护禁用态的按钮必须使用独立门控，通用 `ButtonGate` 同步跳过它们。
+  一个按钮只能有一个 `InteractionDisabled` 写入方，不能挂 `Always` 后再由业务反复禁用；
+  否则资源更新会重新启用按钮，并向同帧重建中已删除的实体排入清除命令。
 - **主机下拉先生成内容再展开**：Feathers 菜单依赖子项焦点保持打开；按钮一边打开菜单、一边
   刷新配置并销毁旧子项，会立即因丢焦关闭。`connect.rs` 保留 `MenuEvent` 的打开意图，等配置版本
   更新且 BSN 插槽就绪，再同时显示和设置焦点。空菜单也必须有可聚焦的提示项；等待期间主动唤醒窗口。
@@ -251,11 +278,46 @@ ROS2 回填不得覆盖正在报错的输入，否则会悄悄清除用户尚未
 
 ### 流程图视图
 
-`config.nodes` / `config.edges` 描述了任务的执行流程，复合节点（`sequence`/`loop`/`parallel`/`condition` 等）
-把子图**直接内联**在自己身上——是节点自带 `nodes`/`edges` 两个键，不是挂在 `children` 下面。
+`config.nodes` / `config.edges` 描述任务执行流程，子图直接内联在容器节点中，不放在 `children` 下。
+默认浏览，点击「编辑流程」开放属性与结构编辑；模型、表单和端口手势统一提交 `GraphCommand`。
+执行器依据与差异见 [协议记录](docs/graph-executor-protocol.md)，实施与验收见
+[编辑验收文档](docs/graph-editing-implementation.md)。
 
-**只读**。本工具编辑的是 context 参数，流程由机器人端定义；`parse_task_graph` 只是多解析出一份
-`TaskGraphData::graph`，序列化仍旧只从 `raw_json` 合并 context，`nodes`/`edges` 原样带回。
+- `GraphDocument` 是完整图 JSON 的唯一编辑权威，`graph` 为重新派生的展示结果。
+  `GraphKey`/`NodeKey`/`EdgeKey` 为稳定身份，改名、撤销和插入不会把旧目标解释成新对象。
+  命令携带预期修订，UI 再带 `document_version`；校验失败原子回滚，批量操作只生成一个历史条目。
+  类型与子图同时变更在整笔 `Batch` 完成后校验，避免中间状态妨碍合法转换。
+- `sequence`/`loop`/`parallel` 始终是容器，缺失必要数组也保留诊断入口；
+  `condition` 仅同时存在 `nodes` 和 `edges` 时是容器，否则为条件叶。
+  已知叶上的同名扩展保留并诊断，不创建假的可执行子图；未知类型宽松保留。
+  `parallel` 只要存在 `branches` 就优先使用它，被遮蔽的 `nodes` 原样保留；其边不参与并行调度。
+- 改名只更新本层边、已有入口和条件跳转引用，不替换表达式或业务字符串。
+  条件容器的入口按 priority 降序、同值目标 ID 排序；改名改变优先次序时用同一事务维护原次序，
+  无法保持的歧义明确拒绝。删除节点与关联边、局部引用同事务撤销。
+  根 `config.entry_point` 优先于入口边；没有显式入口时按原边顺序寻找首个有效 `_entry` 后继。
+- `graph_schema` 对照实际 NodeFactory、构造器和执行代码维护 44 种目录与草稿，不能依赖过时 JSON 定义表。
+  业务必填值不杜撰；静态校验不执行表达式、不探测机器人设备。旧无关异常不能阻止 context 保存。
+- 属性草稿保留完整字符串、布尔、JSON 数组/对象和未知字段。`inputs`/`params` 保持原来源；
+  JSON 数字拒绝非有限值和无法无损表示的超范围整数字面量，不能让 serde_json 静默转为 f64。
+  `InputFlush` 完成同帧文本和剪贴板后才应用或保存；保存先提交合法草稿，非法草稿保留且提示。
+  已应用的普通属性只刷新值、卡片文字及配色，不重建表单或画布；拓扑变化才触发布局刷新。
+- `document_state` 比较图、context 与元数据的已保存快照；`SaveTicket` 同时携带文档代次和请求序号。
+  成功回执只确认发出请求时的快照，期间编辑继续未保存；过期或来源不符回执不能改变文档及文件名。
+  图撤销不回退 context 或实际远端改名。草稿也参与顶栏未保存标记。
+- `document_guard` 在切换文件、删除当前来源、断开及关闭窗口前保护未保存内容。
+  保存后继续必须等匹配回执成功且没有新修改或非法输入；旧确认带文档代次并失效。
+  `WindowPlugin.close_when_requested=false` 让关闭请求先走此路径；确认层阻止底层画布和快捷键。
+- 加载和删除的 `DocumentReadTicket` 绑定文档/连接代次及请求序号，发起时捕获已确认的内容与输入快照。
+  回执时重新检查模型、未应用草稿、非法数字文本代次、异步粘贴和同帧排队的编辑/保存意图；
+  等待期间有新编辑就保留当前文档并提示重新加载，不能只在点击加载前检查脏状态。
+  读取或解析失败同样保留当前文档；删除成功期间产生新编辑时保留内存和历史，并解除已删除的远端来源。
+  只有匹配请求的回执可清忙碌态，旧回执不能结束新请求。
+
+`model/graph.rs` 宽松读取同时记录逐层 `GraphDiagnostic`，路径指向原始 JSON。
+`source_counts` 记录原始数组条数，工具栏同时显示可绘制条数；缺失 ID、错误数组及边端点不能静默消失。
+声明了子图但类型错误时保留带诊断的下钻入口，节点徽标显示其子图问题数。
+未知业务类型原样保留，不用不完整的类型白名单拒绝新节点。
+布局入口返回 `Result`，拒绝同层重复、保留及空白 ID；不能靠去重或饱和减法掩盖身份歧义。
 
 布局在 `graph_layout.rs`，纯函数、不碰 ECS；测试覆盖循环、跨层、自环和生成图的路径不变量：
 
@@ -267,6 +329,9 @@ ROS2 回填不得覆盖正在报错的输入，否则会悄悄清除用户尚未
 - **回边**走右侧通道，通道 x 贴着**这条边纵向跨过的那几层**里最宽的一层，
   不是全图最宽层——否则一条只穿过单列区域的回边会被甩到几百像素外，看着像断掉的线
 - **跨层边与自环**也使用外侧通道，边的所有线段避开非端点卡片，通道占用计入画布边界。
+- **层间横向轨道与端口**按边分配，避免不同依赖正长度共线；拥挤时增加层间距，普通链保持紧凑。
+  `PlacedEdge::edge_index` 指向解析后的本层边数组，过滤悬空边后也不能重新编号或合并平行边。
+  透明命中区域与可见线段分开；悬停和选中刷新整条边及箭头的颜色，详情显示完整起终点与原始边 JSON。
 
 几个不显然的点：
 
@@ -282,9 +347,19 @@ ROS2 回填不得覆盖正在报错的输入，否则会悄悄清除用户尚未
 - **节点 id 最长 73 字符**，中位 27，没有任何卡片宽度能全放下。凡是显示 id 的地方
   都要 `LineBreak::AnyCharacter`：标识符不含空格，按词换行等于不换行，会直接顶破容器。
   详情栏因此用标签在上、值在下的竖排，不复用 `widgets::field_row`（那是 190px 固定标签列的横排）
-- **换文件回根层**：`reset_on_reload` 比对 `editor.structure_version`，变了就 `nav.reset()`
+- **文档重载回根层**：`reset_on_reload` 比对 `editor.document_version`，重载同一路径或清空也递增。
+  context 创建位姿仅递增 `structure_version`，不影响流程导航；该版本仍用于参数树和 ROS2 过期响应防护。
+  失效下钻路径退回最近有效祖先；每批场景保留 `GraphSceneVersion`，节点、下钻按钮和面包屑拒绝旧版本输入。
 - **选中不重建画布**：只同步节点边框和详情栏，保留画布实体及 `ScrollPosition`；导航下钻才更新
   布局版本并重建，不能用统一导航版本表达单纯的选中变化。
+- **本地画布状态**：按稳定图与节点 key 保存手工位置、缩放及滚动；切层后恢复，重载文档清空。
+  拖动具备阈值、预览与取消，手工走线经过避障并维持独立端口；端口连线与重连仍走图事务。
+  所有屏幕命中统一换算 DPI、`UiScale` 和图缩放；用 `HoverMap` 最上层命中的祖先判断画布归属，
+  防止菜单等浮层穿透。已捕获的拖动可以越过浮层，确认弹层则取消手势。
+  双击带子图的节点可下钻，详情中的「进入子图」按钮仍可用；单击、拖动、多选和端口操作不触发下钻。
+  双击按稳定节点身份归并文字与卡片空白命中，通过既有动作队列刷新输入并检查草稿；文字框焦点保留自身撤销语义。
+- **详情不丢全文**：长参数初始显示摘要，可展开/收起并完整复制；原始节点 JSON 独立折叠，保留未知字段。
+  非对象 inputs 显示实际类型和值。全文、摘要和复制反馈分开存储，更新文字而不重建详情树，覆盖跨帧新增文字。
 
 ### 远程路径里的 `~`
 
