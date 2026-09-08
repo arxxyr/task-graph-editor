@@ -4316,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "task-graph-editor"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "bevy",
  "chrono",

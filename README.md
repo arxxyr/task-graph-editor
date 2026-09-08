@@ -145,8 +145,8 @@ Release。轻量标签、附注标签以及 `master` 历史提交上的标签均
 
 ```bash
 git switch master
-git tag v0.8.1
-git push github v0.8.1
+git tag v0.8.2
+git push github v0.8.2
 ```
 
 发布门禁的本地隔离测试：`python3 scripts/test_release_tag.py`，只创建临时 Git 仓库。
@@ -155,9 +155,9 @@ git push github v0.8.1
 
 | 平台 | 文件名 |
 |------|--------|
-| Linux x64 | `task-graph-editor-v0.8.1+{commit}-linux-x64.tar.gz` |
-| macOS ARM64 | `task-graph-editor-v0.8.1+{commit}-macos-arm64.zip`（应用包） |
-| Windows x64 | `task-graph-editor-v0.8.1+{commit}-windows-x64.zip` |
+| Linux x64 | `task-graph-editor-v0.8.2+{commit}-linux-x64.tar.gz` |
+| macOS ARM64 | `task-graph-editor-v0.8.2+{commit}-macos-arm64.zip`（应用包） |
+| Windows x64 | `task-graph-editor-v0.8.2+{commit}-windows-x64.zip` |
 
 ## 许可证
 
