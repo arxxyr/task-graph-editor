@@ -133,6 +133,23 @@ src/
 
 ## 发布
 
+[CHANGELOG.md](CHANGELOG.md) 是版本变更记录的唯一来源：开发时把变化写入「未发布」，
+发布前整理为 `## [版本号] - YYYY-MM-DD`，版本号与 `Cargo.toml` 保持一致，并填写实际发布日期。
+每个版本只保留一个条目，使用「新增 / 修复 / 变更 / 移除 / 工程 / 验证」等三级标题组织内容。
+更新日志从 `0.8.2` 开始记录，已发布条目不追加后续开发内容。链接使用完整 URL 的内联形式，
+不引用条目外的链接定义，确保提取到 Release 后仍可打开。
+
+GitHub Release 只显示标签对应的条目，并附版本信息和下载说明。标签与应用版本不一致，或
+条目缺失、重复、日期无效、正文为空时，流水线会在编译前停止；发布前会再次检查并提取。
+「未发布」和其他版本不会被放进当前 Release，也不会再追加自动生成的提交记录。
+
+本地预览和回归检查（Python 3.11+，仅使用标准库）：
+
+```bash
+uv run --no-project python scripts/release_notes.py --tag v0.8.2
+uv run --no-project python scripts/test_release_notes.py
+```
+
 GitHub Actions 仅在推送 `master` 时执行分支 CI；`dev` 等开发分支通过 PR 执行合并前检查，
 同步推送 `master` 和 `dev` 不会重复触发两套分支构建。
 

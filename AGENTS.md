@@ -11,6 +11,7 @@
 ```
 task-graph-editor/
 ├─ Cargo.toml                  # 项目配置（Rust 2024 edition）
+├─ CHANGELOG.md                # 从 0.8.2 开始的版本变更记录，自动提取到 Release 正文
 ├─ AGENTS.md                   # 开发指南（CLAUDE.md 为指向它的符号链接）
 ├─ .github/workflows/build.yml # GitHub Actions CI
 ├─ .gitlab-ci.yml              # GitLab CI
@@ -389,5 +390,11 @@ shell 同样不会展开其中的 `~`。
 - GitHub 仅允许通过上述门禁的 `v*` 标签创建 Release（含 prerelease 检测），普通分支和 PR 不发布。
   Release 显式依赖门禁及三平台构建成功，发布前再次校验远端 `master`。
   `python3 scripts/test_release_tag.py` 使用隔离临时仓库测试允许与拒绝场景，不创建真实远端标签。
+- 发布前把 `CHANGELOG.md` 的「未发布」整理到 `## [版本号] - YYYY-MM-DD` 条目，版本必须与
+  `Cargo.toml` 一致，日期必须有效，正文不能为空。同版本只能出现一次；旧版本不追加后续变更。
+  `scripts/release_notes.py`（Python 3.11+ 标准库）只提取当前版本，忽略代码围栏、缩进代码与
+  HTML 注释中的伪标题，遇到下一个一级或二级标题停止。标签门禁提前检查，发布前再次提取。
+  GitHub Release 用生成的 `body_path`，关闭自动提交记录，只追加版本和下载信息。
+  `uv run --no-project python scripts/test_release_notes.py` 验证提取边界和失败场景。
 - Unix 本地原子提交测试和部署回归需要 `python3`；Windows 跳过 Unix 系统调用集成测试
 - 部署脚本远端启用严格错误退出，失败保留现有可执行文件和上传包；先在临时位置准备、校验，再替换

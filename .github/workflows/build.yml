@@ -36,6 +36,7 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
             bash scripts/check-release-tag.sh "$GITHUB_REF" "$GITHUB_SHA"
+            python3 scripts/release_notes.py --tag "$GITHUB_REF_NAME" --check
           else
             echo "分支推送和 PR 仅执行检查与构建，不发布 Release。"
           fi
@@ -112,6 +113,11 @@ jobs:
 
       - name: Verify release tag gate
         run: python3 scripts/test_release_tag.py
+
+      - name: Verify release changelog
+        run: |
+          python3 scripts/test_release_notes.py
+          python3 scripts/release_notes.py --check
 
   # ============ 构建 ============
   build:
@@ -348,6 +354,27 @@ jobs:
           BUILD_DATE=$(date -u +%Y-%m-%d)
           echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
 
+      - name: Generate release notes from changelog
+        env:
+          RELEASE_METADATA: |
+            ## 版本信息
+            - **版本号**: ${{ steps.version.outputs.full_version }}
+            - **构建日期**: ${{ steps.version.outputs.build_date }}
+            - **Commit**: ${{ github.sha }}
+
+            ## 下载
+            - Linux x64: `task-graph-editor-${{ steps.version.outputs.full_version }}-linux-x64.tar.gz`
+            - Windows x64: `task-graph-editor-${{ steps.version.outputs.full_version }}-windows-x64.zip`
+            - macOS ARM64: `task-graph-editor-${{ steps.version.outputs.full_version }}-macos-arm64.zip`（.app bundle，双击运行）
+
+            ## 说明
+            - 字体已编译嵌入，无需额外安装
+            - macOS 版本为 .app bundle，双击即可运行，无终端窗口
+            - Linux/Windows 解压后直接运行可执行文件
+        run: |
+          python3 scripts/release_notes.py --tag "$GITHUB_REF_NAME" --output "$RUNNER_TEMP/release-notes.md"
+          printf '\n%s\n' "$RELEASE_METADATA" >> "$RUNNER_TEMP/release-notes.md"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
@@ -371,24 +398,10 @@ jobs:
           name: "Release ${{ steps.version.outputs.full_version }}"
           tag_name: ${{ steps.version.outputs.tag_version }}
           files: release/*
-          generate_release_notes: true
+          body_path: ${{ runner.temp }}/release-notes.md
+          generate_release_notes: false
           draft: false
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
-          body: |
-            ## 版本信息
-            - **版本号**: ${{ steps.version.outputs.full_version }}
-            - **构建日期**: ${{ steps.version.outputs.build_date }}
-            - **Commit**: ${{ github.sha }}
-
-            ## 下载
-            - Linux x64: `task-graph-editor-${{ steps.version.outputs.full_version }}-linux-x64.tar.gz`
-            - Windows x64: `task-graph-editor-${{ steps.version.outputs.full_version }}-windows-x64.zip`
-            - macOS ARM64: `task-graph-editor-${{ steps.version.outputs.full_version }}-macos-arm64.zip`（.app bundle，双击运行）
-
-            ## 说明
-            - 字体已编译嵌入，无需额外安装
-            - macOS 版本为 .app bundle，双击即可运行，无终端窗口
-            - Linux/Windows 解压后直接运行可执行文件
 
   # ============ Dev 构建通知 ============
   dev-build-summary:
