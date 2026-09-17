@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/analyzer-core",
+    "crates/analyzer-merger",
+    "crates/analyzer-visualizer",
+    "crates/plugins/master-control-analyzer",
+]
+
+[workspace.package]
+version = "0.5.8"
+edition = "2024"
+authors = ["loosqk"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# ABI 稳定性核心库
+abi_stable = "0.11"
+
+# 常用依赖
+anyhow = "1.0.104"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+
+# CLI 相关
+clap = { version = "4.6.6", features = ["derive"] }
+
+# 插件加载
+libloading = "0.9"
+
+# 日志分析常用
+regex = "1.13.1"
+csv = "1.4.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10"
+plotters = { version = "0.3", default-features = false, features = ["bitmap_encoder", "bitmap_backend", "line_series", "ab_glyph", "area_series"] }
+glob = "0.3"
+
+# 日志记录
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# SSH 和远程连接
+ssh2 = "0.9"
+
+
+# 进度显示
+indicatif = "0.18.6"
+
+# 文件系统
+dirs = "6.0"
+
+# C++ 互操作
+cxx = "1.0"
+cxx-build = "1.0"
+
+# 测试依赖
+tempfile = "3.27.0"
+
+# 内存分配器
+mimalloc = "0.1"
+
+# 国际化
+rust-i18n = "4"
+
+[profile.release]
+opt-level = 3          # 性能优先
+lto = "fat"            # 全量 LTO，最大化跨 crate 优化和体积压缩
+codegen-units = 1      # 单编译单元，配合 LTO 最大化优化效果
+strip = true           # 移除符号表和调试信息
+panic = "abort"        # 移除 unwind 表，减小体积
+
+[profile.release.build-override]
+opt-level = 3          # 构建脚本用速度优先（如 openssl vendored 编译）

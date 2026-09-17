@@ -1,0 +1,32 @@
+[package]
+name = "analyzer-visualizer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# 核心接口
+analyzer-core = { path = "../analyzer-core" }
+analyzer-merger = { path = "../analyzer-merger" }
+
+# ABI 稳定性
+abi_stable = { workspace = true }
+
+# 错误处理
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# 可视化
+plotters = { workspace = true }
+
+# 时间处理
+chrono = { workspace = true }
+
+# 日志
+tracing = { workspace = true }
+
+# 国际化
+rust-i18n = { workspace = true }
+
+[dev-dependencies]

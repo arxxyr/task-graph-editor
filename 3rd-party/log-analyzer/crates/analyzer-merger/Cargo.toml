@@ -1,0 +1,30 @@
+[package]
+name = "analyzer-merger"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# 核心接口
+analyzer-core = { path = "../analyzer-core" }
+
+# ABI 稳定性
+abi_stable = { workspace = true }
+
+# 错误处理
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# 序列化
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# 日志
+tracing = { workspace = true }
+
+# 国际化
+rust-i18n = { workspace = true }
+
+[dev-dependencies]
+# 测试

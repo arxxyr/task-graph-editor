@@ -85,6 +85,8 @@ if __name__ == "__main__":
 /// 避免副作用散落在各个 observer 里。
 #[derive(Message, Debug, Clone)]
 pub enum AppAction {
+    /// 日志操作也等待同帧文本及异步剪贴板完成。
+    Logs(super::log_analysis::LogAction),
     CloseWindow,
     ConfirmDiscard(u64),
     CancelDiscard,
@@ -431,6 +433,11 @@ fn handle_actions(
             continue;
         }
         match action {
+            AppAction::Logs(action) => {
+                if !document_guard.as_ref().is_some_and(|guard| guard.active()) {
+                    commands.trigger(action.clone());
+                }
+            }
             AppAction::CloseWindow => {
                 if session.worker.is_some() {
                     session.send(WorkerRequest::Disconnect);

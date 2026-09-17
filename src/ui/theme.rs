@@ -158,7 +158,7 @@ pub const APPBAR_HEIGHT: f32 = 46.0;
 /// 状态栏高度
 pub const STATUSBAR_HEIGHT: f32 = 28.0;
 /// 侧栏宽度
-pub const SIDEBAR_WIDTH: f32 = 320.0;
+pub const SIDEBAR_WIDTH: f32 = 288.0;
 /// 标准内边距
 pub const PAD: f32 = 10.0;
 /// 紧凑内边距

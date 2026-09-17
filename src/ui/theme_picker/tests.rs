@@ -103,7 +103,7 @@ fn assert_captions(app: &mut App, selected: ThemeId) {
     for (text, caption) in query.iter(app.world()) {
         match *caption {
             ThemeCaption::Current => {
-                assert_eq!(text.0, format!("选择主题：{}", selected.label()));
+                assert_eq!(text.0, format!("主题 · {}", selected.label()));
             }
             ThemeCaption::Check(id) => {
                 let expected = match id == selected {

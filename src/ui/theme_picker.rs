@@ -140,7 +140,7 @@ fn sync_theme_captions(
             continue;
         }
         let value = match *caption {
-            ThemeCaption::Current => format!("选择主题：{}", selection.0.label()),
+            ThemeCaption::Current => format!("主题 · {}", selection.0.label()),
             ThemeCaption::Check(id) => match selection.0 == id {
                 true => "✓".to_string(),
                 false => String::new(),

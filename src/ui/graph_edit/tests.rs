@@ -200,6 +200,7 @@ fn form_app_with_guard(selected: &str, with_guard: bool) -> App {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
         .init_asset::<Font>()
+        .init_asset::<Image>()
         .init_resource::<InputFocus>()
         .init_resource::<FontCx>()
         .init_resource::<LayoutCx>()
@@ -770,8 +771,8 @@ fn 保存也经真实输入刷新提交当前长文本而非草稿旧值() {
     let expected = format!("{}\n保存帧末尾", long_message());
     let ticket = app.world().resource::<Editor>().next_save_ticket();
     queue_text(&mut app, input, &expected);
-    let save = action_button(&mut app, |action| matches!(action, AppAction::SaveToRemote));
-    activate(&mut app, save);
+    // 保存入口已统一到应用顶栏；本夹具只生成流程表单，派发相同的顶栏动作。
+    app.world_mut().write_message(AppAction::SaveToRemote);
     app.update();
     assert_eq!(node(&app, "message")["inputs"]["message"], expected);
     assert!(matches!(

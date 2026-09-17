@@ -60,6 +60,7 @@ fn selection_app() -> App {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default(), ScenePlugin))
         .init_asset::<Font>()
+        .init_asset::<Image>()
         .init_resource::<InputFocus>()
         .init_resource::<FontCx>()
         .init_resource::<LayoutCx>()

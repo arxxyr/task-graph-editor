@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 mod agent;
 mod atomic_write;
 mod cancellation;
+pub mod logs;
 pub use cancellation::SshCancellation;
 
 /// SSH 认证方式

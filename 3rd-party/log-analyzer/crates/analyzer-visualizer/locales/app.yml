@@ -1,0 +1,35 @@
+_version: 2
+
+# 泳道名称
+track.round_marker:
+  zh-CN: "轮次标记"
+  en: "Round Marker"
+
+track.navigation:
+  zh-CN: "导航"
+  en: "Navigation"
+
+track.arm:
+  zh-CN: "机械臂"
+  en: "Arm"
+
+track.gripper:
+  zh-CN: "夹爪"
+  en: "Gripper"
+
+track.head:
+  zh-CN: "头部"
+  en: "Head"
+
+track.waist:
+  zh-CN: "腰部"
+  en: "Waist"
+
+track.preplan:
+  zh-CN: "预打舵"
+  en: "Pre-plan"
+
+# 错误消息
+err.no_events:
+  zh-CN: "没有事件可以可视化"
+  en: "No events to visualize"

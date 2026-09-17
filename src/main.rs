@@ -3,6 +3,7 @@
 // Windows 下隐藏控制台窗口
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod log_analysis;
 mod model;
 mod ssh;
 mod ssh_config;
@@ -62,6 +63,12 @@ fn winit_settings() -> WinitSettings {
 }
 
 fn main() -> AppExit {
+    if let Some(success) = log_analysis::worker_entry() {
+        return match success {
+            true => AppExit::Success,
+            false => AppExit::error(),
+        };
+    }
     App::new()
         .add_plugins(
             DefaultPlugins

@@ -1,0 +1,434 @@
+_version: 2
+
+# 插件元数据
+plugin.description:
+  zh-CN: "机器人控制系统日志分析器，支持轮次检测、流程分析和甘特图生成"
+  en: "Robot control system log analyzer, supporting round detection, flow analysis, and Gantt chart generation"
+
+# 分析摘要
+summary.complete:
+  zh-CN: "分析完成！"
+  en: "Analysis complete!"
+
+summary.rounds_detected:
+  zh-CN: "检测到 %{count} 个轮次"
+  en: "Detected %{count} rounds"
+
+summary.flows_detected:
+  zh-CN: "检测到 %{count} 个导航流程"
+  en: "Detected %{count} navigation flows"
+
+summary.action_stats:
+  zh-CN: "动作统计: %{nav} 导航, %{preplan} 预打舵, %{arm} 手臂, %{gripper} 夹爪, %{head} 头部, %{waist} 腰部"
+  en: "Action stats: %{nav} navigation, %{preplan} pre-plan, %{arm} arm, %{gripper} gripper, %{head} head, %{waist} waist"
+
+summary.csv_records:
+  zh-CN: "生成 %{count} 条 CSV 记录"
+  en: "Generated %{count} CSV records"
+
+summary.output_dir:
+  zh-CN: "输出目录: %{path}"
+  en: "Output directory: %{path}"
+
+# 输出文件描述
+output.analysis_csv:
+  zh-CN: "主分析数据（所有操作的时序记录）"
+  en: "Main analysis data (timing records of all operations)"
+
+output.round_gantt:
+  zh-CN: "轮次 %{id} 甘特图"
+  en: "Round %{id} Gantt chart"
+
+output.action_timeline:
+  zh-CN: "动作时间轴汇总表"
+  en: "Action timeline summary"
+
+output.cycle_duration_stats:
+  zh-CN: "常规循环耗时统计图"
+  en: "Normal cycle duration statistics chart"
+
+# 循环类型
+cycle.initial:
+  zh-CN: "初始循环"
+  en: "Initial Cycle"
+
+cycle.normal:
+  zh-CN: "常规循环 %{n}"
+  en: "Normal Cycle %{n}"
+
+cycle.final:
+  zh-CN: "最终循环"
+  en: "Final Cycle"
+
+# 甘特图相关
+gantt.title_with_pause:
+  zh-CN: "%{cycle_type} (Round %{id}) Timeline (有效: %{effective}s, 暂停: %{pause}s, 总计: %{total}s)"
+  en: "%{cycle_type} (Round %{id}) Timeline (Effective: %{effective}s, Pause: %{pause}s, Total: %{total}s)"
+
+gantt.title_no_pause:
+  zh-CN: "%{cycle_type} (Round %{id}) Timeline (Total: %{total}s)"
+  en: "%{cycle_type} (Round %{id}) Timeline (Total: %{total}s)"
+
+gantt.beijing_time:
+  zh-CN: "北京时间: %{start} - %{end}"
+  en: "Beijing Time: %{start} - %{end}"
+
+gantt.not_ended:
+  zh-CN: "未结束"
+  en: "Not ended"
+
+gantt.y_label:
+  zh-CN: "动作类型"
+  en: "Action Type"
+
+gantt.x_label:
+  zh-CN: "时间 (相对于轮次开始的秒数)"
+  en: "Time (seconds from round start)"
+
+gantt.total_time:
+  zh-CN: "总计: %{time}s"
+  en: "Total: %{time}s"
+
+# 动作类型
+action.navigation:
+  zh-CN: "导航"
+  en: "Navigation"
+
+action.preplan:
+  zh-CN: "预打舵"
+  en: "Pre-plan"
+
+action.arm:
+  zh-CN: "手臂"
+  en: "Arm"
+
+action.head:
+  zh-CN: "头部"
+  en: "Head"
+
+action.waist:
+  zh-CN: "腰部"
+  en: "Waist"
+
+action.ready_pose:
+  zh-CN: "准备阶段"
+  en: "Ready Pose"
+
+action.det_obj_pose:
+  zh-CN: "目标检测"
+  en: "Object Detection"
+
+action.obstacle:
+  zh-CN: "障碍物"
+  en: "Obstacle"
+
+action.transition:
+  zh-CN: "过渡点"
+  en: "Transition"
+
+action.arm_move:
+  zh-CN: "手臂运动"
+  en: "Arm Movement"
+
+action.arm_move_plan:
+  zh-CN: "手臂规划"
+  en: "Arm Planning"
+
+action.arm_move_exec:
+  zh-CN: "手臂执行"
+  en: "Arm Execution"
+
+action.gripper:
+  zh-CN: "夹爪"
+  en: "Gripper"
+
+action.arm_with_code:
+  zh-CN: "双臂(%{code})"
+  en: "Arm(%{code})"
+
+action.arm_label:
+  zh-CN: "双臂"
+  en: "Arm"
+
+action.default:
+  zh-CN: "动作"
+  en: "Action"
+
+# 甘特图标签
+label.navigation_to:
+  zh-CN: "导航→%{pos}"
+  en: "Navigate→%{pos}"
+
+label.arm_action:
+  zh-CN: "手臂:%{code}"
+  en: "Arm:%{code}"
+
+label.head_control:
+  zh-CN: "头部控制"
+  en: "Head Control"
+
+label.waist_control:
+  zh-CN: "腰部控制"
+  en: "Waist Control"
+
+label.preplan_action:
+  zh-CN: "预打舵(action=%{code})"
+  en: "Pre-plan(action=%{code})"
+
+label.not_completed:
+  zh-CN: "[未完成]"
+  en: "[Incomplete]"
+
+# 统计图
+stats.title_with_pause:
+  zh-CN: "常规循环有效耗时统计 (共%{count}个循环，平均: %{avg}s，总暂停: %{pause}s)"
+  en: "Normal Cycle Effective Duration Stats (%{count} cycles, avg: %{avg}s, total pause: %{pause}s)"
+
+stats.title_no_pause:
+  zh-CN: "常规循环耗时统计 (共%{count}个已完成循环，平均: %{avg}s)"
+  en: "Normal Cycle Duration Stats (%{count} completed cycles, avg: %{avg}s)"
+
+stats.cycle_number:
+  zh-CN: "循环序号"
+  en: "Cycle Number"
+
+stats.duration:
+  zh-CN: "耗时 (秒)"
+  en: "Duration (seconds)"
+
+stats.average:
+  zh-CN: "平均: %{time}s"
+  en: "Average: %{time}s"
+
+stats.max_min_diff:
+  zh-CN: "最大: %{max}s  最小: %{min}s  差值: %{diff}s"
+  en: "Max: %{max}s  Min: %{min}s  Diff: %{diff}s"
+
+stats.no_cycles:
+  zh-CN: "[统计图] 没有已完成的常规循环，跳过生成统计图"
+  en: "[Stats] No completed normal cycles, skipping chart generation"
+
+# CSV 表头
+csv.seq_num:
+  zh-CN: "序号"
+  en: "Seq"
+
+csv.cycle_type:
+  zh-CN: "循环类型"
+  en: "Cycle Type"
+
+csv.round_id:
+  zh-CN: "轮次ID"
+  en: "Round ID"
+
+csv.total_time:
+  zh-CN: "总时间(s)"
+  en: "Total Time(s)"
+
+csv.pause_time:
+  zh-CN: "暂停时间(s)"
+  en: "Pause Time(s)"
+
+csv.effective_time:
+  zh-CN: "有效时间(s)"
+  en: "Effective Time(s)"
+
+csv.pause_ratio:
+  zh-CN: "暂停占比(%)"
+  en: "Pause Ratio(%)"
+
+csv.round:
+  zh-CN: "轮次"
+  en: "Round"
+
+csv.flow:
+  zh-CN: "流程"
+  en: "Flow"
+
+csv.action_type:
+  zh-CN: "动作类型"
+  en: "Action Type"
+
+csv.action_detail:
+  zh-CN: "动作详情"
+  en: "Action Detail"
+
+csv.phase:
+  zh-CN: "阶段"
+  en: "Phase"
+
+csv.start_time:
+  zh-CN: "开始时间(秒)"
+  en: "Start Time(s)"
+
+csv.end_time:
+  zh-CN: "结束时间(秒)"
+  en: "End Time(s)"
+
+csv.duration:
+  zh-CN: "持续时间(秒)"
+  en: "Duration(s)"
+
+csv.start_beijing:
+  zh-CN: "开始时间(北京)"
+  en: "Start Time(Beijing)"
+
+csv.end_beijing:
+  zh-CN: "结束时间(北京)"
+  en: "End Time(Beijing)"
+
+csv.status:
+  zh-CN: "状态"
+  en: "Status"
+
+csv.total:
+  zh-CN: "合计"
+  en: "Total"
+
+csv.average:
+  zh-CN: "平均"
+  en: "Average"
+
+csv.total_cycles:
+  zh-CN: "共%{count}个循环"
+  en: "%{count} cycles total"
+
+csv.not_completed:
+  zh-CN: "未完成"
+  en: "Incomplete"
+
+csv.na:
+  zh-CN: "N/A"
+  en: "N/A"
+
+# 动作时间轴统计
+timeline_stats.title:
+  zh-CN: "动作时间轴统计"
+  en: "Action Timeline Statistics"
+
+timeline_stats.total:
+  zh-CN: "总动作数: %{count}"
+  en: "Total actions: %{count}"
+
+timeline_stats.completed:
+  zh-CN: "已完成: %{count} (%{percent}%)"
+  en: "Completed: %{count} (%{percent}%)"
+
+timeline_stats.pending:
+  zh-CN: "未完成: %{count} (%{percent}%)"
+  en: "Pending: %{count} (%{percent}%)"
+
+timeline_stats.by_type:
+  zh-CN: "各类型动作统计:"
+  en: "Statistics by action type:"
+
+timeline_stats.nav_count:
+  zh-CN: "导航: %{count} 个"
+  en: "Navigation: %{count}"
+
+timeline_stats.arm_count:
+  zh-CN: "机械臂: %{count} 个"
+  en: "Arm: %{count}"
+
+timeline_stats.gripper_count:
+  zh-CN: "夹爪: %{count} 个"
+  en: "Gripper: %{count}"
+
+timeline_stats.head_count:
+  zh-CN: "头部: %{count} 个"
+  en: "Head: %{count}"
+
+timeline_stats.waist_count:
+  zh-CN: "腰部: %{count} 个"
+  en: "Waist: %{count}"
+
+# 时间线事件
+timeline.round:
+  zh-CN: "轮次 %{id}"
+  en: "Round %{id}"
+
+# 子步骤名称（甘特图子步骤显示文本）
+substep.start:
+  zh-CN: "开始"
+  en: "Start"
+
+substep.completed_ms:
+  zh-CN: "完成(%{ms}ms)"
+  en: "Done(%{ms}ms)"
+
+substep.result_code:
+  zh-CN: "结果(code=%{code})"
+  en: "Result(code=%{code})"
+
+substep.ready_pose_start:
+  zh-CN: "GetReadyPose #%{n} 开始"
+  en: "GetReadyPose #%{n} start"
+
+substep.ready_pose_done:
+  zh-CN: "GetReadyPose #%{n} 完成 (%{ms}ms)"
+  en: "GetReadyPose #%{n} done (%{ms}ms)"
+
+substep.node_start:
+  zh-CN: "节点开始"
+  en: "Node start"
+
+substep.node_end:
+  zh-CN: "节点结束(%{status})"
+  en: "Node end(%{status})"
+
+substep.pause:
+  zh-CN: "暂停"
+  en: "Pause"
+
+substep.resume:
+  zh-CN: "恢复"
+  en: "Resume"
+
+substep.exec_start:
+  zh-CN: "开始执行"
+  en: "Executing"
+
+substep.wait_server:
+  zh-CN: "等待服务器 '%{name}'..."
+  en: "Waiting for server '%{name}'..."
+
+substep.server_ready:
+  zh-CN: "服务器已就绪"
+  en: "Server ready"
+
+substep.send_goal:
+  zh-CN: "发送目标"
+  en: "Send goal"
+
+substep.executing:
+  zh-CN: "执行中"
+  en: "Running"
+
+substep.result_success:
+  zh-CN: "[RESULT] 完成，成功: %{success}"
+  en: "[RESULT] Done, success: %{success}"
+
+substep.exec_done:
+  zh-CN: "执行完成，结果: %{result}"
+  en: "Execution done, result: %{result}"
+
+substep.exec_success:
+  zh-CN: "执行成功"
+  en: "Execution success"
+
+substep.set_target:
+  zh-CN: "设置目标→%{pos}"
+  en: "Set target→%{pos}"
+
+substep.response_code:
+  zh-CN: "响应(code=%{code})"
+  en: "Response(code=%{code})"
+
+substep.preplan_label:
+  zh-CN: "预打舵[%{label}]"
+  en: "Pre-plan[%{label}]"
+
+# 错误消息
+err.no_valid_timestamps:
+  zh-CN: "日志文件中未找到有效的时间戳行"
+  en: "No valid timestamp lines found in log file"

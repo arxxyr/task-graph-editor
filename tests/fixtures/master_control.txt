@@ -1,0 +1,11 @@
+2026-09-01 10:00:00.000000 [master_control] [INFO] [初始循环] ===== 初始填充开始，已上件工位数 0 =====
+2026-09-01 10:00:01.000000 [master_control] [INFO] ========== BehaviorTree 节点开始 ==========
+2026-09-01 10:00:01.100000 [master_control] [INFO] 节点ID: test_gripper
+2026-09-01 10:00:01.200000 [master_control] [INFO] gripper start arm=right open_mode=1(open) effective_open=true cached_state=unknown mode=service service=/marvin/gripper_control left_topic=/left right_topic=/right
+2026-09-01 10:00:01.300000 [master_control] [INFO] gripper request: cmd_code=1 arm=right
+2026-09-01 10:00:01.400000 [master_control] [INFO] gripper done status=success cost_ms=200
+2026-09-01 10:00:01.500000 [master_control] [INFO] ========== BehaviorTree 节点结束 ==========
+2026-09-01 10:00:01.600000 [master_control] [INFO] 结果: SUCCESS
+2026-09-01 10:00:02.000000 [master_control] [INFO] TaskGraphExecutor: 用户请求暂停任务 example
+2026-09-01 10:00:04.000000 [master_control] [INFO] TaskGraphExecutor: 恢复任务 example
+2026-09-01 10:00:10.000000 [master_control] [INFO] [初始循环] 初始循环结束，扫码成功=true, 气密位状态=2

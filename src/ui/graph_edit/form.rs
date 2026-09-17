@@ -7,7 +7,6 @@ use bevy::ui::InteractionDisabled;
 use bevy::ui_widgets::ScrollArea;
 
 use super::*;
-use crate::ui::connect::ActionButton;
 use crate::ui::graph_view::{GraphSceneVersion, stale_scene};
 use crate::ui::theme;
 use crate::ui::widgets::{BoxedScene, boxed};
@@ -94,17 +93,27 @@ pub(super) fn rebuild_toolbar(
             &editor,
         ))];
         if editing.enabled {
+            let structure = [
+                ("新增节点", GraphControl::NewNode),
+                ("新增连接", GraphControl::NewEdge),
+                ("删除所选", GraphControl::DeleteSelection),
+            ]
+            .into_iter()
+            .map(|(label, action)| {
+                boxed(widgets::menu_action(
+                    label,
+                    ControlButton {
+                        document_version: editor.document_version,
+                        operation: Some(GraphOperation::Control(action)),
+                    },
+                    widgets::ButtonGate::Managed,
+                ))
+            })
+            .collect();
             controls.extend([
-                boxed(control("新增节点", GraphControl::NewNode, &editor)),
-                boxed(control("新增连接", GraphControl::NewEdge, &editor)),
-                boxed(control("删除所选", GraphControl::DeleteSelection, &editor)),
-                boxed(operation_button("撤销流程", GraphOperation::Undo, &editor)),
-                boxed(operation_button("重做流程", GraphOperation::Redo, &editor)),
-                boxed(widgets::button(
-                    "保存",
-                    ButtonVariant::Primary,
-                    ActionButton(AppAction::SaveToRemote),
-                )),
+                boxed(widgets::action_menu("结构操作", structure)),
+                boxed(operation_button("撤销", GraphOperation::Undo, &editor)),
+                boxed(operation_button("重做", GraphOperation::Redo, &editor)),
             ]);
             controls.push(boxed(bsn! {
                 Text("")

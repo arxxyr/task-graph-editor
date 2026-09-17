@@ -290,55 +290,31 @@ fn action_bar(has_data: bool, connected: bool) -> Vec<BoxedScene> {
         return Vec::new();
     }
 
-    let mut items: Vec<BoxedScene> = vec![boxed(widgets::button_gated(
-        "应用到远程文件",
-        ButtonVariant::Primary,
-        ButtonGate::WhenIdle,
-        ActionButton(AppAction::SaveToRemote),
-    ))];
-
-    // 三个 ROS2 取数按钮还要求先选中一个位姿点位
     let fetches = [
         ("获取底盘位姿", AppAction::FetchChassisPose),
         ("获取头部关节", AppAction::FetchHeadJoints),
         ("获取腰部关节", AppAction::FetchWaistJoints),
     ];
-    for (label, action) in fetches {
-        items.push(boxed(widgets::button_gated(
-            label,
-            ButtonVariant::Normal,
-            ButtonGate::WhenIdleAndPose,
-            ActionButton(action),
-        )));
-    }
-    // 提示只在没选中位姿时露出，显隐由 sync_pose_hint 控制——
-    // 选中与否是属性，塞进重建条件会让整条操作栏跟着重建
-    items.push(boxed(bsn! {
-        Node { display: {Display::None} }
-        PoseHintText
-        Children [(widgets::hint("← 位姿相关按钮需先在下方选中一个点位"))]
-    }));
+    let entries = fetches
+        .into_iter()
+        .map(|(label, action)| {
+            boxed(widgets::menu_action(
+                label,
+                ActionButton(action),
+                ButtonGate::WhenIdleAndPose,
+            ))
+        })
+        .collect();
+    let items = vec![
+        boxed(widgets::action_menu("位姿取数", entries)),
+        boxed(widgets::button_gated(
+            "保存到远程",
+            ButtonVariant::Primary,
+            ButtonGate::WhenIdle,
+            ActionButton(AppAction::SaveToRemote),
+        )),
+    ];
     items
-}
-
-/// 顶栏那句"需先选中位姿"的提示
-#[derive(Component, Clone, Default)]
-struct PoseHintText;
-
-/// 选中位姿后收起提示，取消选中再露出来
-fn sync_pose_hint(editor: Res<Editor>, mut hints: Query<&mut Node, With<PoseHintText>>) {
-    if !editor.is_changed() {
-        return;
-    }
-    let display = match editor.has_pose_selection() {
-        true => Display::None,
-        false => Display::Flex,
-    };
-    for mut node in &mut hints {
-        if node.display != display {
-            node.display = display;
-        }
-    }
 }
 
 // ============================================================
@@ -1280,7 +1256,6 @@ impl Plugin for EditorPanelPlugin {
                     // 先提交旧树销毁，再查询现存控件；共享资源只限制并行，不会刷新延迟命令。
                     (
                         sync_pose_selection,
-                        sync_pose_hint,
                         sync_document_source,
                         fill_lazy_bodies,
                         push_initial_values,

@@ -473,3 +473,21 @@ shell 同样不会展开其中的 `~`。
   `uv run --no-project python scripts/test_release_notes.py` 验证提取边界和失败场景。
 - Unix 本地原子提交测试和部署回归需要 `python3`；Windows 跳过 Unix 系统调用集成测试
 - 部署脚本远端启用严格错误退出，失败保留现有可执行文件和上传包；先在临时位置准备、校验，再替换
+
+### 日志分析
+
+- `src/log_analysis.rs`：原生分析适配、独立子进程与完整报告回执；`main` 在创建窗口前分发内部分析模式。
+- `src/ui/log_analysis.rs`：日志操作与异步回执；`src/ui/log_analysis/view.rs`：独立页面、多选筛选、分页及报告入口。
+- `src/ssh/logs.rs`：复用现有连接，只读 SFTP 浏览与流式下载，取消后删除本地半文件。
+- `3rd-party/log-analyzer`：内嵌 0.5.8 分析核心，来源见该目录 `UPSTREAM.md`；无需原仓库路径或动态插件。
+- `WorkerRequest::Logs` 使用独立回执通道与连接代次，不混用任务图保存/加载票据。
+- 日志操作也经 `AppAction` / `InputFlush` 分发，等待同帧输入与异步粘贴完成。
+- 原始解析与暂停统计沿用来源实现；宿主内嵌字体用于中文报告，不能重新引入系统字体硬依赖。
+- 每次运行独占目录、每份输入独立子目录；禁止清空使用者指定的报告根目录。
+- 测试及使用说明见 `docs/log-analysis.md`。
+
+日志分析有“动作与轮次”和“工件节拍”两种独立口径，详见 `docs/log-analysis.md`。
+统计开关是属性同步，不重建页面；每个分析请求冻结选项，忙碌时禁止修改。
+工件节拍采用显式北京时间、整数微秒和按进程隔离的事件证据，排除结构不完整周期；
+等待不确定时不得猜测扣除。JSON、交互图和汇总共用同一份逐轮判定。
+流程图资源 `assets/log_analysis/cycle-flow.html` 由 Archify 从同目录 JSON 生成，修改需重新验收。

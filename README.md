@@ -81,12 +81,12 @@ ROS2 取数另需远端的 ROS2 Humble 和机器人环境。
 
 ## 使用
 
-1. 启动应用，在左侧面板填写 SSH 连接信息（主机、端口、用户名、密码）
+1. 启动应用，在左侧填写主机、用户名和密码；端口、私钥及任务目录收在「连接设置」中
 2. 点击「连接」，认证成功后自动加载远程目录下的 JSON 文件列表
 3. 点击文件名加载任务图，右侧显示元数据和按类型分组的 context 编辑器
-4. 编辑数据，或点击位姿卡片选中后用顶栏按钮从 ROS2 获取实时数据
+4. 编辑数据，或点击位姿卡片选中后用顶栏「位姿取数」菜单从 ROS2 获取实时数据
 5. 右键文件可备份、删除，右键空白区域可上传本地文件
-6. 点击「应用到远程文件」将修改写回远程文件
+6. 点击「保存到远程」将修改写回远程文件
 
 元数据卡片中的“保存位置”记录文档的实际来源。修改左侧目录后点击刷新可浏览另一目录，当前文档
 仍保存到原位置；重新连接需重新加载文档。修改 `task_id` 会更名，目标同名文件已存在时拒绝覆盖。
@@ -182,7 +182,7 @@ GitHub Release 只显示标签对应的条目，并附版本信息和下载说�
 本地预览和回归检查（Python 3.11+，仅使用标准库）：
 
 ```bash
-uv run --no-project python scripts/release_notes.py --tag v0.9.0
+uv run --no-project python scripts/release_notes.py --tag v0.10.0
 uv run --no-project python scripts/test_release_notes.py
 ```
 
@@ -198,8 +198,8 @@ Release。轻量标签、附注标签以及 `master` 历史提交上的标签均
 
 ```bash
 git switch master
-git tag v0.9.0
-git push github v0.9.0
+git tag v0.10.0
+git push github v0.10.0
 ```
 
 发布门禁的本地隔离测试：`python3 scripts/test_release_tag.py`，只创建临时 Git 仓库。
@@ -208,10 +208,20 @@ git push github v0.9.0
 
 | 平台 | 文件名 |
 |------|--------|
-| Linux x64 | `task-graph-editor-v0.9.0+{commit}-linux-x64.tar.gz` |
-| macOS ARM64 | `task-graph-editor-v0.9.0+{commit}-macos-arm64.zip`（应用包） |
-| Windows x64 | `task-graph-editor-v0.9.0+{commit}-windows-x64.zip` |
+| Linux x64 | `task-graph-editor-v0.10.0+{commit}-linux-x64.tar.gz` |
+| macOS ARM64 | `task-graph-editor-v0.10.0+{commit}-macos-arm64.zip`（应用包） |
+| Windows x64 | `task-graph-editor-v0.10.0+{commit}-windows-x64.zip` |
 
 ## 许可证
 
 MIT
+
+## 日志分析
+
+顶栏新增「日志分析」页面：支持本地多文件选择、远程日志目录浏览与多选、文件名筛选、
+后台分析和取消。暂停、错误轮次可独立勾选纳入统计，默认排除。
+提供“动作与轮次”和“工件节拍”两种口径：前者输出 CSV、中文甘特图与合并时间线；
+后者支持北京时间日期、可靠搬框等待扣除及含逐轮证据的交互报告。
+每次分析写入独立目录，保留旧报告；远程读取复用当前 SSH 会话。
+
+详见 [日志分析使用与开发说明](docs/log-analysis.md)。

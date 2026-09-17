@@ -21,6 +21,7 @@ pub mod fonts;
 pub mod graph_edit;
 pub mod graph_layout;
 pub mod graph_view;
+pub mod log_analysis;
 pub mod password;
 pub mod screenshot;
 pub mod shell;
@@ -343,6 +344,7 @@ impl Plugin for EditorUiPlugin {
                 graph_view::GraphViewPlugin,
                 graph_edit::GraphEditPlugin,
                 document_guard::DocumentGuardPlugin,
-            ));
+            ))
+            .add_plugins(log_analysis::LogAnalysisPlugin);
     }
 }

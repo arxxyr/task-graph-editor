@@ -1,0 +1,112 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "工件流转周期 · 四段证据链",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "frontend": {
+          "label": "周期边界"
+        },
+        "backend": {
+          "label": "成功证据"
+        }
+      }
+    }
+  },
+  "lanes": [
+    {
+      "id": "cycle",
+      "label": "同一主控进程 · 真实时间轴"
+    }
+  ],
+  "mainPath": [
+    "anchor",
+    "pick",
+    "exchange",
+    "put",
+    "next"
+  ],
+  "nodes": [
+    {
+      "id": "anchor",
+      "lane": "cycle",
+      "col": 0,
+      "type": "frontend",
+      "label": "取件导航创建",
+      "sublabel": "周期起点"
+    },
+    {
+      "id": "pick",
+      "lane": "cycle",
+      "col": 1,
+      "type": "backend",
+      "label": "取件成功",
+      "sublabel": "normal_arm_pick_merged"
+    },
+    {
+      "id": "exchange",
+      "lane": "cycle",
+      "col": 2,
+      "type": "backend",
+      "label": "气密换件成功",
+      "sublabel": "工位 1 或工位 2"
+    },
+    {
+      "id": "put",
+      "lane": "cycle",
+      "col": 3,
+      "type": "backend",
+      "label": "回框放件成功",
+      "sublabel": "normal_arm_put_merged"
+    },
+    {
+      "id": "next",
+      "lane": "cycle",
+      "col": 4,
+      "type": "frontend",
+      "label": "下次取件导航创建",
+      "sublabel": "本轮终点 · 下轮起点",
+      "width": 180
+    }
+  ],
+  "edges": [
+    {
+      "from": "anchor",
+      "to": "pick"
+    },
+    {
+      "from": "pick",
+      "to": "exchange"
+    },
+    {
+      "from": "exchange",
+      "to": "put"
+    },
+    {
+      "from": "put",
+      "to": "next"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "净周期",
+      "items": [
+        "四段分别扣除已确认搬框等待的交集，合计等于净周期。",
+        "保留原始时间戳；阶段间隔不代表单一模块的独占耗时。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "有效样本",
+      "items": [
+        "三项成功记录按顺序各出现一次，周期必须闭合。",
+        "默认整轮排除暂停、执行错误和人工干预，不以时长删除极值。"
+      ]
+    }
+  ]
+}

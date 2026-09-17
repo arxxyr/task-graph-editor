@@ -97,29 +97,15 @@ fn connect_panel(session: &Session) -> impl Scene {
         "SSH 连接",
         bsn_list![
             host_row(&login.host),
-            widgets::form_row("端口", widgets::text_field(login.port, LoginField::Port)),
-            widgets::form_row(
-                "用户名",
-                widgets::text_field(login.username, LoginField::Username)
-            ),
-            widgets::form_row(
-                "密码",
-                widgets::password_field(login.password, PasswordFieldMarker)
-            ),
-            widgets::hint("密码留空则用公钥认证：ssh-agent → 私钥文件"),
-            widgets::form_row(
-                "私钥",
-                widgets::text_field(login.identity_file, LoginField::IdentityFile)
-            ),
-            widgets::hint("留空则依次尝试 ~/.ssh/id_rsa、id_ecdsa、id_ed25519"),
-            widgets::form_row(
-                "DOMAIN_ID",
-                widgets::text_field(login.ros_domain_id, LoginField::RosDomainId)
-            ),
-            widgets::form_row(
-                "远程目录",
-                widgets::text_field(login.remote_dir, LoginField::RemoteDir)
-            ),
+            widgets::form_row("用户名", widgets::text_field(login.username, LoginField::Username)),
+            widgets::form_row("密码", widgets::password_field(login.password, PasswordFieldMarker)),
+            widgets::collapsible("连接设置", None, false, bsn_list![
+                widgets::form_row("端口", widgets::text_field(login.port, LoginField::Port)),
+                widgets::form_row("私钥", widgets::text_field(login.identity_file, LoginField::IdentityFile)),
+                widgets::hint("密码留空时使用 ssh-agent 或本机默认私钥。"),
+                widgets::form_row("DOMAIN_ID", widgets::text_field(login.ros_domain_id, LoginField::RosDomainId)),
+                widgets::form_row("任务目录", widgets::text_field(login.remote_dir, LoginField::RemoteDir)),
+            ]),
             (
                 Node {
                     flex_direction: FlexDirection::Row,
@@ -502,7 +488,7 @@ fn connect_buttons() -> Vec<BoxedScene> {
     .map(|kind| {
         let variant = match kind {
             ConnectButton::Connect => ButtonVariant::Primary,
-            _ => ButtonVariant::Normal,
+            _ => ButtonVariant::Plain,
         };
         let caption = bsn! {
             Text::default()
@@ -568,6 +554,7 @@ fn spawn_connect_panel(
 #[allow(clippy::type_complexity)]
 fn sync_connect_buttons(
     session: Res<Session>,
+    mode: Option<Res<super::graph_view::ViewMode>>,
     mut buttons: Query<(
         Entity,
         &ConnectButton,
@@ -587,7 +574,13 @@ fn sync_connect_buttons(
     let mut move_focus = false;
     let mut next_focus = None;
     for (entity, kind, mut node, mut tab, disabled, pressed) in &mut buttons {
-        let state = kind.state(&session);
+        let mut state = kind.state(&session);
+        if mode.as_deref() == Some(&super::graph_view::ViewMode::Logs)
+            && matches!(kind, ConnectButton::Refresh | ConnectButton::Upload)
+        {
+            state.visible = false;
+            state.enabled = false;
+        }
         let display = match state.visible {
             true => Display::Flex,
             false => Display::None,

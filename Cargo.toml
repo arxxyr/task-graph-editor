@@ -1,9 +1,14 @@
 [package]
 name = "task-graph-editor"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 
 [dependencies]
+analyzer-core = { path = "3rd-party/log-analyzer/crates/analyzer-core" }
+analyzer-merger = { path = "3rd-party/log-analyzer/crates/analyzer-merger" }
+analyzer-visualizer = { path = "3rd-party/log-analyzer/crates/analyzer-visualizer" }
+master-control-analyzer = { path = "3rd-party/log-analyzer/crates/plugins/master-control-analyzer" }
+
 # Bevy：按需挑选 feature，不用现成的 "ui" 组合
 # —— 后者会连带 bevy_gilrs（手柄，Linux 上要 libudev-dev）、sysinfo_plugin、webgl2，
 # 本工具都用不到。去掉后 Linux CI 不再需要额外系统依赖，产物也更小。

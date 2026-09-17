@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="UTF-8" /><meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  /><title>工件节拍 · 日志分析</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f6fa;
+      --card: #fff;
+      --text: #172139;
+      --muted: #52617c;
+      --line: #d8dfea;
+      --accent: #196fc9;
+      --bad: #b13a3a;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      font:
+        15px/1.6 system-ui,
+        "Microsoft YaHei",
+        sans-serif;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main {
+      max-width: 1440px;
+      margin: auto;
+      padding: 28px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 30px;
+    }
+    h2 {
+      font-size: 19px;
+      margin: 0 0 12px;
+    }
+    p {
+      margin: 8px 0;
+    }
+    .muted {
+      color: var(--muted);
+    }
+    section,
+    details.card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 20px;
+      margin: 18px 0;
+    }
+    button,
+    select {
+      font: inherit;
+      color: var(--text);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 7px 12px;
+    }
+    button {
+      cursor: pointer;
+    }
+    button:hover,
+    button:focus-visible {
+      border-color: var(--accent);
+      outline: 2px solid #196fc930;
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+    label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+    .metric {
+      border-left: 3px solid var(--accent);
+      padding: 8px 14px;
+      background: var(--bg);
+    }
+    .metric b {
+      display: block;
+      font-size: 24px;
+      font-variant-numeric: tabular-nums;
+    }
+    .chart {
+      overflow-x: auto;
+    }
+    svg#plot {
+      width: 100%;
+      min-width: 640px;
+      height: 350px;
+      display: block;
+    }
+    circle {
+      cursor: pointer;
+    }
+    circle:focus {
+      outline: none;
+      stroke: var(--text);
+      stroke-width: 3;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-variant-numeric: tabular-nums;
+    }
+    th,
+    td {
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      padding: 8px;
+      vertical-align: top;
+    }
+    th {
+      white-space: nowrap;
+      font-weight: 600;
+    }
+    td {
+      overflow-wrap: anywhere;
+    }
+    tr.selected {
+      background: #196fc919;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 12px;
+      background: var(--bg);
+      padding: 12px;
+      border-radius: 8px;
+    }
+    .table-wrap {
+      overflow: auto;
+      max-height: 480px;
+    }
+    .bad {
+      color: var(--bad);
+    }
+    summary {
+      cursor: pointer;
+      font-weight: 600;
+    }
+    iframe {
+      width: 100%;
+      height: 680px;
+      border: 0;
+      margin-top: 12px;
+    }
+    #detail {
+      scroll-margin-top: 20px;
+    }
+    small {
+      color: var(--muted);
+    }
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .empty {
+      padding: 40px;
+      text-align: center;
+      color: var(--muted);
+    }
+    @media (max-width: 760px) {
+      main {
+        padding: 12px;
+      }
+      .split {
+        grid-template-columns: 1fr;
+      }
+      h1 {
+        font-size: 25px;
+      }
+      section {
+        padding: 14px;
+      }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111923;
+        --card: #1c2635;
+        --text: #e2e9f4;
+        --muted: #a3b2cb;
+        --line: #354257;
+        --accent: #68b7ff;
+        --bad: #ff9494;
+      }
+    }
+  </style>
+  <main>
+    <small>任务图编辑器 / 独立日志报告 / 北京时间 UTC+08:00</small>
+    <h1>工件流转节拍</h1>
+    <p id="range" class="muted"></p>
+    <p class="muted">
+      相邻取件导航创建划分周期。净周期只扣除有可靠边界的阻塞搬框等待；原始时间轴不移动。
+    </p>
+    <section>
+      <h2>筛选与统计口径</h2>
+      <div class="filters">
+        <label
+          >工位<select id="station">
+            <option value="">全部工位</option>
+            <option value="1">工位 1</option>
+            <option value="2">工位 2</option>
+            <option value="unknown">工位未知</option>
+          </select></label
+        ><label
+          >起始小时<select id="hour">
+            <option value="">全部小时</option>
+          </select></label
+        ><label
+          >图表指标<select id="metric">
+            <option value="net_us">净周期</option>
+            <option value="raw_us">原始周期</option>
+          </select></label
+        ><button id="reset">重置筛选</button>
+      </div>
+      <p id="rules" class="muted"></p>
+      <div class="metrics" id="metrics"></div>
+    </section>
+    <section>
+      <div class="filters">
+        <h2 style="margin: 0; flex: 1">周期随时间变化</h2>
+        <button id="min">定位最小</button><button id="max">定位最大</button
+        ><button id="wait">定位最长搬框等待</button>
+      </div>
+      <p class="muted">
+        点选散点查看原始证据。蓝色为工位 1，橙色为工位 2；平均线随筛选同步变化，不删除正常极值。
+      </p>
+      <div class="chart">
+        <svg
+          id="plot"
+          viewBox="0 0 1080 350"
+          role="img"
+          aria-label="周期散点及平均线"
+        ></svg>
+      </div>
+    </section>
+    <section id="detail">
+      <h2>逐轮证据</h2>
+      <div id="evidence" class="muted">点击散点、周期编号或极值定位按钮。</div>
+    </section>
+    <section>
+      <h2>有效周期 <span id="valid-count"></span></h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>周期 / 起点</th>
+              <th>工位</th>
+              <th>原始秒</th>
+              <th>扣除秒</th>
+              <th>净秒</th>
+              <th>等待核查</th>
+            </tr>
+          </thead>
+          <tbody id="valid"></tbody>
+        </table>
+      </div>
+    </section>
+    <details class="card">
+      <summary>
+        已排除周期 <span id="excluded-count"></span>（不参与统计）
+      </summary>
+      <p id="reasons" class="muted"></p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>周期 / 起点</th>
+              <th>工位</th>
+              <th>排除原因（可重叠）</th>
+            </tr>
+          </thead>
+          <tbody id="excluded"></tbody>
+        </table>
+      </div>
+    </details>
+    <section>
+      <h2>工位与分小时汇总</h2>
+      <p class="muted">
+        以下分组使用当前筛选条件；日期和小时均由周期起点的北京时间确定。
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>分组</th>
+              <th>有效 / 排除</th>
+              <th>平均秒</th>
+              <th>最小秒</th>
+              <th>最大秒</th>
+              <th>中位秒</th>
+              <th>等待轮数 / 扣除秒</th>
+            </tr>
+          </thead>
+          <tbody id="groups"></tbody>
+        </table>
+      </div>
+    </section>
+    <details class="card">
+      <summary>数据来源、截止时间与不确定性</summary>
+      <pre id="audit"></pre>
+    </details>
+    <details class="card" id="flow-section">
+      <summary>四阶段周期流程（Archify）</summary>
+      <iframe
+        id="flow"
+        title="周期证据流程图"
+        sandbox="allow-scripts allow-downloads"
+      ></iframe>
+    </details>
+    <p class="muted">
+      这是机器人工件流转节拍，不等同于按工件 ID
+      追踪的生命周期或合格品产量。阶段间隔可能包含并行任务，不能解释为单一模块独占耗时。
+    </p>
+  </main>
+  <script>
+    "use strict";
+    const D = /*DATA*/ null,
+      FLOW = /*FLOW*/ null;
+    const $ = (id) => document.getElementById(id),
+      NS = "http://www.w3.org/2000/svg";
+    const sec = (x) => (x == null ? "—" : (x / 1e6).toFixed(6));
+    const time = (x) =>
+      x == null
+        ? "未闭合"
+        : new Date(x / 1000 + 8 * 3600000)
+            .toISOString()
+            .replace("T", " ")
+            .slice(0, 19) +
+          "." +
+          String(((x % 1e6) + 1e6) % 1e6).padStart(6, "0");
+    const hour = (c) => time(c.start.timestamp_us).slice(0, 13);
+    function node(tag, text, cls) {
+      const e = document.createElement(tag);
+      if (text != null) e.textContent = text;
+      if (cls) e.className = cls;
+      return e;
+    }
+    function svg(tag, attrs, text) {
+      const e = document.createElementNS(NS, tag);
+      for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+      if (text != null) e.textContent = text;
+      return e;
+    }
+    let chosen = null,
+      valid = [],
+      filtered = [];
+    function stats(rows, key) {
+      const a = rows
+          .filter((c) => c.included && c[key] != null)
+          .map((c) => c[key])
+          .sort((a, b) => a - b),
+        n = a.length;
+      return {
+        n,
+        excluded: rows.length - n,
+        mean: n ? a.reduce((a, b) => a + b, 0) / n : null,
+        min: n ? a[0] : null,
+        max: n ? a[n - 1] : null,
+        median: n
+          ? (a[Math.floor((n - 1) / 2)] + a[Math.floor(n / 2)]) / 2
+          : null,
+        wait: rows.filter((c) => c.included).reduce((s, c) => s + c.wait_us, 0),
+        waiting: rows.filter(
+          (c) =>
+            c.included &&
+            c.waits.some(
+              (w) => w.reliable && w.observed_end_us > w.start.timestamp_us,
+            ),
+        ).length,
+      };
+    }
+    function locate(c) {
+      if (!c) return;
+      chosen = c.id;
+      show(c);
+      $("detail").scrollIntoView({ behavior: "smooth", block: "start" });
+      draw();
+    }
+    function evidence(e) {
+      const p = node(
+        "pre",
+        e
+          ? `第 ${e.line} 行 · ${time(e.timestamp_us)}\n${e.text}`
+          : "无闭合证据",
+      );
+      return p;
+    }
+    function show(c) {
+      const root = $("evidence");
+      root.replaceChildren();
+      root.append(
+        node(
+          "h3",
+          `${c.id} · 工位 ${c.station ?? "未知"} · ${c.included ? "已纳入" : "已排除"}`,
+        ),
+        node("p", `${c.source}\n进程 ${c.process}`),
+        node(
+          "p",
+          `原始 ${sec(c.raw_us)} 秒 − 搬框等待 ${sec(c.wait_us)} 秒 = 净周期 ${sec(c.net_us)} 秒`,
+        ),
+      );
+      if (c.reasons.length) root.append(node("p", c.reasons.join("；"), "bad"));
+      root.append(node("h3", "周期边界"), evidence(c.start), evidence(c.end));
+      if (c.stages_us.length)
+        root.append(
+          node(
+            "p",
+            c.stages_us
+              .map(
+                (v, i) =>
+                  `阶段 ${i + 1}：${sec(v)} 秒（扣除 ${sec(c.stage_wait_us[i])} 秒）`,
+              )
+              .join("；"),
+          ),
+        );
+      root.append(node("h3", `成功节点证据（${c.success.length} 条）`));
+      for (const e of c.success) root.append(evidence(e));
+      for (const [label, key] of [
+        ["执行错误", "errors"],
+        ["人工干预", "interventions"],
+      ]) {
+        if (c[key].length)
+          root.append(
+            node(
+              "h3",
+              `${label} · ${c[key].length} 条日志（不是独立故障次数）`,
+            ),
+          );
+        for (const e of c[key]) root.append(evidence(e));
+      }
+      for (const [label, key] of [
+        ["暂停区间", "pauses"],
+        ["搬框等待", "waits"],
+      ])
+        for (const w of c[key]) {
+          root.append(
+            node("h3", label),
+            node(
+              "p",
+              `${w.note || "起止已闭合"}；观测终点 ${time(w.observed_end_us)}`,
+            ),
+            evidence(w.start),
+            evidence(w.end),
+          );
+        }
+    }
+    function row(c, excluded) {
+      const tr = node("tr");
+      const td = node("td"),
+        button = node("button", c.id);
+      button.onclick = () => locate(c);
+      td.append(button, node("div", time(c.start.timestamp_us), "muted"));
+      tr.append(td, node("td", c.station ?? "未知"));
+      if (excluded) tr.append(node("td", c.reasons.join("；"), "bad"));
+      else
+        for (const value of [
+          sec(c.raw_us),
+          sec(c.wait_us),
+          sec(c.net_us),
+          c.waits.some((w) => !w.reliable) ? "存在未扣除的不确定等待" : "—",
+        ])
+          tr.append(node("td", value));
+      return tr;
+    }
+    function draw() {
+      const plot = $("plot");
+      plot.replaceChildren();
+      if (!valid.length) {
+        plot.append(
+          svg(
+            "text",
+            { x: 540, y: 170, "text-anchor": "middle", fill: "var(--muted)" },
+            "当前筛选无有效周期",
+          ),
+        );
+        return;
+      }
+      const key = $("metric").value,
+        values = valid.map((c) => c[key]);
+      const a = valid[0].start.timestamp_us,
+        b = valid[valid.length - 1].start.timestamp_us;
+      const ymax = values.reduce((m, v) => Math.max(m, v), 1) * 1.12,
+        x = (t) => 70 + ((t - a) / Math.max(b - a, 1)) * 970,
+        y = (v) => 290 - (v / ymax) * 240;
+      for (let i = 0; i <= 4; i++) {
+        const v = (ymax * i) / 4;
+        plot.append(
+          svg("line", {
+            x1: 70,
+            y1: y(v),
+            x2: 1040,
+            y2: y(v),
+            stroke: "var(--line)",
+          }),
+          svg(
+            "text",
+            {
+              x: 62,
+              y: y(v) + 4,
+              "text-anchor": "end",
+              fill: "var(--muted)",
+              "font-size": 12,
+            },
+            (v / 1e6).toFixed(1),
+          ),
+        );
+      }
+      plot.append(svg("text", { x: 12, y: 30, fill: "var(--muted)" }, "秒"));
+      const mean = values.reduce((a, b) => a + b, 0) / values.length;
+      plot.append(
+        svg("line", {
+          x1: 70,
+          x2: 1040,
+          y1: y(mean),
+          y2: y(mean),
+          stroke: "var(--accent)",
+          "stroke-dasharray": "7 5",
+        }),
+        svg(
+          "text",
+          {
+            x: 1040,
+            y: y(mean) - 9,
+            "text-anchor": "end",
+            fill: "var(--accent)",
+          },
+          `平均 ${sec(mean)} 秒`,
+        ),
+      );
+      for (const c of valid) {
+        const dot = svg("circle", {
+          cx: x(c.start.timestamp_us),
+          cy: y(c[key]),
+          r: chosen === c.id ? 7 : 4,
+          fill: c.station === 1 ? "#247dcc" : "#db8532",
+          opacity: 0.85,
+          tabindex: 0,
+          role: "button",
+          "aria-label": `${c.id} ${sec(c[key])} 秒`,
+        });
+        dot.append(
+          svg(
+            "title",
+            {},
+            `${c.id} · ${time(c.start.timestamp_us)} · ${sec(c[key])} 秒`,
+          ),
+        );
+        dot.onclick = () => locate(c);
+        dot.onkeydown = (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            locate(c);
+          }
+        };
+        plot.append(dot);
+      }
+      plot.append(
+        svg(
+          "text",
+          { x: 70, y: 325, fill: "var(--muted)", "font-size": 12 },
+          time(a).slice(0, 19),
+        ),
+        svg(
+          "text",
+          {
+            x: 1040,
+            y: 325,
+            "text-anchor": "end",
+            fill: "var(--muted)",
+            "font-size": 12,
+          },
+          time(b).slice(0, 19),
+        ),
+      );
+    }
+    function render() {
+      const station = $("station").value,
+        h = $("hour").value,
+        key = $("metric").value;
+      filtered = D.cycles.filter(
+        (c) =>
+          (!station ||
+            (station === "unknown"
+              ? c.station == null
+              : String(c.station) === station)) &&
+          (!h || hour(c) === h),
+      );
+      valid = filtered.filter((c) => c.included);
+      const s = stats(filtered, key),
+        metrics = $("metrics");
+      metrics.replaceChildren();
+      for (const [label, value] of [
+        ["有效样本", s.n],
+        ["平均 / 秒", sec(s.mean)],
+        ["最小 / 秒", sec(s.min)],
+        ["最大 / 秒", sec(s.max)],
+        ["中位 / 秒", sec(s.median)],
+        ["搬框等待扣除 / 秒", sec(s.wait)],
+      ]) {
+        const e = node("div", label, "metric");
+        e.append(node("b", value));
+        metrics.append(e);
+      }
+      $("valid-count").textContent = `(${valid.length})`;
+      $("excluded-count").textContent = `(${filtered.length - valid.length})`;
+      $("valid").replaceChildren(...valid.map((c) => row(c, false)));
+      $("excluded").replaceChildren(
+        ...filtered.filter((c) => !c.included).map((c) => row(c, true)),
+      );
+      const reasons = {};
+      for (const c of filtered)
+        for (const reason of c.reasons)
+          reasons[reason] = (reasons[reason] || 0) + 1;
+      $("reasons").textContent =
+        Object.entries(reasons)
+          .map(([r, n]) => `${r} ${n} 轮`)
+          .join("；") || "无排除周期";
+      for (const id of ["min", "max", "wait"]) $(id).disabled = !valid.length;
+      if (chosen && !filtered.some((c) => c.id === chosen)) {
+        chosen = null;
+        $("evidence").replaceChildren(
+          node("p", "原选中周期不在当前筛选范围，请重新选择。"),
+        );
+      }
+      const groups = new Map([["全部", filtered]]);
+      for (const c of filtered)
+        for (const group of [`工位 ${c.station ?? "未知"}`, `${hour(c)} 时`]) {
+          if (!groups.has(group)) groups.set(group, []);
+          groups.get(group).push(c);
+        }
+      $("groups").replaceChildren(
+        ...[...groups].map(([g, rows]) => {
+          const s = stats(rows, key),
+            tr = node("tr");
+          for (const v of [
+            g,
+            `${s.n} / ${s.excluded}`,
+            sec(s.mean),
+            sec(s.min),
+            sec(s.max),
+            sec(s.median),
+            `${s.waiting} / ${sec(s.wait)}`,
+          ])
+            tr.append(node("td", v));
+          return tr;
+        }),
+      );
+      draw();
+    }
+    const starts = D.sources.map((s) => s.first_us).filter((v) => v != null),
+      ends = D.sources.map((s) => s.last_us).filter((v) => v != null);
+    $("range").textContent =
+      `日志观测范围：${starts.length ? time(Math.min(...starts)) : "无"} 至 ${ends.length ? time(Math.max(...ends)) : "无"}。仅代表已采集时段，各进程分别统计。`;
+    $("rules").textContent =
+      `起点日期：${D.options.date || "全部"}；暂停轮次${D.statistics.include_paused ? "纳入" : "排除"}，错误轮次${D.statistics.include_errors ? "纳入" : "排除"}，人工干预${D.options.include_interventions ? "纳入" : "排除"}；${D.options.deduct_wait ? "扣除已确认搬框等待" : "本次未扣除等待（净值等于原始值）"}。改变应用内口径后需重新分析；此页筛选不改变样本判定。`;
+    for (const h of [...new Set(D.cycles.map(hour))].sort()) {
+      $("hour").append(new Option(h + " 时", h));
+    }
+    $("audit").textContent = JSON.stringify(
+      { 时区: D.timezone, 采集副本去重: D.duplicates, 来源: D.sources },
+      null,
+      2,
+    );
+    $("flow-section").addEventListener("toggle", () => {
+      if ($("flow-section").open && !$("flow").srcdoc) $("flow").srcdoc = FLOW;
+    });
+    for (const id of ["station", "hour", "metric"]) $(id).onchange = render;
+    $("reset").onclick = () => {
+      $("station").value = "";
+      $("hour").value = "";
+      $("metric").value = "net_us";
+      render();
+    };
+    $("min").onclick = () =>
+      locate(
+        valid.reduce(
+          (a, c) =>
+            a == null || c[$("metric").value] < a[$("metric").value] ? c : a,
+          null,
+        ),
+      );
+    $("max").onclick = () =>
+      locate(
+        valid.reduce(
+          (a, c) =>
+            a == null || c[$("metric").value] > a[$("metric").value] ? c : a,
+          null,
+        ),
+      );
+    $("wait").onclick = () =>
+      locate(
+        valid.reduce(
+          (a, c) => (a == null || c.wait_us > a.wait_us ? c : a),
+          null,
+        ),
+      );
+    render();
+  </script>
+</html>

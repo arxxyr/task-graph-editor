@@ -61,6 +61,12 @@ pub enum BusyState {
 
 /// 发送给后台线程的请求
 pub enum WorkerRequest {
+    /// 日志操作使用独立回执通道，不参与任务图文档保存状态。
+    Logs {
+        operation: crate::ssh::logs::LogOperation,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        reply: mpsc::Sender<Result<crate::ssh::logs::LogReply, String>>,
+    },
     /// 连接 SSH（连接 + 读 ROS_DOMAIN_ID + 列出文件）
     Connect {
         host: String,
@@ -408,6 +414,20 @@ fn worker_loop(
         }
         // ── 处理请求 ──
         match request {
+            WorkerRequest::Logs {
+                operation,
+                cancel,
+                reply,
+            } => {
+                let result = match &connection {
+                    Some(conn) => conn
+                        .log_operation(operation, &cancel)
+                        .map_err(|e| e.to_string()),
+                    None => Err("请先连接远程主机".into()),
+                };
+                let _ = reply.send(result);
+                wake();
+            }
             WorkerRequest::Connect {
                 host,
                 port,

@@ -1,0 +1,10 @@
+_version: 2
+
+# 错误消息
+err.empty_timeline:
+  zh-CN: "时间线列表为空"
+  en: "Timeline list is empty"
+
+err.no_primary:
+  zh-CN: "未找到主时间线"
+  en: "Primary timeline not found"

@@ -436,7 +436,8 @@ fn content() -> impl Scene {
                 }
                 GraphPane
                 GraphSlot
-            )
+            ),
+            super::log_analysis::pane()
         ]
     }
 }

@@ -48,6 +48,8 @@ pub enum ViewMode {
     Params,
     /// 任务流程图
     Graph,
+    /// 日志选择与分析
+    Logs,
 }
 
 /// 流程图的浏览状态
@@ -177,7 +179,7 @@ struct DrillButton(String);
 
 /// 视图切换按钮
 #[derive(Component, Clone, Copy, Default)]
-struct ViewToggle(bool);
+struct ViewToggle(ViewMode);
 
 /// 顶栏入口只生成一次，切换时更新组件而不销毁按钮与焦点。
 #[derive(Component)]
@@ -345,20 +347,11 @@ fn toolbar(
                 }
                 Children [{crumbs}]
             ),
-            (
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: px(14),
-                    width: percent(100),
-                    flex_wrap: {FlexWrap::Wrap},
-                }
-                Children [
-                    (widgets::hint(summary)),
-                    (legend()),
-                    (widgets::hint("点击节点查看参数，详情按钮进入子图；悬停连线追踪路径，点击查看起终点"))
-                ]
-            ),
+            widgets::collapsible("图例与结构信息", None, false, bsn_list![
+                widgets::hint(summary),
+                legend(),
+                widgets::hint("点击节点查看参数，双击容器进入子图；点击连线查看起终点。"),
+            ]),
             {parallel_note}
         ]
     }
@@ -629,6 +622,7 @@ fn sync_view_mode(
     let (p, g) = match *mode {
         ViewMode::Params => (Display::Flex, Display::None),
         ViewMode::Graph => (Display::None, Display::Flex),
+        ViewMode::Logs => (Display::None, Display::None),
     };
     for mut node in &mut params {
         if node.display != p {
@@ -1229,10 +1223,7 @@ fn handle_view_toggle(
     let Ok(toggle) = toggles.get(event.entity) else {
         return;
     };
-    let want = match toggle.0 {
-        true => ViewMode::Graph,
-        false => ViewMode::Params,
-    };
+    let want = toggle.0;
     mode.set_if_neq(want);
     // picking 的 observer 在 PreUpdate 中触发；提前写 variant，让同帧 Feathers 样式同步可见。
     update_view_variants(want, &mut variants);
@@ -1240,10 +1231,7 @@ fn handle_view_toggle(
 
 fn update_view_variants(mode: ViewMode, toggles: &mut Query<(&ViewToggle, &mut ButtonVariant)>) {
     for (toggle, mut variant) in toggles.iter_mut() {
-        let selected = matches!(
-            (toggle.0, mode),
-            (true, ViewMode::Graph) | (false, ViewMode::Params)
-        );
+        let selected = toggle.0 == mode;
         variant.set_if_neq(match selected {
             true => ButtonVariant::Primary,
             false => ButtonVariant::Normal,
@@ -1282,12 +1270,17 @@ fn view_switch(current: ViewMode) -> Vec<BoxedScene> {
         boxed(widgets::button(
             "参数",
             variant(current == ViewMode::Params),
-            ViewToggle(false),
+            ViewToggle(ViewMode::Params),
         )),
         boxed(widgets::button(
             "流程图",
             variant(current == ViewMode::Graph),
-            ViewToggle(true),
+            ViewToggle(ViewMode::Graph),
+        )),
+        boxed(widgets::button(
+            "日志分析",
+            variant(current == ViewMode::Logs),
+            ViewToggle(ViewMode::Logs),
         )),
     ]
 }
@@ -1532,7 +1525,13 @@ mod tests {
         app.world_mut()
             .query::<(Entity, &ViewToggle)>()
             .iter(app.world())
-            .find(|(_, marker)| marker.0 == graph)
+            .find(|(_, marker)| {
+                marker.0
+                    == match graph {
+                        true => ViewMode::Graph,
+                        false => ViewMode::Params,
+                    }
+            })
             .unwrap()
             .0
     }
@@ -1602,7 +1601,7 @@ mod tests {
             .spawn_scene(widgets::button(
                 "流程图",
                 ButtonVariant::Normal,
-                ViewToggle(true),
+                ViewToggle(ViewMode::Graph),
             ))
             .unwrap()
             .id();

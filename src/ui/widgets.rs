@@ -4,7 +4,8 @@
 //! 统一在这里定义，保证整个界面的间距、圆角、字号一致。
 
 use bevy::feathers::controls::{
-    ButtonVariant, FeathersButton, FeathersCheckbox, FeathersNumberInput, FeathersTextInput,
+    ButtonVariant, FeathersButton, FeathersCheckbox, FeathersMenu, FeathersMenuButton,
+    FeathersMenuItem, FeathersMenuPopup, FeathersNumberInput, FeathersTextInput,
     FeathersTextInputContainer, NumberFormat,
 };
 use bevy::feathers::theme::{
@@ -33,6 +34,26 @@ pub type BoxedScene = Box<dyn bevy::scene::SceneBox>;
 /// 把任意场景装箱
 pub fn boxed(scene: impl Scene) -> BoxedScene {
     Box::new(scene)
+}
+
+/// 固定菜单一次生成，保持键盘导航及弹层焦点稳定。
+pub fn action_menu(label: &str, items: Vec<BoxedScene>) -> impl Scene {
+    bsn! {
+        @FeathersMenu
+        Node { flex_shrink: 0.0 }
+        Children [
+            (@FeathersMenuButton { @caption: {bsn! { Text({label.to_string()}) ThemedText }} }),
+            (@FeathersMenuPopup Node { min_width: px(180) } Children [{items}]),
+        ]
+    }
+}
+
+pub fn menu_action(label: &str, marker: impl Marker, gate: ButtonGate) -> impl Scene {
+    bsn! {
+        @FeathersMenuItem { @caption: {bsn! { Text({label.to_string()}) ThemedText }} }
+        template_value(marker)
+        template_value(gate)
+    }
 }
 
 /// 可插入 BSN 的标记组件
@@ -104,8 +125,10 @@ fn on_header_click(
 }
 
 /// 同步展开状态到内容节点的显示与指示符字形
+type CollapseRefresh = Or<(Changed<Collapsible>, Added<Children>)>;
+
 fn sync_collapse_state(
-    sections: Query<(&Collapsible, &Children), Changed<Collapsible>>,
+    sections: Query<(&Collapsible, &Children), CollapseRefresh>,
     mut bodies: Query<&mut Node, With<CollapseBody>>,
     chevrons: Query<Entity, With<CollapseChevron>>,
     descendants: Query<&Children>,
@@ -276,7 +299,7 @@ pub fn card_titled(
                     align_items: AlignItems::Center,
                     width: percent(100),
                 }
-                ThemeBackgroundColor({theme::CARD_HEADER_BG})
+                ThemeBackgroundColor({theme::CARD_BG})
                 Children [(
                     Text({title.into()})
                     template_value(title_marker)
