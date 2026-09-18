@@ -951,7 +951,7 @@ fn synchronize_selection(
     editing.panel_version += 1;
 }
 
-/// 文本框保留自己的编辑快捷键；流程快捷键仅在画布视图生效。
+/// 文本框保留自己的编辑快捷键；Ctrl/Cmd+S 保存全局生效，其余流程快捷键仅在画布视图生效。
 #[derive(SystemParam)]
 struct ShortcutContext<'w, 's> {
     keys: Res<'w, ButtonInput<KeyCode>>,
@@ -975,7 +975,8 @@ fn keyboard_shortcuts(context: ShortcutContext, mut actions: MessageWriter<AppAc
         parents,
         guard,
     } = context;
-    if *mode != ViewMode::Graph || guard.as_ref().is_some_and(|guard| guard.active()) {
+    // 文档保护确认层最优先：挂起时拦截一切快捷键。
+    if guard.as_ref().is_some_and(|guard| guard.active()) {
         return;
     }
     let command = keys.any_pressed([
@@ -984,8 +985,12 @@ fn keyboard_shortcuts(context: ShortcutContext, mut actions: MessageWriter<AppAc
         KeyCode::SuperLeft,
         KeyCode::SuperRight,
     ]);
+    // 保存不受视图限制，参数 / 流程图 / 日志分析下都可按；文本框聚焦时同样生效。
     if command && keys.just_pressed(KeyCode::KeyS) {
         actions.write(AppAction::SaveToRemote);
+        return;
+    }
+    if *mode != ViewMode::Graph {
         return;
     }
     if !editing.enabled

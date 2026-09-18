@@ -436,17 +436,10 @@ pub(super) fn rebuild(
     }
 }
 
-/// 日志页暂时隐藏任务图操作组与整个侧栏，切回编辑视图恢复原实体与状态。
-type DocumentSlots<'w, 's> = Query<
-    'w,
-    's,
-    &'static mut Node,
-    Or<(
-        With<super::super::shell::ActionBarSlot>,
-        With<super::super::shell::FileListSlot>,
-        With<super::super::shell::SidebarRoot>,
-    )>,
->;
+/// 日志页暂时隐藏任务图操作组，切回编辑视图恢复原实体与状态。
+/// 文件列表已收进任务工作台，随工作台整体显隐，不再由本系统单独管理。
+type DocumentSlots<'w, 's> =
+    Query<'w, 's, &'static mut Node, With<super::super::shell::ActionBarSlot>>;
 
 pub(super) fn sync_document_actions(mode: Res<ViewMode>, mut slots: DocumentSlots) {
     let display = match *mode {

@@ -188,7 +188,7 @@ impl Default for Logs {
             deduct_wait: true,
             output_parent: base.join("task-graph-editor-reports"),
             status:
-                "选择本地日志，或连接左侧 SSH 后浏览远程日志目录。支持 master_control 新旧格式。"
+                "选择本地日志，或连接顶栏 SSH 后浏览远程日志目录。支持 master_control 新旧格式。"
                     .into(),
             remote: None,
             task: None,

@@ -187,35 +187,26 @@ fn 统计勾选不重建页面且忙碌期间保持请求口径() {
     assert!(!app.world().resource::<Logs>().statistics.include_paused);
 }
 #[test]
-fn 日志标签独立隐藏编辑区而切回保留实体() {
+fn 日志标签独立隐藏编辑操作组而切回保留实体() {
     let mut app = app();
     let actions = app
         .world_mut()
         .spawn((Node::default(), super::super::shell::ActionBarSlot))
         .id();
-    let files = app
-        .world_mut()
-        .spawn((Node::default(), super::super::shell::FileListSlot))
-        .id();
-    let sidebar = app
-        .world_mut()
-        .spawn((Node::default(), super::super::shell::SidebarRoot))
-        .id();
+    // 工作台实体在场但不由本插件管理：显隐归 graph_view 的 sync_view_mode，断言传在 graph_view 侧。
+    app.world_mut()
+        .spawn((Node::default(), super::super::shell::TaskWorkspace));
     app.update();
-    for entity in [actions, files, sidebar] {
-        assert_eq!(
-            app.world().get::<Node>(entity).unwrap().display,
-            Display::None
-        );
-    }
+    assert_eq!(
+        app.world().get::<Node>(actions).unwrap().display,
+        Display::None
+    );
     app.world_mut().insert_resource(ViewMode::Params);
     app.update();
-    for entity in [actions, files, sidebar] {
-        assert_eq!(
-            app.world().get::<Node>(entity).unwrap().display,
-            Display::Flex
-        );
-    }
+    assert_eq!(
+        app.world().get::<Node>(actions).unwrap().display,
+        Display::Flex
+    );
 }
 #[test]
 fn 口径切换保留文件选择并拒绝非法日期启动() {

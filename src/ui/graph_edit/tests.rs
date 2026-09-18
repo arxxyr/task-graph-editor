@@ -1650,3 +1650,63 @@ fn 流程撤销快捷键不抢文本焦点且离开输入框后才执行图历�
         2
     );
 }
+
+#[test]
+fn 保存快捷键不受视图限制且ctrl与cmd都生效() {
+    for (mode, modifier) in [
+        (ViewMode::Params, KeyCode::ControlLeft),
+        (ViewMode::Params, KeyCode::SuperLeft),
+        (ViewMode::Graph, KeyCode::ControlLeft),
+        (ViewMode::Logs, KeyCode::ControlLeft),
+    ] {
+        let mut app = form_app("message");
+        *app.world_mut().resource_mut::<ViewMode>() = mode;
+        let ticket = app.world().resource::<Editor>().next_save_ticket();
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(modifier);
+            keys.press(KeyCode::KeyS);
+        }
+        app.update();
+        assert!(
+            matches!(
+                app.world().resource::<Session>().busy,
+                BusyState::Working(_)
+            ),
+            "{mode:?} 视图下应按出保存"
+        );
+        assert!(
+            app.world_mut()
+                .resource_mut::<Editor>()
+                .confirm_save(ticket),
+            "{mode:?} 视图下的保存票据应已开始"
+        );
+    }
+}
+
+#[test]
+fn 保存快捷键在文档保护确认期间不发出() {
+    let mut app = form_app_with_guard("message", true);
+    app.world_mut().resource_scope(
+        |world, mut guard: Mut<crate::ui::document_guard::DocumentGuard>| {
+            guard.request(world.resource::<Editor>(), AppAction::CloseWindow);
+        },
+    );
+    assert!(
+        app.world()
+            .resource::<crate::ui::document_guard::DocumentGuard>()
+            .active()
+    );
+    let ticket = app.world().resource::<Editor>().next_save_ticket();
+    {
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.press(KeyCode::ControlLeft);
+        keys.press(KeyCode::KeyS);
+    }
+    app.update();
+    assert!(matches!(
+        app.world().resource::<Session>().busy,
+        BusyState::Idle
+    ));
+    assert_eq!(app.world().resource::<Editor>().next_save_ticket(), ticket);
+}

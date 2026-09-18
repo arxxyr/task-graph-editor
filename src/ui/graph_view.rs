@@ -20,7 +20,7 @@ use crate::model::{SubGraph, TaskNode};
 use super::document_guard::DocumentGuard;
 use super::graph_edit::{GraphEditPanelSlot, GraphEditToolbarSlot, GraphEditing};
 use super::graph_layout::{self, GraphLayout, NODE_H, NODE_W, NodeSlot};
-use super::shell::{GraphPane, GraphSlot, ParamsPane, ViewSwitchSlot};
+use super::shell::{GraphPane, GraphSlot, ParamsPane, TaskWorkspace, ViewSwitchSlot};
 use super::theme;
 use super::widgets::{self, BoxedScene, boxed};
 use super::{Editor, UiSet};
@@ -612,18 +612,33 @@ fn node_scene(
 // 系统
 // ============================================================
 
-/// 切换视图时改两个面板的显示
+/// 工作台查询与参数、流程图面板的查询互斥，三者的 display 由同一系统按值同步。
+type WorkspacePane<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Node,
+    (With<TaskWorkspace>, Without<ParamsPane>, Without<GraphPane>),
+>;
+
+/// 切换视图时改面板的显示：任务工作台（侧栏 + 任务内容）随视图整体显隐，
+/// 替代原先分散隐藏侧栏的做法；参数与流程图面板的互斥规则不变。
 fn sync_view_mode(
     mode: Res<ViewMode>,
+    mut workspace: WorkspacePane,
     mut params: Query<&mut Node, (With<ParamsPane>, Without<GraphPane>)>,
     mut graph: Query<&mut Node, (With<GraphPane>, Without<ParamsPane>)>,
 ) {
     // 面板通过 BSN 跨帧生成，可能晚于视图变化落地；按值同步同时覆盖首次生成。
-    let (p, g) = match *mode {
-        ViewMode::Params => (Display::Flex, Display::None),
-        ViewMode::Graph => (Display::None, Display::Flex),
-        ViewMode::Logs => (Display::None, Display::None),
+    let (w, p, g) = match *mode {
+        ViewMode::Params => (Display::Flex, Display::Flex, Display::None),
+        ViewMode::Graph => (Display::Flex, Display::None, Display::Flex),
+        ViewMode::Logs => (Display::None, Display::None, Display::None),
     };
+    for mut node in &mut workspace {
+        if node.display != w {
+            node.display = w;
+        }
+    }
     for mut node in &mut params {
         if node.display != p {
             node.display = p;
@@ -1760,6 +1775,71 @@ mod tests {
         assert_eq!(
             *app.world().get::<ButtonVariant>(button).unwrap(),
             ButtonVariant::Primary
+        );
+    }
+
+    #[test]
+    fn 任务工作台随视图整体显隐且切回保留实体() {
+        let mut app = graph_app(Editor::default());
+        let workspace = app.world_mut().spawn((TaskWorkspace, Node::default())).id();
+        let params = app.world_mut().spawn((ParamsPane, Node::default())).id();
+        let graph = app
+            .world_mut()
+            .spawn((
+                GraphPane,
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+            ))
+            .id();
+        app.world_mut().spawn((ViewSwitchSlot, Node::default()));
+        settle_scenes(&mut app);
+        assert_eq!(
+            app.world().get::<Node>(workspace).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(params).unwrap().display,
+            Display::Flex
+        );
+        app.world_mut().insert_resource(ViewMode::Logs);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(workspace).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(params).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(graph).unwrap().display,
+            Display::None
+        );
+        app.world_mut().insert_resource(ViewMode::Graph);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(workspace).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(graph).unwrap().display,
+            Display::Flex
+        );
+        app.world_mut().insert_resource(ViewMode::Params);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(workspace).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(params).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(graph).unwrap().display,
+            Display::None
         );
     }
 

@@ -1,4 +1,4 @@
-//! 界面骨架：顶栏 + 侧栏 + 主内容区 + 状态栏
+//! 界面骨架：顶栏 + 主体（任务工作台 / 日志页）+ 状态栏
 //!
 //! 骨架在启动时一次性建好，各面板往预留的插槽里填内容。
 //! 布局：
@@ -7,11 +7,13 @@
 //! │ ● 标题 │ [SSH 摘要条] [视图] 文件 [编辑操作] [主题] │ 顶栏第一行
 //! │ SSH 连接面板抽屉（可折叠）                          │ 顶栏第二行
 //! ├─────────────┬──────────────────────────────────────┤
-//! │ 文件列表    │  元数据 + 字段分组编辑器              │
+//! │ 文件列表    │  参数 / 流程图内容区                  │ 任务工作台
 //! ├─────────────┴──────────────────────────────────────┤
 //! │ [复制提示] 状态消息                        连接目标 │ 状态栏
 //! └────────────────────────────────────────────────────┘
 //! ```
+//! 侧栏收在任务工作台（TaskWorkspace）内部；日志分析页与工作台平级、自带页内文件列表，
+//! 显示时独占整行全宽，工作台整体隐藏。
 
 use bevy::clipboard::{Clipboard, ClipboardError};
 use bevy::feathers::controls::{ButtonVariant, FeathersButton};
@@ -54,9 +56,10 @@ pub struct ConnectSlot;
 #[derive(Component, Default, Clone)]
 pub struct ConnectPanelRoot;
 
-/// 侧栏根节点；日志分析视图下整个侧栏隐藏
+/// 任务工作台：侧栏（文件列表）与任务内容（参数 / 流程图）的容器。
+/// 日志分析视图下整个工作台隐藏，日志页与之平级、独占全宽。
 #[derive(Component, Default, Clone)]
-pub struct SidebarRoot;
+pub struct TaskWorkspace;
 
 /// 侧栏中的文件列表插槽
 #[derive(Component, Default, Clone)]
@@ -395,7 +398,7 @@ fn sync_app_bar_layout(
     *previous = Some(compact);
 }
 
-/// 中部主体：侧栏 + 内容区
+/// 中部主体：任务工作台与日志页平级，日志页显示时独占全宽
 fn body() -> impl Scene {
     bsn! {
         Node {
@@ -405,13 +408,30 @@ fn body() -> impl Scene {
             min_height: px(0),
         }
         Children [
-            sidebar(),
-            content(),
+            task_workspace(),
+            super::log_analysis::pane(),
         ]
     }
 }
 
-/// 左侧栏：只留文件列表（SSH 连接面板已移到顶栏抽屉），日志视图整体隐藏
+/// 任务工作台：侧栏（文件列表）+ 任务内容（参数 / 流程图），日志视图整体隐藏
+fn task_workspace() -> impl Scene {
+    bsn! {
+        Node {
+            flex_grow: 1.0,
+            flex_direction: FlexDirection::Row,
+            min_width: px(0),
+            min_height: px(0),
+        }
+        TaskWorkspace
+        Children [
+            sidebar(),
+            task_content(),
+        ]
+    }
+}
+
+/// 工作台左侧栏：只留文件列表（SSH 连接面板已移到顶栏抽屉），随工作台整体显隐
 fn sidebar() -> impl Scene {
     bsn! {
         Node {
@@ -424,7 +444,6 @@ fn sidebar() -> impl Scene {
             border: {UiRect::right(px(1.0))},
             overflow: {Overflow::scroll_y()},
         }
-        SidebarRoot
         ScrollArea
         ThemeBackgroundColor({theme::SIDEBAR_BG})
         ThemeBorderColor({theme::DIVIDER})
@@ -438,8 +457,8 @@ fn sidebar() -> impl Scene {
     }
 }
 
-/// 右侧主内容区
-fn content() -> impl Scene {
+/// 工作台右侧任务内容区：参数与流程图面板互斥堆叠
+fn task_content() -> impl Scene {
     bsn! {
         Node {
             flex_grow: 1.0,
@@ -480,7 +499,6 @@ fn content() -> impl Scene {
                 GraphPane
                 GraphSlot
             ),
-            super::log_analysis::pane()
         ]
     }
 }
