@@ -450,6 +450,7 @@ impl Plugin for ThemePlugin {
                 (
                     refresh::refresh_direct_colors,
                     refresh::refresh_inherited_text,
+                    refresh::fix_orphan_themed_text,
                     refresh::refresh_text_cursor,
                     refresh::refresh_slider,
                     refresh::refresh_disclosure,

@@ -6,6 +6,7 @@ use bevy::feathers::controls::{
 use bevy::feathers::focus::FocusWithinIndicator;
 use bevy::feathers::theme::{
     InheritableThemeTextColor, ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, ThemedText,
+    UiTheme,
 };
 use bevy::input::InputPlugin;
 use bevy::input_focus::{FocusCause, InputFocus, InputFocusVisible};
@@ -247,6 +248,21 @@ fn themed_button(app: &mut App, variant: ButtonVariant) -> (Entity, Entity) {
         .spawn((Text::new("操作"), ThemedText, ChildOf(button)))
         .id();
     (button, text)
+}
+
+#[test]
+fn 孤儿继承文本补挂直接色而控件内文本不触碰() {
+    let mut app = theme_app(ThemeId::MistIndigo);
+    let orphan = app.world_mut().spawn((Text::new("孤儿"), ThemedText)).id();
+    let (_button, button_text) = themed_button(&mut app, ButtonVariant::Normal);
+    app.update();
+    app.update();
+    let expected = app.world().resource::<UiTheme>().color(&tokens::TEXT_MAIN);
+    assert_eq!(
+        app.world().get::<TextColor>(orphan),
+        Some(&TextColor(expected))
+    );
+    assert!(app.world().get::<ThemeTextColor>(button_text).is_none());
 }
 
 #[test]

@@ -9,7 +9,8 @@ use bevy::feathers::controls::{
     FeathersDisclosureToggle, FeathersMenuButton, FeathersSlider, FeathersTextInput,
 };
 use bevy::feathers::theme::{
-    InheritableThemeTextColor, ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, UiTheme,
+    InheritableThemeTextColor, ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, ThemedText,
+    UiTheme,
 };
 use bevy::feathers::tokens;
 use bevy::picking::hover::Hovered;
@@ -63,6 +64,34 @@ pub(super) fn refresh_inherited_text(
         commands
             .entity(entity)
             .insert(Propagate(TextColor(theme.color(&token.0))));
+    }
+}
+
+/// 文字色继承来源：控件根的 `InheritableThemeTextColor` 或已挂直接色的实体。
+type TextColorSources<'w, 's> =
+    Query<'w, 's, (), Or<(With<InheritableThemeTextColor>, With<ThemeTextColor>)>>;
+
+/// 裸 `ThemedText` 找不到继承来源时保持默认白字，浅色主题下不可读。
+/// 只给这类孤儿文本补挂直接主题色；按钮、菜单、列表行等祖先链上
+/// 已有继承来源的一律不触碰，直接色也会随主题切换刷新。
+pub(super) fn fix_orphan_themed_text(
+    texts: Query<Entity, Added<ThemedText>>,
+    sources: TextColorSources,
+    parents: Query<&ChildOf>,
+    mut commands: Commands,
+) {
+    'text: for entity in &texts {
+        if sources.contains(entity) {
+            continue;
+        }
+        for ancestor in parents.iter_ancestors(entity) {
+            if sources.contains(ancestor) {
+                continue 'text;
+            }
+        }
+        commands
+            .entity(entity)
+            .try_insert(ThemeTextColor(tokens::TEXT_MAIN));
     }
 }
 
