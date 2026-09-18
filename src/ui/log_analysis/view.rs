@@ -37,6 +37,11 @@ fn action_button(label: impl Into<String>, action: LogAction) -> impl Scene {
             @caption: {bsn! { Text({label.into()}) ThemedText TextLayout { linebreak: bevy::text::LineBreak::AnyCharacter } }},
             @variant: variant
         }
+        // 与同行的输入框及通用按钮保持同一控件行高与圆角
+        Node {
+            height: {px(theme::CONTROL_HEIGHT)},
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+        }
         template_value(action)
         template_value(marker)
         on(click)
@@ -261,7 +266,12 @@ pub fn pane() -> impl Scene {
             (
                 Node { align_items: AlignItems::Center, column_gap: px(8), flex_shrink: 0.0, flex_wrap: FlexWrap::Wrap }
                 Children [
-                    widgets::subheading("日志分析"), widgets::spacer(),
+                    (
+                        Text("日志分析")
+                        ThemeTextColor({theme::SECTION_TEXT})
+                        TextFont { font_size: px(16), weight: {bevy::text::FontWeight::BOLD} }
+                    ),
+                    widgets::spacer(),
                     action_button("报告目录", LogAction::ReportDirectory),
                     action_button("开始分析", LogAction::Analyze),
                     action_button("取消", LogAction::Cancel),

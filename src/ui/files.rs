@@ -124,7 +124,7 @@ fn file_list_card(browser: &FileBrowser) -> impl Scene {
             ThemeTextColor({tokens::TEXT_DIM})
             TextFont { font_size: px(11.0) }
             TextLayout { linebreak: {LineBreak::AnyCharacter} }
-            Node { width: percent(100), margin: {UiRect::bottom(px(5.0))} }
+            Node { width: percent(100), margin: {UiRect::bottom(px(4.0))} }
         ), (
             Node {
                 width: percent(100),
@@ -167,7 +167,7 @@ fn file_row(filename: &str) -> impl Scene {
         Children [(
             Text(name)
             ThemedText
-            TextFont { font_size: px(12.0) }
+            TextFont { font_size: px(12.5) }
         )]
     }
 }
@@ -433,7 +433,7 @@ fn menu_item(label: &str, danger: bool, enabled: bool, action: AppAction) -> imp
     bsn! {
         Node {
             width: percent(100),
-            padding: {UiRect::axes(px(10.0), px(5.0))},
+            padding: {UiRect::axes(px(8.0), px(4.0))},
             border_radius: {BorderRadius::all(px(4.0))},
             align_items: AlignItems::Center,
         }
@@ -443,7 +443,7 @@ fn menu_item(label: &str, danger: bool, enabled: bool, action: AppAction) -> imp
         Children [(
             Text({label.to_string()})
             ThemeTextColor({text_token})
-            TextFont { font_size: px(12.0) }
+            TextFont { font_size: px(12.5) }
         )]
     }
 }

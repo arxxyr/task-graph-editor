@@ -154,21 +154,23 @@ pub const CHECKPOINT_DOT: ThemeToken = ThemeToken::new_static("app.graph.checkpo
 // ============================================================
 
 /// 顶栏最小高度，窄窗口下编辑操作换行时随内容增高。
-pub const APPBAR_HEIGHT: f32 = 46.0;
+pub const APPBAR_HEIGHT: f32 = 52.0;
 /// 状态栏高度
-pub const STATUSBAR_HEIGHT: f32 = 28.0;
+pub const STATUSBAR_HEIGHT: f32 = 30.0;
 /// 侧栏宽度
-pub const SIDEBAR_WIDTH: f32 = 288.0;
+pub const SIDEBAR_WIDTH: f32 = 296.0;
 /// 标准内边距
-pub const PAD: f32 = 10.0;
+pub const PAD: f32 = 14.0;
 /// 紧凑内边距
-pub const PAD_SM: f32 = 6.0;
+pub const PAD_SM: f32 = 8.0;
 /// 卡片圆角
-pub const RADIUS: f32 = 8.0;
+pub const RADIUS: f32 = 12.0;
 /// 小圆角
-pub const RADIUS_SM: f32 = 5.0;
+pub const RADIUS_SM: f32 = 8.0;
 /// 每层嵌套的缩进量
-pub const INDENT: f32 = 12.0;
+pub const INDENT: f32 = 14.0;
+/// 控件统一行高（按钮、输入框、菜单按钮、数值框）
+pub const CONTROL_HEIGHT: f32 = 30.0;
 
 /// 输入框描边：保留原始边界色，不使用容器的软分隔色。
 pub const INPUT_BORDER: ThemeToken = ThemeToken::new_static("app.input.border");
@@ -187,14 +189,14 @@ pub const COPY_BG_HOVER: ThemeToken = ThemeToken::new_static("app.copy.bg.hover"
 /// 状态栏复制提示按钮文字。
 pub const COPY_TEXT: ThemeToken = ThemeToken::new_static("app.copy.text");
 
-/// 与预览的 color-mix(in srgb, border 42%, panel 58%) 保持一致。
+/// 与预览的 color-mix(in srgb, border 22%, panel 78%) 保持一致。
 fn soft_border(border: Color, panel: Color) -> Color {
     let a = border.to_srgba();
     let b = panel.to_srgba();
     Color::srgb(
-        a.red * 0.42 + b.red * 0.58,
-        a.green * 0.42 + b.green * 0.58,
-        a.blue * 0.42 + b.blue * 0.58,
+        a.red * 0.22 + b.red * 0.78,
+        a.green * 0.22 + b.green * 0.78,
+        a.blue * 0.22 + b.blue * 0.78,
     )
 }
 

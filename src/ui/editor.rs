@@ -332,7 +332,7 @@ fn metadata_card(data: &TaskGraphData, editor: &Editor) -> impl Scene {
                 ThemeTextColor({tokens::TEXT_DIM})
                 TextFont { font_size: px(11.0) }
                 TextLayout { linebreak: {LineBreak::AnyCharacter} }
-                Node { width: percent(100), margin: {UiRect::bottom(px(5.0))} }
+                Node { width: percent(100), margin: {UiRect::bottom(px(4.0))} }
             ),
             widgets::form_row(
                 "map_id",
@@ -867,7 +867,7 @@ fn lazy_collapsible(title: String, path: Vec<usize>, kind: LazyKind) -> impl Sce
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::Center,
                     column_gap: px(6),
-                    padding: {UiRect::axes(px(theme::PAD_SM), px(4.0))},
+                    padding: {UiRect::axes(px(theme::PAD_SM), px(6.0))},
                     border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
                     width: percent(100),
                 }
@@ -883,7 +883,7 @@ fn lazy_collapsible(title: String, path: Vec<usize>, kind: LazyKind) -> impl Sce
                     (
                         Text(title)
                         ThemeTextColor({theme::SECTION_TEXT})
-                        TextFont { font_size: px(12.0) }
+                        TextFont { font_size: px(12.5) }
                     )
                 ]
             ),

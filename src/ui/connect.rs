@@ -148,6 +148,11 @@ pub fn connect_strip() -> impl Scene {
             }},
             @variant: ButtonVariant::Plain
         }
+        // 摘要条与抽屉里的按钮、输入框保持同一控件行高与圆角
+        Node {
+            height: {px(theme::CONTROL_HEIGHT)},
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+        }
         AccessibleLabel("展开或收起 SSH 连接面板")
         on(on_connect_strip)
     }
@@ -341,7 +346,7 @@ fn host_row(host: &str) -> impl Scene {
             (
                 // 菜单根自行管理打开时序；原生 FeathersMenu 会在子项重建前先获取旧焦点。
                 Node {
-                    height: {bevy::feathers::constants::size::ROW_HEIGHT},
+                    height: {px(theme::CONTROL_HEIGHT)},
                     justify_content: JustifyContent::Stretch,
                     align_items: AlignItems::Stretch,
                     flex_shrink: 0.0,
@@ -695,7 +700,11 @@ fn connect_buttons() -> Vec<BoxedScene> {
             template_value(ButtonGate::Managed)
             InteractionDisabled
             TabIndex(-1)
-            Node { display: Display::None }
+            Node {
+                display: Display::None,
+                height: {px(theme::CONTROL_HEIGHT)},
+                border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+            }
         })
     })
     .collect()

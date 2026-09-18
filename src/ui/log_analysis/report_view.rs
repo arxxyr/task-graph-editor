@@ -32,7 +32,7 @@ fn cell(text: impl Into<String>, width: f32) -> impl Scene {
 fn metric(label: &str, value: String) -> impl Scene {
     bsn! {
         Node { flex_direction: FlexDirection::Column, row_gap: px(6), flex_grow: 1.0, min_width: px(120),
-            padding: px(12), border: {UiRect::all(px(1))},
+            padding: {px(theme::PAD)}, border: {UiRect::all(px(1))},
             border_radius: {BorderRadius::all(px(theme::RADIUS))} }
         ThemeBackgroundColor({theme::CARD_BG})
         ThemeBorderColor({theme::CARD_BORDER})
@@ -149,13 +149,13 @@ fn report_card(body: Vec<BoxedScene>) -> impl Scene {
         ThemeBorderColor({theme::CARD_BORDER})
         Children [
             (
-                Node { padding: {UiRect::axes(px(theme::PAD), px(6))},
+                Node { padding: {UiRect::axes(px(theme::PAD), px(10))},
                     align_items: AlignItems::Center, width: percent(100) }
                 ThemeBackgroundColor({theme::CARD_BG})
                 Children [(
                     Text("分析结果")
                     ThemeTextColor({theme::SECTION_TEXT})
-                    TextFont { font_size: px(13), weight: {FontWeight::BOLD} }
+                    TextFont { font_size: px(16), weight: {FontWeight::BOLD} }
                 )]
             ),
             (

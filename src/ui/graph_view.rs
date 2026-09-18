@@ -365,7 +365,7 @@ fn crumb(label: &str, depth: usize, current: bool) -> impl Scene {
     };
     bsn! {
         Node {
-            padding: {UiRect::axes(px(7.0), px(3.0))},
+            padding: {UiRect::axes(px(8.0), px(4.0))},
             border_radius: {BorderRadius::all(px(4.0))},
         }
         Button
@@ -377,7 +377,7 @@ fn crumb(label: &str, depth: usize, current: bool) -> impl Scene {
         Children [(
             Text({label.to_string()})
             ThemeTextColor({token})
-            TextFont { font_size: px(12.0) }
+            TextFont { font_size: px(12.5) }
         )]
     }
 }
@@ -1249,7 +1249,7 @@ fn update_view_variants(mode: ViewMode, toggles: &mut Query<(&ViewToggle, &mut B
         let selected = toggle.0 == mode;
         variant.set_if_neq(match selected {
             true => ButtonVariant::Primary,
-            false => ButtonVariant::Normal,
+            false => ButtonVariant::Plain,
         });
     }
 }
@@ -1276,28 +1276,43 @@ fn build_view_switch(
 }
 
 /// 视图切换按钮组，供顶栏使用
+///
+/// 分段控件：描边圆角容器包住三个互斥按钮，与日志页模式选择同一语言；
+/// 选中态由 sync 切换变体（选中 Primary、未选 Plain），按钮实体不重建。
 fn view_switch(current: ViewMode) -> Vec<BoxedScene> {
     let variant = |on: bool| match on {
         true => ButtonVariant::Primary,
-        false => ButtonVariant::Normal,
+        false => ButtonVariant::Plain,
     };
-    vec![
-        boxed(widgets::button(
-            "参数",
-            variant(current == ViewMode::Params),
-            ViewToggle(ViewMode::Params),
-        )),
-        boxed(widgets::button(
-            "流程图",
-            variant(current == ViewMode::Graph),
-            ViewToggle(ViewMode::Graph),
-        )),
-        boxed(widgets::button(
-            "日志分析",
-            variant(current == ViewMode::Logs),
-            ViewToggle(ViewMode::Logs),
-        )),
-    ]
+    vec![boxed(bsn! {
+        Node {
+            padding: px(2),
+            border: {UiRect::all(px(1))},
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+            column_gap: px(2),
+            align_items: AlignItems::Center,
+            flex_shrink: 0.0,
+        }
+        ThemeBackgroundColor({theme::CARD_BG})
+        ThemeBorderColor({theme::CARD_BORDER})
+        Children [
+            (widgets::button(
+                "参数",
+                variant(current == ViewMode::Params),
+                ViewToggle(ViewMode::Params),
+            )),
+            (widgets::button(
+                "流程图",
+                variant(current == ViewMode::Graph),
+                ViewToggle(ViewMode::Graph),
+            )),
+            (widgets::button(
+                "日志分析",
+                variant(current == ViewMode::Logs),
+                ViewToggle(ViewMode::Logs),
+            )),
+        ]
+    })]
 }
 
 /// 流程图视图插件

@@ -446,6 +446,13 @@ shell 同样不会展开其中的 `~`。
   保存失败不逐帧重试；主目录不可得时禁用存储，不能回退工作目录。
   离线测试和截图夹具必须在插件装配前注入 `ThemePreferencesStore::disabled()`；
   持久化测试使用 `at_path` 指定隔离临时路径，不访问使用者配置。
+- **视觉体系**：尺寸常量集中在 `theme.rs`，构件样式集中在 `widgets.rs`，各视图按此对齐，不各自发明数值。
+  - 圆角体系：卡片 `RADIUS = 12`，控件（按钮、输入、菜单）`RADIUS_SM = 8`，小件（徽章、折叠头）7，pill 全圆。
+  - 间距 4 倍数网格：页面 padding 16–20，卡片 `PAD = 14`，区块 gap 12，行内 `PAD_SM = 8`。
+  - 字号层级：页面标题 16 BOLD，卡片标题 13.5 BOLD，正文 12.5，辅助 hint 11，统计大数字 22。
+  - 控件行高统一 `CONTROL_HEIGHT = 30`（按钮、输入框、数值框），覆盖 feathers 默认的 24。
+  - 边框退后：柔化边框 `soft_border` 为 `border` 22% + `panel` 78% 的 sRGB 混合色；
+    输入框与流程图边仍使用原始 `border`。
 - **Windows**：Release 构建隐藏控制台窗口（`windows_subsystem = "windows"`）
 - **profile**：依赖用 `opt-level = 3` 编译（dev 与 release 都是），Bevy 在低优化下交互明显发涩
 

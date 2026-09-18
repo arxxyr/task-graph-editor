@@ -42,7 +42,12 @@ pub fn action_menu(label: &str, items: Vec<BoxedScene>) -> impl Scene {
         @FeathersMenu
         Node { flex_shrink: 0.0 }
         Children [
-            (@FeathersMenuButton { @caption: {bsn! { Text({label.to_string()}) ThemedText }} }),
+            (@FeathersMenuButton { @caption: {bsn! { Text({label.to_string()}) ThemedText }} }
+                // 与同行按钮、输入框保持同一控件行高与圆角
+                Node {
+                    height: {px(theme::CONTROL_HEIGHT)},
+                    border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+                }),
             (@FeathersMenuPopup Node { min_width: px(180) } Children [{items}]),
         ]
     }
@@ -204,7 +209,7 @@ pub fn collapsible_titled(
                     flex_direction: FlexDirection::Row,
                     align_items: AlignItems::Center,
                     column_gap: px(6),
-                    padding: {UiRect::axes(px(theme::PAD_SM), px(5.0))},
+                    padding: {UiRect::axes(px(theme::PAD_SM), px(6.0))},
                     border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
                     width: percent(100),
                 }
@@ -252,7 +257,7 @@ pub fn collapsible_titled(
 pub fn badge(text: impl Into<String>) -> impl Scene {
     bsn! {
         Node {
-            padding: {UiRect::axes(px(5.0), px(1.0))},
+            padding: {UiRect::axes(px(7.0), px(2.0))},
             border_radius: {BorderRadius::all(px(7.0))},
             align_items: AlignItems::Center,
             flex_shrink: 0.0,
@@ -261,7 +266,7 @@ pub fn badge(text: impl Into<String>) -> impl Scene {
         Children [(
             Text({text.into()})
             ThemeTextColor({theme::BADGE_TEXT})
-            TextFont { font_size: px(10.0) }
+            TextFont { font_size: px(10.5) }
         )]
     }
 }
@@ -295,7 +300,7 @@ pub fn card_titled(
         Children [
             (
                 Node {
-                    padding: {UiRect::axes(px(theme::PAD), px(6.0))},
+                    padding: {UiRect::axes(px(theme::PAD), px(10.0))},
                     align_items: AlignItems::Center,
                     width: percent(100),
                 }
@@ -305,7 +310,7 @@ pub fn card_titled(
                     template_value(title_marker)
                     ThemeTextColor({theme::SECTION_TEXT})
                     TextFont {
-                        font_size: px(13.0),
+                        font_size: px(13.5),
                         weight: {FontWeight::BOLD}
                     }
                 )]
@@ -343,7 +348,7 @@ pub fn form_row(label: impl Into<String>, control: impl Scene) -> impl Scene {
                 Children [(
                     Text({label.into()})
                     ThemeTextColor({theme::FIELD_LABEL})
-                    TextFont { font_size: px(12.0) }
+                    TextFont { font_size: px(12.5) }
                     TextLayout { linebreak: {LineBreak::AnyCharacter} }
                 )]
             ),
@@ -373,7 +378,7 @@ pub fn field_row(label: impl Into<String>, control: impl Scene) -> impl Scene {
                 Children [(
                     Text({label.into()})
                     ThemeTextColor({theme::FIELD_LABEL})
-                    TextFont { font_size: px(12.0) }
+                    TextFont { font_size: px(12.5) }
                     // context 字段名是不含空格的标识符，按词换行等于不换行，
                     // min-content 会顶破标签列宽把文字压到控件上；允许逐字符断行
                     TextLayout { linebreak: {LineBreak::AnyCharacter} }
@@ -411,7 +416,7 @@ pub fn readonly_value(text: impl Into<String>) -> impl Scene {
     bsn! {
         Text({text.into()})
         ThemeTextColor({theme::READONLY_TEXT})
-        TextFont { font_size: px(12.0) }
+        TextFont { font_size: px(12.5) }
     }
 }
 
@@ -421,7 +426,7 @@ pub fn subheading(text: impl Into<String>) -> impl Scene {
         Text({text.into()})
         ThemeTextColor({theme::SECTION_TEXT})
         TextFont {
-            font_size: px(12.0),
+            font_size: px(12.5),
             weight: {FontWeight::BOLD}
         }
     }
@@ -458,7 +463,12 @@ pub fn text_field(initial: impl Into<String>, marker: impl Marker) -> impl Scene
     let initial = initial.into();
     bsn! {
         @FeathersTextInputContainer
-        Node { flex_grow: 1.0, border: {UiRect::all(px(1.0))} }
+        Node {
+            flex_grow: 1.0,
+            height: {px(theme::CONTROL_HEIGHT)},
+            border: {UiRect::all(px(1.0))},
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+        }
         ThemeBorderColor({theme::INPUT_BORDER})
         Children [(
             @FeathersTextInput
@@ -473,7 +483,12 @@ pub fn password_field(initial: impl Into<String>, marker: impl Marker) -> impl S
     let initial = initial.into();
     bsn! {
         @FeathersTextInputContainer
-        Node { flex_grow: 1.0, border: {UiRect::all(px(1.0))} }
+        Node {
+            flex_grow: 1.0,
+            height: {px(theme::CONTROL_HEIGHT)},
+            border: {UiRect::all(px(1.0))},
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+        }
         ThemeBorderColor({theme::INPUT_BORDER})
         Children [(
             @FeathersTextInput
@@ -503,7 +518,11 @@ pub fn number_field(
             @label_text: label,
             @number_format: {NumberFormat::F64}
         }
-        Node { flex_grow: 1.0 }
+        Node {
+            flex_grow: 1.0,
+            height: {px(theme::CONTROL_HEIGHT)},
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+        }
         template_value(marker)
         template_value(normal_border)
         template_value(NumberFieldInit(NumberInitValue::F64(value)))
@@ -517,7 +536,11 @@ pub fn int_field(value: i64, marker: impl Marker) -> impl Scene {
             @number_format: {NumberFormat::I64},
             @sigil_color: {theme::INPUT_BORDER}
         }
-        Node { flex_grow: 1.0 }
+        Node {
+            flex_grow: 1.0,
+            height: {px(theme::CONTROL_HEIGHT)},
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
+        }
         template_value(marker)
         template_value(NumberFieldBorder(theme::INPUT_BORDER))
         template_value(NumberFieldInit(NumberInitValue::I64(value)))
@@ -595,6 +618,11 @@ pub fn button_gated(
         @FeathersButton {
             @caption: {bsn! { Text({label.into()}) ThemedText }},
             @variant: variant
+        }
+        // 上游按钮行高 24、圆角 4，统一覆盖为控件行高与小圆角
+        Node {
+            height: {px(theme::CONTROL_HEIGHT)},
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))},
         }
         template_value(marker)
         template_value(gate)

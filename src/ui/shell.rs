@@ -235,7 +235,7 @@ fn app_bar() -> impl Scene {
                                 Text("任务图编辑器")
                                 ThemeTextColor({theme::SECTION_TEXT})
                                 TextFont {
-                                    font_size: px(15.0),
+                                    font_size: px(16.0),
                                     weight: {FontWeight::BOLD}
                                 }
                             ),
@@ -319,7 +319,7 @@ fn app_bar() -> impl Scene {
                     width: percent(100),
                     flex_direction: FlexDirection::Column,
                     border: {UiRect::top(px(1.0))},
-                    padding: {UiRect::axes(px(theme::PAD + 2.0), px(theme::PAD_SM))},
+                    padding: {UiRect::axes(px(theme::PAD + 2.0), px(10.0))},
                 }
                 ConnectPanelRoot
                 ThemeBackgroundColor({theme::APPBAR_BG})
