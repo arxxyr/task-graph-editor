@@ -27,6 +27,16 @@ pub use view::pane;
 
 const PAGE_SIZE: usize = 30;
 
+// Nerd Fonts 私用区图标，字形已验证在内嵌更纱黑体的 cmap 内，常规 Text 即可渲染。
+/// 文件夹：目录行与本地空态
+const ICON_FOLDER: &str = "\u{f07b}";
+/// 文件：日志行
+const ICON_FILE: &str = "\u{f15b}";
+/// 搜索：筛选行与远程空态
+const ICON_SEARCH: &str = "\u{f002}";
+/// 信息：状态条
+const ICON_INFO: &str = "\u{f05a}";
+
 #[derive(Component, Clone, Default)]
 pub struct LogPane;
 #[derive(Component, Clone, Default)]
@@ -51,6 +61,9 @@ enum StatisticsFlag {
 struct FilterField;
 #[derive(Component, Clone, Default)]
 struct SelectionCaption;
+/// 位置行说明：远程列表目录或本地文件来源
+#[derive(Component, Clone, Default)]
+struct LocationCaption;
 #[derive(Component, Clone, Default)]
 struct ChoiceMarker {
     version: u64,
@@ -88,7 +101,10 @@ pub enum LogAction {
 
 #[derive(Clone)]
 struct Choice {
-    label: String,
+    /// 行内显示名称：远程为条目名，本地为完整路径
+    name: String,
+    /// 右端大小文本（如 "12.3 KiB"）；目录为 None，行尾改显示 ›
+    size: Option<String>,
     path: PathBuf,
     directory: bool,
 }
@@ -190,7 +206,7 @@ impl Logs {
             .enumerate()
             .filter_map(|(index, choice)| {
                 choice
-                    .label
+                    .name
                     .to_lowercase()
                     .contains(&filter)
                     .then_some(index)
@@ -587,13 +603,17 @@ fn accept_listing(logs: &mut Logs, listing: LogListing, generation: u64) {
     let choices = listing
         .entries
         .into_iter()
-        .map(|entry| Choice {
-            label: match entry.directory {
-                true => format!("日期  {}  ›", entry.name),
-                false => format!("{}    {:.1} KiB", entry.name, entry.size as f64 / 1024.0),
-            },
-            path: PathBuf::from(&listing.directory).join(&entry.name),
-            directory: entry.directory,
+        .map(|entry| {
+            let path = PathBuf::from(&listing.directory).join(&entry.name);
+            Choice {
+                size: match entry.directory {
+                    true => None,
+                    false => Some(format!("{:.1} KiB", entry.size as f64 / 1024.0)),
+                },
+                name: entry.name,
+                path,
+                directory: entry.directory,
+            }
         })
         .collect();
     logs.replace(choices, Some((generation, listing.directory)), false);
@@ -617,10 +637,16 @@ fn poll(mut logs: ResMut<Logs>, session: Res<Session>, proxy: Option<Res<EventLo
                         let choices = files
                             .into_iter()
                             .filter(|p| unique.insert(p.clone()))
-                            .map(|path| Choice {
-                                label: path.to_string_lossy().into_owned(),
-                                path,
-                                directory: false,
+                            .map(|path| {
+                                let size = std::fs::metadata(&path)
+                                    .ok()
+                                    .map(|meta| format!("{:.1} KiB", meta.len() as f64 / 1024.0));
+                                Choice {
+                                    name: path.to_string_lossy().into_owned(),
+                                    size,
+                                    path,
+                                    directory: false,
+                                }
                             })
                             .collect();
                         logs.replace(choices, None, true);
@@ -714,6 +740,15 @@ fn poll(mut logs: ResMut<Logs>, session: Res<Session>, proxy: Option<Res<EventLo
     }
 }
 
+/// 解析报告快照：磁盘上的 report.json 是 Result 信封（{"Ok": …}），也接受裸 AnalysisReport。
+fn parse_report_snapshot(bytes: &[u8]) -> Option<AnalysisReport> {
+    if let Ok(report) = serde_json::from_slice::<AnalysisReport>(bytes) {
+        return Some(report);
+    }
+    let envelope = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    serde_json::from_value(envelope.get("Ok")?.clone()).ok()
+}
+
 pub struct LogAnalysisPlugin;
 impl Plugin for LogAnalysisPlugin {
     fn build(&self, app: &mut App) {
@@ -735,7 +770,7 @@ impl Plugin for LogAnalysisPlugin {
         if std::env::var_os("TGE_SCREENSHOT").is_some()
             && let Some(path) = std::env::var_os("TGE_SCREENSHOT_REPORT")
             && let Ok(bytes) = std::fs::read(path)
-            && let Ok(report) = serde_json::from_slice::<AnalysisReport>(&bytes)
+            && let Some(report) = parse_report_snapshot(&bytes)
         {
             app.insert_resource(ViewMode::Logs);
             app.insert_resource(Logs {

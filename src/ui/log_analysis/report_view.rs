@@ -2,7 +2,8 @@
 use super::*;
 use crate::log_analysis::{FileReport, RoundOverview};
 use crate::ui::theme;
-use bevy::feathers::theme::{ThemeBackgroundColor, ThemeTextColor};
+use bevy::feathers::theme::{ThemeBackgroundColor, ThemeBorderColor, ThemeTextColor, ThemeToken};
+use bevy::text::FontWeight;
 
 fn seconds(value: Option<f64>) -> String {
     value
@@ -27,13 +28,31 @@ fn cell(text: impl Into<String>, width: f32) -> impl Scene {
     }
 }
 
+/// 统计卡：描边圆角表面，大数字加弱化标签。
 fn metric(label: &str, value: String) -> impl Scene {
     bsn! {
-        Node { flex_direction: FlexDirection::Column, row_gap: px(6), flex_grow: 1.0, min_width: px(120), padding: px(12) }
+        Node { flex_direction: FlexDirection::Column, row_gap: px(6), flex_grow: 1.0, min_width: px(120),
+            padding: px(12), border: {UiRect::all(px(1))},
+            border_radius: {BorderRadius::all(px(theme::RADIUS))} }
+        ThemeBackgroundColor({theme::CARD_BG})
+        ThemeBorderColor({theme::CARD_BORDER})
         Children [
             widgets::hint(label),
-            (Text(value) ThemedText TextFont { font_size: px(21) }),
+            (Text(value) ThemeTextColor({theme::SECTION_TEXT}) TextFont { font_size: px(22), weight: {FontWeight::BOLD} }),
         ]
+    }
+}
+
+/// 统计状态 pill：徽章底色 + 状态色文字。
+fn pill(state: &str, token: ThemeToken) -> impl Scene {
+    bsn! {
+        Node { padding: {UiRect::axes(px(6), px(1))},
+            border_radius: {BorderRadius::all(px(7))},
+            align_items: AlignItems::Center, flex_shrink: 0.0 }
+        ThemeBackgroundColor({theme::BADGE_BG})
+        Children [(
+            Text(state) ThemeTextColor({token}) TextFont { font_size: px(11) }
+        )]
     }
 }
 
@@ -86,27 +105,64 @@ fn row(round: &RoundOverview, max: f64) -> impl Scene {
         )));
     }
     bsn! {
-        Node { flex_direction: FlexDirection::Column, flex_shrink: 0.0, row_gap: px(2), padding: {UiRect::vertical(px(3))} }
+        Node { flex_direction: FlexDirection::Column, flex_shrink: 0.0, row_gap: px(2), padding: {UiRect::axes(px(4), px(3))} }
         widgets::Collapsible { open: false }
         Children [
             (Node { align_items: AlignItems::Center, min_width: px(700) } widgets::CollapseHeader Children [
                 (Node { width: px(150), flex_shrink: 0.0, align_items: AlignItems::Center, column_gap: px(4) } Children [
-                    (Text("▸") widgets::CollapseChevron ThemedText TextFont { font_size: px(10) }),
+                    (Text("▸") widgets::CollapseChevron ThemeTextColor({theme::SECTION_TEXT}) TextFont { font_size: px(10) }),
                     report_text(format!("#{}  {}", round.id, round.label)),
                 ]),
                 cell(time(round.start_us), 120.0),
                 cell(seconds(round.raw_seconds), 90.0),
                 cell(seconds(Some(round.deducted_seconds)), 90.0),
                 (Node { flex_grow: 1.0, min_width: px(140), padding: px(4), flex_direction: FlexDirection::Column, row_gap: px(4) } Children [
-                    (Text({seconds(round.duration_seconds)}) ThemedText TextFont { font_size: px(16) }),
-                    (Node { height: px(4), width: percent(width), border_radius: px(2) } ThemeBackgroundColor({token.clone()})),
+                    (Text({seconds(round.duration_seconds)}) ThemeTextColor({theme::SECTION_TEXT}) TextFont { font_size: px(16) }),
+                    (Node { height: px(6), width: percent(width), border_radius: px(3) } ThemeBackgroundColor({token.clone()})),
                 ]),
-                (Node { width: px(95), flex_shrink: 0.0 } Children [
-                    (Text(state) ThemeTextColor(token) TextFont { font_size: px(12) }),
-                ]),
+                (Node { width: px(95), flex_shrink: 0.0 } Children [ pill(state, token) ]),
             ]),
             (Node { display: Display::None, flex_direction: FlexDirection::Column, padding: px(10), row_gap: px(6) }
                 widgets::CollapseBody Children [{detail}]),
+        ]
+    }
+}
+
+/// 斑马纹包装：间隔行铺卡片底色，与页面底色交替。
+fn stripe(inner: impl Scene) -> impl Scene {
+    bsn! {
+        Node { flex_direction: FlexDirection::Column,
+            border_radius: {BorderRadius::all(px(theme::RADIUS_SM))} }
+        ThemeBackgroundColor({theme::CARD_BG})
+        Children [ (inner) ]
+    }
+}
+
+/// 报告卡片：边框与标题带勾出区域；正文留在页面底色上，
+/// 统计卡、表头与斑马纹的表面色才有对比。
+fn report_card(body: Vec<BoxedScene>) -> impl Scene {
+    bsn! {
+        Node { flex_direction: FlexDirection::Column, width: percent(100),
+            border: {UiRect::all(px(1))},
+            border_radius: {BorderRadius::all(px(theme::RADIUS))},
+            overflow: {Overflow::clip()}, flex_shrink: 0.0 }
+        ThemeBorderColor({theme::CARD_BORDER})
+        Children [
+            (
+                Node { padding: {UiRect::axes(px(theme::PAD), px(6))},
+                    align_items: AlignItems::Center, width: percent(100) }
+                ThemeBackgroundColor({theme::CARD_BG})
+                Children [(
+                    Text("分析结果")
+                    ThemeTextColor({theme::SECTION_TEXT})
+                    TextFont { font_size: px(13), weight: {FontWeight::BOLD} }
+                )]
+            ),
+            (
+                Node { flex_direction: FlexDirection::Column, row_gap: px(10),
+                    padding: {UiRect::all(px(theme::PAD))}, width: percent(100) }
+                Children [{body}]
+            )
         ]
     }
 }
@@ -124,8 +180,8 @@ pub(super) fn content(logs: &Logs, report: &AnalysisReport) -> Vec<BoxedScene> {
         .iter()
         .filter_map(|r| r.duration_seconds)
         .fold(0.0_f64, f64::max);
-    let mut result = vec![boxed(widgets::subheading("分析结果"))];
-    result.push(boxed(bsn! {
+    let mut body = Vec::<BoxedScene>::new();
+    body.push(boxed(bsn! {
         Node { align_items: AlignItems::Center, flex_wrap: FlexWrap::Wrap, column_gap: px(8), row_gap: px(6) }
         Children [
             widgets::hint(format!("日志 {} / {} · {}", logs.report_index + 1, report.reports.len(), item.input.file_name().unwrap_or_default().to_string_lossy())),
@@ -135,11 +191,11 @@ pub(super) fn content(logs: &Logs, report: &AnalysisReport) -> Vec<BoxedScene> {
         ]
     }));
     if let Some(error) = &item.error {
-        result.push(boxed(report_text(format!("分析失败：{error}"))));
+        body.push(boxed(report_text(format!("分析失败：{error}"))));
     }
     if !item.rounds.is_empty() {
-        result.push(boxed(bsn! {
-            Node { flex_wrap: FlexWrap::Wrap, column_gap: px(12), flex_shrink: 0.0 }
+        body.push(boxed(bsn! {
+            Node { flex_wrap: FlexWrap::Wrap, column_gap: px(12), row_gap: px(10), flex_shrink: 0.0 }
             Children [
                 metric("纳入 / 全部轮次", format!("{} / {}", values.len(), item.rounds.len())),
                 metric("平均耗时", seconds(average)),
@@ -147,7 +203,7 @@ pub(super) fn content(logs: &Logs, report: &AnalysisReport) -> Vec<BoxedScene> {
                 metric("最慢", seconds(slowest)),
             ]
         }));
-        result.push(boxed(widgets::hint(format!(
+        body.push(boxed(widgets::hint(format!(
             "{} · 灰色为排除轮次；条形按本份日志统一比例显示，分页不改变统计。",
             item.duration_label
         ))));
@@ -156,22 +212,29 @@ pub(super) fn content(logs: &Logs, report: &AnalysisReport) -> Vec<BoxedScene> {
             .iter()
             .skip(logs.report_page * PAGE_SIZE)
             .take(PAGE_SIZE)
-            .map(|r| boxed(row(r, max)))
+            .enumerate()
+            .map(|(index, r)| match index % 2 == 1 {
+                true => boxed(stripe(row(r, max))),
+                false => boxed(row(r, max)),
+            })
             .collect();
-        result.push(boxed(bsn! {
+        body.push(boxed(bsn! {
             Node { flex_direction: FlexDirection::Column, overflow: {Overflow::scroll_x()}, flex_shrink: 0.0 }
             ScrollArea
             Children [
-                (Node { min_width: px(700) } Children [
-                    cell("轮次 / 类型", 150.0), cell("开始（北京时间）", 120.0),
-                    cell("原始耗时", 90.0), cell("扣除量", 90.0),
-                    (Node { flex_grow: 1.0, min_width: px(140) } Children [widgets::hint("统计耗时")]),
-                    cell("统计状态", 95.0),
-                ]),
+                (Node { min_width: px(700), align_items: AlignItems::Center,
+                    border_radius: {BorderRadius::all(px(theme::RADIUS_SM))} }
+                    ThemeBackgroundColor({theme::CARD_HEADER_BG})
+                    Children [
+                        cell("轮次 / 类型", 150.0), cell("开始（北京时间）", 120.0),
+                        cell("原始耗时", 90.0), cell("扣除量", 90.0),
+                        (Node { flex_grow: 1.0, min_width: px(140) } Children [widgets::hint("统计耗时")]),
+                        cell("统计状态", 95.0),
+                    ]),
                 (Node { flex_direction: FlexDirection::Column, max_height: px(420), min_width: px(700), overflow: {Overflow::scroll_y()} } ScrollArea Children [{rows}]),
             ]
         }));
-        result.push(boxed(bsn! {
+        body.push(boxed(bsn! {
             Node { column_gap: px(8), align_items: AlignItems::Center }
             Children [
                 widgets::hint(format!("逐轮明细 · 第 {} / {} 页", logs.report_page + 1, item.rounds.len().div_ceil(PAGE_SIZE).max(1))),
@@ -179,7 +242,7 @@ pub(super) fn content(logs: &Logs, report: &AnalysisReport) -> Vec<BoxedScene> {
             ]
         }));
     } else if item.error.is_none() {
-        result.push(boxed(widgets::hint(
+        body.push(boxed(widgets::hint(
             "未获得逐轮概览，可展开原始报告；旧版报告需重新分析生成。",
         )));
     }
@@ -205,11 +268,11 @@ pub(super) fn content(logs: &Logs, report: &AnalysisReport) -> Vec<BoxedScene> {
             LogAction::Open(path.clone()),
         )));
     }
-    result.push(boxed(widgets::collapsible(
+    body.push(boxed(widgets::collapsible(
         "原始报告与导出文件",
         None,
         false,
         files,
     )));
-    result
+    vec![boxed(report_card(body))]
 }

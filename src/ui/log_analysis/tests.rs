@@ -34,7 +34,8 @@ fn app() -> App {
 
 fn local(name: &str) -> Choice {
     Choice {
-        label: name.into(),
+        name: name.into(),
+        size: None,
         path: PathBuf::from(name),
         directory: false,
     }
@@ -196,8 +197,12 @@ fn 日志标签独立隐藏编辑区而切回保留实体() {
         .world_mut()
         .spawn((Node::default(), super::super::shell::FileListSlot))
         .id();
+    let sidebar = app
+        .world_mut()
+        .spawn((Node::default(), super::super::shell::SidebarRoot))
+        .id();
     app.update();
-    for entity in [actions, files] {
+    for entity in [actions, files, sidebar] {
         assert_eq!(
             app.world().get::<Node>(entity).unwrap().display,
             Display::None
@@ -205,7 +210,7 @@ fn 日志标签独立隐藏编辑区而切回保留实体() {
     }
     app.world_mut().insert_resource(ViewMode::Params);
     app.update();
-    for entity in [actions, files] {
+    for entity in [actions, files, sidebar] {
         assert_eq!(
             app.world().get::<Node>(entity).unwrap().display,
             Display::Flex
