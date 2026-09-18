@@ -1,8 +1,10 @@
-//! 连接面板：SSH 表单、`~/.ssh/config` 主机下拉、连接/断开等操作
+//! 连接面板：顶栏 SSH 摘要条 + 可折叠抽屉表单、`~/.ssh/config` 主机下拉、连接/断开等操作
 //!
 //! 表单只在启动时建一次，之后由 observer 单向同步到 [`Session`]；
 //! 只有"套用 ssh config 主机"会反向刷新输入框（靠 `form_version` 触发）。
 //! 连接按钮常驻，只同步显隐、禁用与焦点；主机菜单项在配置刷新后单独重建。
+//! 抽屉展开状态由 [`ConnectPanelOpen`] 记录：连接成功自动收起、断开自动展开，
+//! 点击摘要条随时手动翻转；摘要条本身只是 [`Session`] 的只读展示。
 
 use bevy::feathers::controls::{
     ButtonVariant, FeathersButton, FeathersMenuButton, FeathersMenuItem, FeathersMenuPopup,
@@ -13,7 +15,7 @@ use bevy::input::keyboard::KeyboardInput;
 use bevy::input_focus::tab_navigation::{NavAction, TabIndex, TabNavigation};
 use bevy::input_focus::{FocusCause, FocusedInput, InputFocus};
 use bevy::prelude::*;
-use bevy::text::{EditableText, FontWeight, TextEdit, TextEditChange};
+use bevy::text::{EditableText, FontWeight, LineBreak, TextEdit, TextEditChange};
 use bevy::ui::{InteractionDisabled, Pressed};
 use bevy::ui_widgets::{Activate, MenuAction, MenuEvent, MenuFocusState};
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
@@ -21,7 +23,7 @@ use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use crate::ssh_config::SshHostEntry;
 
 use super::password::PasswordInput;
-use super::shell::ConnectSlot;
+use super::shell::{ConnectPanelRoot, ConnectSlot, ConnectionDot};
 use super::theme;
 use super::widgets::{self, BoxedScene, ButtonGate, boxed};
 use super::worker_bridge::AppAction;
@@ -90,33 +92,221 @@ struct RenderedVersions {
     form: Option<u64>,
 }
 
-/// 构建连接面板
-fn connect_panel(session: &Session) -> impl Scene {
-    let login = session.login.clone();
-    widgets::card(
-        "SSH 连接",
-        bsn_list![
-            host_row(&login.host),
-            widgets::form_row("用户名", widgets::text_field(login.username, LoginField::Username)),
-            widgets::form_row("密码", widgets::password_field(login.password, PasswordFieldMarker)),
-            widgets::collapsible("连接设置", None, false, bsn_list![
-                widgets::form_row("端口", widgets::text_field(login.port, LoginField::Port)),
-                widgets::form_row("私钥", widgets::text_field(login.identity_file, LoginField::IdentityFile)),
-                widgets::hint("密码留空时使用 ssh-agent 或本机默认私钥。"),
-                widgets::form_row("DOMAIN_ID", widgets::text_field(login.ros_domain_id, LoginField::RosDomainId)),
-                widgets::form_row("任务目录", widgets::text_field(login.remote_dir, LoginField::RemoteDir)),
-            ]),
-            (
+/// 连接面板抽屉是否展开：首启即见表单，连接成功自动收起、断开自动展开。
+#[derive(Resource, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectPanelOpen(pub bool);
+
+impl Default for ConnectPanelOpen {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+/// 摘要条上的连接目标文字（未连接显示「SSH · 未连接」）
+#[derive(Component, Default, Clone)]
+struct ConnectStripText;
+
+/// 摘要条上的抽屉指示箭头（展开 ▾ / 收起 ▴）
+#[derive(Component, Default, Clone)]
+struct ConnectStripChevron;
+
+/// 顶栏 SSH 摘要条：状态点 + 连接目标 + 抽屉指示，点击翻转连接面板抽屉。
+///
+/// 状态点复用 [`ConnectionDot`]，颜色由状态栏同步统一维护；
+/// 目标文字与箭头由 [`sync_connect_strip`] 随会话和展开资源刷新。
+pub fn connect_strip() -> impl Scene {
+    bsn! {
+        @FeathersButton {
+            @caption: {bsn! {
                 Node {
                     flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
                     column_gap: px(6),
-                    width: percent(100),
-                    margin: {UiRect::top(px(2.0))},
                 }
-                Children [{connect_buttons()}]
-            )
-        ],
-    )
+                // 自定义 caption 的中间容器必须加入文字颜色传播链
+                ThemedText
+                Children [
+                    (widgets::status_dot(theme::DOT_DISCONNECTED) ConnectionDot),
+                    (
+                        Node { max_width: px(220), min_width: px(0), overflow: {Overflow::clip()} }
+                        Children [(
+                            Text("SSH · 未连接")
+                            TextLayout { linebreak: LineBreak::NoWrap }
+                            ConnectStripText
+                            ThemedText
+                            TextFont { font_size: px(12.0) }
+                            Node { flex_shrink: 0.0 }
+                        )]
+                    ),
+                    (
+                        Text("▾")
+                        ConnectStripChevron
+                        ThemedText
+                        TextFont { font_size: px(10.0) }
+                    ),
+                ]
+            }},
+            @variant: ButtonVariant::Plain
+        }
+        AccessibleLabel("展开或收起 SSH 连接面板")
+        on(on_connect_strip)
+    }
+}
+
+/// 点击摘要条：手动翻转抽屉展开状态
+fn on_connect_strip(_: On<Activate>, mut open: ResMut<ConnectPanelOpen>) {
+    open.0 = !open.0;
+}
+
+/// 摘要条文字与箭头随会话和展开资源刷新
+fn sync_connect_strip(
+    session: Res<Session>,
+    open: Res<ConnectPanelOpen>,
+    mut targets: Query<&mut Text, With<ConnectStripText>>,
+    mut chevrons: Query<&mut Text, (With<ConnectStripChevron>, Without<ConnectStripText>)>,
+) {
+    let target = match session.is_connected {
+        true => session
+            .target
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "SSH · 未连接".into()),
+        false => "SSH · 未连接".into(),
+    };
+    for mut text in &mut targets {
+        if text.0 != target {
+            text.0.clone_from(&target);
+        }
+    }
+    let chevron = match open.0 {
+        true => "▾",
+        false => "▴",
+    };
+    for mut text in &mut chevrons {
+        if text.0 != chevron {
+            text.0 = chevron.into();
+        }
+    }
+}
+
+/// 抽屉 display 跟随展开资源；连接沿自动收起、断开沿自动展开，方便更换主机。
+fn sync_connect_panel(
+    session: Res<Session>,
+    mut open: ResMut<ConnectPanelOpen>,
+    mut panels: Query<&mut Node, With<ConnectPanelRoot>>,
+    mut previous: Local<Option<bool>>,
+) {
+    if let Some(was_connected) = *previous
+        && was_connected != session.is_connected
+    {
+        open.0 = !session.is_connected;
+    }
+    *previous = Some(session.is_connected);
+    let display = match open.0 {
+        true => Display::Flex,
+        false => Display::None,
+    };
+    for mut node in &mut panels {
+        if node.display != display {
+            node.display = display;
+        }
+    }
+}
+
+/// 构建连接面板抽屉内容：主机 / 用户名 / 密码 / 按钮组横向流式排列，
+/// 宽度不够时换行；「连接设置」折叠区占整行。
+fn connect_panel(session: &Session) -> impl Scene {
+    let login = session.login.clone();
+    bsn! {
+        Node {
+            width: percent(100),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(4),
+        }
+        Children [
+            (
+                Node {
+                    width: percent(100),
+                    flex_direction: FlexDirection::Row,
+                    flex_wrap: FlexWrap::Wrap,
+                    align_items: AlignItems::Center,
+                    column_gap: px(12),
+                    row_gap: px(6),
+                }
+                Children [
+                    (
+                        Node { flex_grow: 2.0, flex_basis: px(0), min_width: px(280) }
+                        Children [host_row(&login.host)]
+                    ),
+                    (
+                        Node { flex_grow: 1.0, flex_basis: px(0), min_width: px(200) }
+                        Children [widgets::form_row("用户名", widgets::text_field(login.username, LoginField::Username))]
+                    ),
+                    (
+                        Node { flex_grow: 1.0, flex_basis: px(0), min_width: px(200) }
+                        Children [widgets::form_row("密码", widgets::password_field(login.password, PasswordFieldMarker))]
+                    ),
+                    (
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: px(6),
+                            flex_shrink: 0.0,
+                            margin: {UiRect::left(auto())},
+                        }
+                        Children [{connect_buttons()}]
+                    ),
+                ]
+            ),
+            widgets::collapsible("连接设置", None, false, bsn_list![
+                (
+                    Node {
+                        width: percent(100),
+                        flex_direction: FlexDirection::Row,
+                        flex_wrap: FlexWrap::Wrap,
+                        column_gap: px(12),
+                        row_gap: px(4),
+                    }
+                    Children [
+                        setting_row("端口", widgets::text_field(login.port, LoginField::Port)),
+                        setting_row("私钥", widgets::text_field(login.identity_file, LoginField::IdentityFile)),
+                        setting_row("DOMAIN_ID", widgets::text_field(login.ros_domain_id, LoginField::RosDomainId)),
+                        setting_row("任务目录", widgets::text_field(login.remote_dir, LoginField::RemoteDir)),
+                    ]
+                ),
+                widgets::hint("密码留空时使用 ssh-agent 或本机默认私钥。"),
+            ]),
+        ]
+    }
+}
+
+/// 连接设置的流式行：标签自适应宽度，输入框占满剩余空间，整行参与换行。
+fn setting_row(label: impl Into<String>, control: impl Scene) -> impl Scene {
+    bsn! {
+        Node {
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(6),
+            flex_grow: 1.0,
+            flex_basis: px(0),
+            min_width: px(240),
+        }
+        Children [
+            (
+                Node {
+                    flex_shrink: 0.0,
+                    align_items: AlignItems::Center,
+                    overflow: {Overflow::clip()},
+                }
+                Children [(
+                    Text({label.into()})
+                    ThemeTextColor({theme::FIELD_LABEL})
+                    TextFont { font_size: px(12.0) }
+                    TextLayout { linebreak: LineBreak::NoWrap }
+                )]
+            ),
+            (control)
+        ]
+    }
 }
 
 /// 密码框标记（密码值另走 [`PasswordInput`]，这里只作定位用）
@@ -732,6 +922,7 @@ pub struct ConnectPanelPlugin;
 impl Plugin for ConnectPanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RenderedVersions>()
+            .init_resource::<ConnectPanelOpen>()
             .add_observer(on_login_field_edit)
             .add_observer(on_action_button)
             .add_systems(
@@ -744,11 +935,26 @@ impl Plugin for ConnectPanelPlugin {
                 )
                     .in_set(UiSet::Rebuild),
             )
-            .add_systems(Update, sync_connect_buttons.after(UiSet::Rebuild))
+            .add_systems(
+                Update,
+                (
+                    sync_connect_buttons,
+                    sync_connect_panel,
+                    // 自动收起/展开与手动翻转在同帧反映到摘要条
+                    sync_connect_strip.after(sync_connect_panel),
+                )
+                    .after(UiSet::Rebuild),
+            )
             .add_systems(
                 PostUpdate,
                 position_open_host_menu.after(bevy::ui::UiSystems::Layout),
             );
+        // 截图验收注入收起态，便于核验摘要条外观；与现有截图夹具同风格，只在截图模式生效。
+        if std::env::var_os("TGE_SCREENSHOT").is_some()
+            && std::env::var("TGE_CONNECT_PANEL").as_deref() == Ok("collapsed")
+        {
+            app.insert_resource(ConnectPanelOpen(false));
+        }
     }
 }
 
@@ -1145,5 +1351,148 @@ mod tests {
         activate_button(&mut app);
         open_and_settle(&mut app);
         assert_eq!(app.world().get::<ScrollPosition>(popup).unwrap().y, 0.0);
+    }
+
+    /// 摘要条与抽屉的夹具：不生成完整表单，只验证摘要条、展开资源和抽屉 display。
+    fn strip_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            ScenePlugin,
+            InputPlugin,
+            InputDispatchPlugin,
+            MenuPlugin,
+        ))
+        .init_asset::<Font>()
+        .init_asset::<Image>()
+        .init_resource::<InputFocus>()
+        .init_resource::<FontCx>()
+        .init_resource::<LayoutCx>()
+        .init_resource::<bevy::clipboard::Clipboard>()
+        .init_resource::<Editor>()
+        .init_resource::<StatusLine>()
+        .insert_resource(Session::new(LoginConfig::default(), Vec::new()))
+        .add_message::<AppAction>()
+        .configure_sets(
+            Update,
+            (UiSet::Input, UiSet::Update, UiSet::Rebuild).chain(),
+        )
+        .add_plugins((widgets::WidgetsPlugin, ConnectPanelPlugin));
+        app.world_mut().spawn_scene(connect_strip()).unwrap();
+        app.world_mut().spawn((Node::default(), ConnectPanelRoot));
+        // 先稳定几帧，让连接沿检测记下未连接的基线
+        for _ in 0..4 {
+            app.update();
+        }
+        app
+    }
+
+    /// 摘要条按钮是 caption 文字的祖先中挂 `ui_widgets::Button` 的那一层
+    fn strip_button(app: &mut App) -> Entity {
+        let mut entity = entity_with::<ConnectStripText>(app);
+        while app
+            .world()
+            .get::<bevy::ui_widgets::Button>(entity)
+            .is_none()
+        {
+            entity = app.world().get::<ChildOf>(entity).unwrap().parent();
+        }
+        entity
+    }
+
+    fn strip_text(app: &mut App) -> String {
+        let entity = entity_with::<ConnectStripText>(app);
+        app.world().get::<Text>(entity).unwrap().0.clone()
+    }
+
+    fn chevron_text(app: &mut App) -> String {
+        let entity = entity_with::<ConnectStripChevron>(app);
+        app.world().get::<Text>(entity).unwrap().0.clone()
+    }
+
+    #[test]
+    fn 摘要条激活翻转抽屉展开状态并同步箭头() {
+        let mut app = strip_app();
+        assert!(app.world().resource::<ConnectPanelOpen>().0);
+        assert_eq!(strip_text(&mut app), "SSH · 未连接");
+        assert_eq!(chevron_text(&mut app), "▾");
+        let strip = strip_button(&mut app);
+        app.world_mut().trigger(Activate { entity: strip });
+        app.world_mut().flush();
+        assert!(!app.world().resource::<ConnectPanelOpen>().0);
+        app.update();
+        assert_eq!(chevron_text(&mut app), "▴");
+        app.world_mut().trigger(Activate { entity: strip });
+        app.world_mut().flush();
+        assert!(app.world().resource::<ConnectPanelOpen>().0);
+        app.update();
+        assert_eq!(chevron_text(&mut app), "▾");
+    }
+
+    #[test]
+    fn 连接沿自动收起抽屉而断开沿自动展开() {
+        let mut app = strip_app();
+        let panel = entity_with::<ConnectPanelRoot>(&mut app);
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().display,
+            Display::Flex
+        );
+        {
+            let mut session = app.world_mut().resource_mut::<Session>();
+            session.is_connected = true;
+            session.target = Some(crate::ui::ConnectionTarget {
+                host: "robot.example".into(),
+                port: 22,
+                username: "loosqk".into(),
+            });
+        }
+        app.update();
+        assert!(
+            !app.world().resource::<ConnectPanelOpen>().0,
+            "未连接变为已连接时自动收起抽屉"
+        );
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().display,
+            Display::None
+        );
+        assert_eq!(strip_text(&mut app), "loosqk@robot.example:22");
+        assert_eq!(chevron_text(&mut app), "▴");
+        {
+            let mut session = app.world_mut().resource_mut::<Session>();
+            session.is_connected = false;
+            session.target = None;
+        }
+        app.update();
+        assert!(
+            app.world().resource::<ConnectPanelOpen>().0,
+            "断开后自动展开抽屉，方便换主机"
+        );
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(strip_text(&mut app), "SSH · 未连接");
+    }
+
+    #[test]
+    fn 抽屉显示跟随展开资源且连接状态稳定时不重复翻转() {
+        let mut app = strip_app();
+        let panel = entity_with::<ConnectPanelRoot>(&mut app);
+        app.world_mut().resource_mut::<ConnectPanelOpen>().0 = false;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().display,
+            Display::None
+        );
+        // 没有连接沿时不能替用户重新展开或收起
+        app.update();
+        assert!(!app.world().resource::<ConnectPanelOpen>().0);
+        app.world_mut().resource_mut::<ConnectPanelOpen>().0 = true;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(panel).unwrap().display,
+            Display::Flex
+        );
     }
 }

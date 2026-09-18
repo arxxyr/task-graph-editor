@@ -3,14 +3,14 @@
 //! 骨架在启动时一次性建好，各面板往预留的插槽里填内容。
 //! 布局：
 //! ```text
-//! ┌──────────────────────────────────────────────┐
-//! │ ● 标题      │ [参数 / 流程图] 文件 [编辑操作] │ 顶栏
-//! ├─────────────┼────────────────────────────────┤
-//! │ 连接卡片    │  元数据 + 字段分组编辑器        │
-//! │ 文件列表    │  （可滚动）                     │
-//! ├─────────────┴────────────────────────────────┤
-//! │ [复制提示] 状态消息                  连接目标 │ 状态栏
-//! └──────────────────────────────────────────────┘
+//! ┌────────────────────────────────────────────────────┐
+//! │ ● 标题 │ [SSH 摘要条] [视图] 文件 [编辑操作] [主题] │ 顶栏第一行
+//! │ SSH 连接面板抽屉（可折叠）                          │ 顶栏第二行
+//! ├─────────────┬──────────────────────────────────────┤
+//! │ 文件列表    │  元数据 + 字段分组编辑器              │
+//! ├─────────────┴──────────────────────────────────────┤
+//! │ [复制提示] 状态消息                        连接目标 │ 状态栏
+//! └────────────────────────────────────────────────────┘
 //! ```
 
 use bevy::clipboard::{Clipboard, ClipboardError};
@@ -34,20 +34,29 @@ use super::{Editor, Session, StatusLine, UiSet};
 #[derive(Component, Default, Clone)]
 pub struct ActionBarSlot;
 
-/// 窄窗口把编辑操作放到第二行，视图入口与主题选择仍保持在第一行两端。
+/// 窄窗口把编辑操作放到第二行，SSH 摘要条、视图入口与主题选择保持在第一行。
 #[derive(Component, Clone, Default)]
 enum AppBarCell {
     #[default]
     Layout,
+    Ssh,
     Filename,
     Spacer,
     Actions,
     Theme,
 }
 
-/// 侧栏中的连接面板插槽
+/// 顶栏抽屉中的连接面板插槽
 #[derive(Component, Default, Clone)]
 pub struct ConnectSlot;
+
+/// 顶栏第二行的连接面板抽屉容器；display 由连接面板的展开资源驱动
+#[derive(Component, Default, Clone)]
+pub struct ConnectPanelRoot;
+
+/// 侧栏根节点；日志分析视图下整个侧栏隐藏
+#[derive(Component, Default, Clone)]
+pub struct SidebarRoot;
 
 /// 侧栏中的文件列表插槽
 #[derive(Component, Default, Clone)]
@@ -189,14 +198,15 @@ fn context_menu_layer() -> impl Scene {
     }
 }
 
-/// 顶栏与主体共用侧栏宽度，左侧是选择区标题，右侧是文档功能。
+/// 顶栏：第一行与主体共用侧栏宽度，左侧是选择区标题，右侧是文档功能；
+/// 第二行是全宽的 SSH 连接面板抽屉，display 由 `ConnectPanelOpen` 驱动。
 fn app_bar() -> impl Scene {
     bsn! {
         Node {
             width: percent(100),
             min_height: {px(theme::APPBAR_HEIGHT)},
             flex_shrink: 0.0,
-            flex_direction: FlexDirection::Row,
+            flex_direction: FlexDirection::Column,
             border: {UiRect::bottom(px(1.0))},
         }
         ThemeBackgroundColor({theme::APPBAR_BG})
@@ -204,85 +214,120 @@ fn app_bar() -> impl Scene {
         Children [
             (
                 Node {
-                    width: {px(theme::SIDEBAR_WIDTH)},
-                    flex_shrink: 0.0,
-                    align_items: AlignItems::Center,
-                    column_gap: px(10),
-                    padding: {UiRect::horizontal(px(theme::PAD + 2.0))},
+                    width: percent(100),
+                    flex_direction: FlexDirection::Row,
                 }
                 Children [
-                    (widgets::status_dot(theme::DOT_DISCONNECTED) ConnectionDot),
                     (
-                        Text("任务图编辑器")
-                        ThemeTextColor({theme::SECTION_TEXT})
-                        TextFont {
-                            font_size: px(15.0),
-                            weight: {FontWeight::BOLD}
+                        Node {
+                            width: {px(theme::SIDEBAR_WIDTH)},
+                            flex_shrink: 0.0,
+                            align_items: AlignItems::Center,
+                            column_gap: px(10),
+                            padding: {UiRect::horizontal(px(theme::PAD + 2.0))},
                         }
+                        Children [
+                            (widgets::status_dot(theme::DOT_DISCONNECTED) ConnectionDot),
+                            (
+                                Text("任务图编辑器")
+                                ThemeTextColor({theme::SECTION_TEXT})
+                                TextFont {
+                                    font_size: px(15.0),
+                                    weight: {FontWeight::BOLD}
+                                }
+                            ),
+                        ]
+                    ),
+                    (
+                        Node {
+                            flex_grow: 1.0,
+                            min_width: px(0),
+                            display: Display::Grid,
+                            align_items: AlignItems::Center,
+                            column_gap: px(10),
+                            row_gap: px(6),
+                            padding: {UiRect::axes(px(theme::PAD + 2.0), px(theme::PAD_SM))},
+                        }
+                        template_value(AppBarCell::Layout)
+                        Children [
+                            (
+                                Node {
+                                    flex_shrink: 0.0,
+                                    grid_row: {GridPlacement::start(1)},
+                                    grid_column: {GridPlacement::start(1)},
+                                }
+                                template_value(AppBarCell::Ssh)
+                                Children [super::connect::connect_strip()]
+                            ),
+                            (
+                                Node {
+                                    flex_direction: FlexDirection::Row,
+                                    justify_content: JustifyContent::FlexStart,
+                                    align_items: AlignItems::Center,
+                                    flex_shrink: 0.0,
+                                    column_gap: px(4),
+                                    grid_row: {GridPlacement::start(1)},
+                                    grid_column: {GridPlacement::start(2)},
+                                }
+                                ViewSwitchSlot
+                            ),
+                            (
+                                Node {
+                                    min_width: px(0),
+                                    overflow: {Overflow::clip()},
+                                    grid_row: {GridPlacement::start(1)},
+                                    grid_column: {GridPlacement::start(3)},
+                                }
+                                template_value(AppBarCell::Filename)
+                                Children [(
+                                    Text("")
+                                    TextLayout { linebreak: LineBreak::NoWrap }
+                                    CurrentFileText
+                                    ThemeTextColor({theme::READONLY_TEXT})
+                                    TextFont { font_size: px(12.0) }
+                                    Node { flex_shrink: 0.0 }
+                                )]
+                            ),
+                            (widgets::spacer() template_value(AppBarCell::Spacer)),
+                            (
+                                Node {
+                                    min_width: px(0),
+                                    flex_direction: FlexDirection::Row,
+                                    flex_wrap: FlexWrap::Wrap,
+                                    justify_content: JustifyContent::FlexEnd,
+                                    align_items: AlignItems::Center,
+                                    column_gap: px(6),
+                                    row_gap: px(6),
+                                }
+                                ActionBarSlot
+                                template_value(AppBarCell::Actions)
+                            ),
+                            (
+                                Node { justify_self: JustifySelf::End }
+                                template_value(AppBarCell::Theme)
+                                Children [super::theme_picker::theme_picker()]
+                            ),
+                        ]
                     ),
                 ]
             ),
             (
                 Node {
-                    flex_grow: 1.0,
-                    min_width: px(0),
-                    display: Display::Grid,
-                    align_items: AlignItems::Center,
-                    column_gap: px(10),
-                    row_gap: px(6),
+                    width: percent(100),
+                    flex_direction: FlexDirection::Column,
+                    border: {UiRect::top(px(1.0))},
                     padding: {UiRect::axes(px(theme::PAD + 2.0), px(theme::PAD_SM))},
                 }
-                template_value(AppBarCell::Layout)
-                Children [
-                    (
-                        Node {
-                            flex_direction: FlexDirection::Row,
-                            justify_content: JustifyContent::FlexStart,
-                            align_items: AlignItems::Center,
-                            flex_shrink: 0.0,
-                            column_gap: px(4),
-                            grid_row: {GridPlacement::start(1)},
-                            grid_column: {GridPlacement::start(1)},
-                        }
-                        ViewSwitchSlot
-                    ),
-                    (
-                        Node {
-                            min_width: px(0),
-                            overflow: {Overflow::clip()},
-                            grid_row: {GridPlacement::start(1)},
-                            grid_column: {GridPlacement::start(2)},
-                        }
-                        template_value(AppBarCell::Filename)
-                        Children [(
-                            Text("")
-                            TextLayout { linebreak: LineBreak::NoWrap }
-                            CurrentFileText
-                            ThemeTextColor({theme::READONLY_TEXT})
-                            TextFont { font_size: px(12.0) }
-                            Node { flex_shrink: 0.0 }
-                        )]
-                    ),
-                    (widgets::spacer() template_value(AppBarCell::Spacer)),
-                    (
-                        Node {
-                            min_width: px(0),
-                            flex_direction: FlexDirection::Row,
-                            flex_wrap: FlexWrap::Wrap,
-                            justify_content: JustifyContent::FlexEnd,
-                            align_items: AlignItems::Center,
-                            column_gap: px(6),
-                            row_gap: px(6),
-                        }
-                        ActionBarSlot
-                        template_value(AppBarCell::Actions)
-                    ),
-                    (
-                        Node { justify_self: JustifySelf::End }
-                        template_value(AppBarCell::Theme)
-                        Children [super::theme_picker::theme_picker()]
-                    ),
-                ]
+                ConnectPanelRoot
+                ThemeBackgroundColor({theme::APPBAR_BG})
+                ThemeBorderColor({theme::DIVIDER})
+                Children [(
+                    Node {
+                        width: percent(100),
+                        flex_direction: FlexDirection::Column,
+                    }
+                    ConnectSlot
+                )]
             ),
         ]
     }
@@ -309,12 +354,18 @@ fn sync_app_bar_layout(
                     false => Display::Flex,
                 };
                 if compact {
+                    // 第一行：SSH 摘要条 / 视图入口 / 文件名 / 主题；编辑操作移到第二行
                     node.grid_template_columns = vec![
+                        RepeatedGridTrack::auto(1),
                         RepeatedGridTrack::auto(1),
                         RepeatedGridTrack::flex(1, 1.0),
                         RepeatedGridTrack::auto(1),
                     ];
                 }
+            }
+            AppBarCell::Ssh => {
+                node.grid_row = GridPlacement::start(1);
+                node.grid_column = GridPlacement::start(1);
             }
             AppBarCell::Filename => {
                 node.max_width = match compact {
@@ -331,13 +382,13 @@ fn sync_app_bar_layout(
             AppBarCell::Actions => {
                 node.grid_row = GridPlacement::start(if compact { 2 } else { 1 });
                 node.grid_column = match compact {
-                    true => GridPlacement::start_span(1, 3),
-                    false => GridPlacement::start(3),
+                    true => GridPlacement::start_span(1, 4),
+                    false => GridPlacement::start(4),
                 };
             }
             AppBarCell::Theme => {
                 node.grid_row = GridPlacement::start(1);
-                node.grid_column = GridPlacement::start(if compact { 3 } else { 4 });
+                node.grid_column = GridPlacement::start(if compact { 4 } else { 5 });
             }
         }
     }
@@ -360,7 +411,7 @@ fn body() -> impl Scene {
     }
 }
 
-/// 左侧栏：连接面板 + 文件列表
+/// 左侧栏：只留文件列表（SSH 连接面板已移到顶栏抽屉），日志视图整体隐藏
 fn sidebar() -> impl Scene {
     bsn! {
         Node {
@@ -373,25 +424,17 @@ fn sidebar() -> impl Scene {
             border: {UiRect::right(px(1.0))},
             overflow: {Overflow::scroll_y()},
         }
+        SidebarRoot
         ScrollArea
         ThemeBackgroundColor({theme::SIDEBAR_BG})
         ThemeBorderColor({theme::DIVIDER})
-        Children [
-            (
-                Node {
-                    width: percent(100),
-                    flex_direction: FlexDirection::Column,
-                }
-                ConnectSlot
-            ),
-            (
-                Node {
-                    width: percent(100),
-                    flex_direction: FlexDirection::Column,
-                }
-                FileListSlot
-            )
-        ]
+        Children [(
+            Node {
+                width: percent(100),
+                flex_direction: FlexDirection::Column,
+            }
+            FileListSlot
+        )]
     }
 }
 
