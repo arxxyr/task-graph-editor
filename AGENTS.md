@@ -537,7 +537,8 @@ shell 同样不会展开其中的 `~`。
 - 缓存：Swatinem/rust-cache@v2
 - Linux 系统依赖：`libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev libxcursor-dev
   libxrandr-dev libxi-dev`（不需要 libasound2-dev / libudev-dev —— 音频与手柄 feature 都没开）
-- UPX 压缩：仅 Linux `--best --lzma`；macOS 不支持；Windows 跳过（UPX 加壳的无签名 exe 会触发 Defender/SmartScreen 木马误报）
+- 三个平台都不做 UPX 压缩，发布包里就是 cargo 构建出的原始可执行文件；不要再引入加壳
+  （此前仅 Linux 压缩，已按使用要求去掉；Windows 上加壳的无签名 exe 还会触发 Defender/SmartScreen 误报）
 - 产物命名：`task-graph-editor-{版本}-{平台}.{扩展名}`
 - GitHub 仅允许通过上述门禁的 `v*` 标签创建 Release（含 prerelease 检测），普通分支和 PR 不发布。
   Release 显式依赖门禁及三平台构建成功，发布前再次校验远端 `master`。

@@ -204,7 +204,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install pkg-config
 
-      # Windows: NASM 用于 openssl vendored 编译
+      # Windows: NASM 用于 openssl vendored 编译；exe 图标由 build.rs 经 winresource 写入，
+      # 用到的 rc.exe 随 MSVC 工具链的 Windows SDK 提供，无需额外安装
       - name: Install Windows dependencies
         if: runner.os == 'Windows'
         run: choco install nasm -y
@@ -232,22 +233,7 @@ jobs:
             exit 1
           fi
 
-      # UPX 压缩（仅 Linux；macOS 不支持，Windows 跳过——
-      # UPX 加壳的无签名 exe 会触发 Defender/SmartScreen 木马误报）
-      - name: Install UPX (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y upx-ucl
-
-      - name: Compress binary with UPX
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          EXE="target/${{ matrix.target }}/release/task-graph-editor${{ matrix.exe_suffix }}"
-          echo "=== 压缩前 ==="
-          ls -lh "$EXE"
-          upx --best --lzma "$EXE" || true
-          echo "=== 压缩后 ==="
-          ls -lh "$EXE"
+      # 三个平台都不做 UPX 压缩，产物就是 cargo 构建出的原始可执行文件。
 
       # 打包产物 (Linux)
       - name: Package artifacts (Linux)
