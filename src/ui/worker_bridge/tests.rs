@@ -719,6 +719,7 @@ fn 保存旧目录不会把新列表切回去且同步改名来源() {
             old_filename: "task.json".into(),
             new_filename: Some("renamed.json".into()),
             cleanup_warning: None,
+            geo_sync: None,
             file_list: listing("/A", &["renamed.json"]),
         },
         &mut session,
@@ -818,6 +819,7 @@ fn 保存成功但清理失败保持来源并明确提示() {
             old_filename: "task.json".into(),
             new_filename: Some("new.json".into()),
             cleanup_warning: Some("旧文件未删除".into()),
+            geo_sync: None,
             file_list: listing("/A", &["task.json", "new.json"]),
         },
         &mut session,
@@ -828,6 +830,95 @@ fn 保存成功但清理失败保持来源并明确提示() {
     assert_eq!(editor.document.as_ref().unwrap().filename, "new.json");
     assert!(status.text.contains("文件已保存"));
     assert!(status.text.contains("旧文件未删除"));
+}
+
+#[test]
+fn 保存请求携带顶层位姿的底盘位姿用于同步地图点位() {
+    let session = session();
+    let WorkerRequest::SaveFile { geo_sync, .. } = save_request(&session, &pose_editor()).unwrap()
+    else {
+        panic!("应产生保存请求");
+    };
+    let request = geo_sync.expect("有顶层位姿时必须请求同步");
+    assert_eq!(request.map_id, "m");
+    assert_eq!(request.task_id, "task");
+    // 位姿数组和嵌套分组里的位姿没有对应的导航点键，不参与。
+    let keys: Vec<&str> = request
+        .chassis_poses
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, ["home_pose"]);
+
+    let WorkerRequest::SaveFile { geo_sync, .. } = save_request(&session, &editor()).unwrap()
+    else {
+        panic!("应产生保存请求");
+    };
+    assert!(geo_sync.is_none(), "没有位姿时不必读取地图目录");
+}
+
+#[test]
+fn 保存回执把地图点位同步结果接在保存提示之后() {
+    use crate::model::geojson::{GeoSyncReport, SyncedPoint};
+    use crate::ui::StatusLevel;
+
+    let mut session = session();
+    let mut editor = editor();
+    let mut status = StatusLine::default();
+    let mut saved = |geo_sync: Option<GeoSyncReport>, status: &mut StatusLine| {
+        let ticket = editor.next_save_ticket();
+        assert!(editor.begin_save(ticket));
+        respond(
+            WorkerResponse::FileSaved {
+                ticket,
+                remote_dir: "/A".into(),
+                old_filename: "task.json".into(),
+                new_filename: None,
+                cleanup_warning: None,
+                geo_sync,
+                file_list: listing("/A", &["task.json"]),
+            },
+            &mut session,
+            status,
+            &mut FileBrowser::default(),
+            &mut editor,
+        );
+    };
+
+    let mut report = GeoSyncReport {
+        matched_files: 1,
+        updated_files: vec!["a.geojson".into()],
+        ..Default::default()
+    };
+    report.updated.insert(SyncedPoint {
+        feature: "WS-01-wait".into(),
+        context_key: "origin_point".into(),
+    });
+    saved(Some(report), &mut status);
+    assert_eq!(
+        status.text,
+        "已更新远程文件: task.json；已同步 1 个地图点位到 1 个 GeoJSON：origin_point"
+    );
+    assert_eq!(status.level(), StatusLevel::Ok);
+
+    // 同步失败时任务图依旧算已保存，但要按错误配色提示，再次保存即可重试。
+    let failed = GeoSyncReport {
+        matched_files: 1,
+        errors: vec!["a.geojson：当前用户没有写权限".into()],
+        ..Default::default()
+    };
+    saved(Some(failed), &mut status);
+    assert_eq!(
+        status.text,
+        "已更新远程文件: task.json；地图点位同步失败：a.geojson：当前用户没有写权限"
+    );
+    assert_eq!(status.level(), StatusLevel::Error);
+
+    // 没有关联的 GeoJSON 时保存提示保持原样。
+    for quiet in [None, Some(GeoSyncReport::default())] {
+        saved(quiet, &mut status);
+        assert_eq!(status.text, "已更新远程文件: task.json");
+    }
 }
 
 #[test]

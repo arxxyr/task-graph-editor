@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::model::geojson::{GeoSyncReport, GeoSyncRequest};
 use crate::ssh::{AuthMethod, DirListing, SshCancellation, SshConfig, SshConnection};
 
 /// UI 唤醒回调：后台线程产生响应后调用，通知 UI 层尽快处理
@@ -85,13 +86,15 @@ pub enum WorkerRequest {
         remote_dir: String,
         filename: String,
     },
-    /// 保存文件（写入 + 可选重命名 + 自动刷新列表）
+    /// 保存文件（写入 + 可选重命名 + 同步地图点位 + 自动刷新列表）
     SaveFile {
         ticket: SaveTicket,
         remote_dir: String,
         current_filename: String,
         content: String,
         new_filename: Option<String>,
+        /// 任务图提交成功后要同步到地图 GeoJSON 的底盘位姿；没有顶层位姿时为 `None`
+        geo_sync: Option<GeoSyncRequest>,
     },
     /// 备份文件（读取 + 生成备份名 + 写入 + 刷新列表）
     BackupFile {
@@ -144,6 +147,8 @@ pub enum WorkerResponse {
         old_filename: String,
         new_filename: Option<String>,
         cleanup_warning: Option<String>,
+        /// 地图点位同步结果；任务图此时已经保存，同步失败只作为警告
+        geo_sync: Option<GeoSyncReport>,
         file_list: Result<DirListing, String>,
     },
     /// 保存失败
@@ -530,6 +535,7 @@ fn worker_loop(
                 current_filename,
                 content,
                 new_filename,
+                geo_sync,
             } => {
                 let valid_names = validate_filename(&current_filename)
                     .and_then(|()| new_filename.as_deref().map_or(Ok(()), validate_filename));
@@ -562,6 +568,9 @@ fn worker_loop(
                 };
                 tracing::info!(path = %outcome.saved_path, "任务图已提交");
 
+                // 运行时以地图 GeoJSON 的导航点为准，任务图提交后立即同步，示教结果才会生效。
+                let geo_sync = geo_sync.map(|request| conn.sync_geojson(&remote_dir, &request));
+
                 // 刷新文件列表
                 let file_list = list_files_logged(conn, &remote_dir);
                 respond!(WorkerResponse::FileSaved {
@@ -570,6 +579,7 @@ fn worker_loop(
                     old_filename: current_filename,
                     new_filename,
                     cleanup_warning: outcome.cleanup_warning,
+                    geo_sync,
                     file_list,
                 });
             }

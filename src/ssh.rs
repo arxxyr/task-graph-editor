@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 mod agent;
 mod atomic_write;
 mod cancellation;
+mod geo_sync;
 pub mod logs;
 pub use cancellation::SshCancellation;
 

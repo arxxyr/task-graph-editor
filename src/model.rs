@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub mod geojson;
 mod graph;
 pub mod graph_edit;
 pub mod graph_schema;

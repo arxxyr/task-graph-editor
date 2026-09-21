@@ -21,8 +21,10 @@ task-graph-editor/
 │  ├─ model/graph.rs           # 只读流程模型解析、逐层结构诊断与原始条数
 │  ├─ model/graph_edit.rs      # 完整图工作副本、稳定身份、事务、撤销与合并保存
 │  ├─ model/graph_schema.rs    # 执行器 44 种节点定义、创建草稿与静态校验
+│  ├─ model/geojson.rs         # 地图 GeoJSON 导航点与底盘位姿的比对和原地数字替换（纯逻辑，带单测）
 │  ├─ ssh.rs                   # SSH/SFTP 封装：连接、认证（密码 / ssh-agent / 私钥）、文件操作、命令执行
 │  ├─ ssh/                     # 原子写入、agent 认证与连接取消
+│  ├─ ssh/geo_sync.rs          # 保存后查找并同步 `<工作区>/map/<map_id>/geo_info/*.geojson`
 │  ├─ ssh_config.rs            # ~/.ssh/config 解析：Host/Match/Include、首值生效、token 展开
 │  ├─ worker.rs                # 后台工作线程：所有 SSH/SFTP/ROS2 操作在此异步执行（与 GUI 框架解耦）
 │  └─ ui/
@@ -152,6 +154,32 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
 - **远端 Linux 需要 `python3` 和支持 `fsync@openssh.com` 的 SFTP 服务端**。提交脚本仅从 stdin JSON
   接收路径；不要把文件名拼进命令。前置能力不满足时停止保存，不能回退到 truncate 覆盖旧文件。
 - 提交时若连接中断，回执可能丢失，应刷新核实目标状态；原子替换保证旧目标不会变成半写入文件。
+
+### 地图点位同步（GeoJSON）
+
+**运行时以地图 GeoJSON 的导航点为准**，导航点按 `pose_context_key` 注入任务图 context。只改任务图
+而不同步 GeoJSON，示教结果不会生效，所以同步是保存流程的一部分，而不是单独的操作。
+
+- 位置由文档来源目录推出：`<工作区>/task_graphs` → `<工作区>/map/<map_id>/geo_info/*.geojson`。
+  `map_id` 必须是单个路径段；目录经 `realpath` 后仍须位于地图根目录内，只认普通文件，不跟随符号链接。
+  没有该目录是常态，静默跳过，保存提示保持原样。
+- 只处理 `properties.source_task_id == task_id` 且 `map_id`/`map_code`（若存在）一致的 FeatureCollection。
+  保存总会把文件更名为 `{task_id}.json` 且拒绝同名覆盖，备份副本因此无法把旧位姿推进 GeoJSON。
+- 关联键优先 `pose_context_key`（注入目标），该属性缺失才退回 `source_context_key`（生成来源）；
+  注入键指向的位姿不存在时**不**拿来源键顶替。只关联顶层 `ContextValue::Pose`，取其 `chassis_pose`；
+  同一个键可对应多个导航点，全部更新。没有键的占位点、工位多边形等一律不动。
+- 每次保存做全量比对（幂等）：关联点位与任务图不一致就更新，因此同步失败后再保存一次即可重试。
+  不要改成「只同步本次改动的键」，那样失败后的重试会因新旧任务图相同而悄悄跳过。
+- GeoJSON 属于上游平台：借助 `serde_json` 的 `raw_value` 取得数字字面量的字节范围，**只原地替换变化的
+  数字**，键顺序、缩进、整数写法（`0` 与 `0.0` 视为相等）和未知字段逐字节保留；项目没开
+  `preserve_order`，整体反序列化再写回会把键按字母序重排。替换结果必须与「在解析结果上做同样修改」
+  完全相等，否则放弃写入。非有限数值直接拒绝；结构异常的点整点不动并在提示里说明原因。
+- 以当前登录用户经普通原子保存写回，不使用 sudo；权限不足时提示把 `geo_info` 改为当前用户所有。
+- 结果随 `FileSaved` 回执带回，接在保存提示之后；失败文案含「失败」、未同步含「注意」，
+  与状态栏按关键词配色的规则配合。任务图此时已保存，同步失败不回滚、不改变未保存状态。
+- 真实样例核对：`TASK_GRAPH_REAL_FILE=<任务图副本> TGE_GEOJSON_FILE=<geojson 副本>
+  cargo test 真实地图点位与任务图一致且改动最小 -- --ignored --nocapture`，只读本地副本。
+  仓库是公开的，测试夹具必须是合成数据，不要提交含工厂名称或内网地址的真实 GeoJSON。
 
 ### UI 层：保留模式下的重建策略
 

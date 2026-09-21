@@ -328,6 +328,7 @@ fn save_request(session: &Session, editor: &Editor) -> Result<WorkerRequest, Str
         current_filename: document.filename.clone(),
         content,
         new_filename: (new_name != document.filename).then_some(new_name),
+        geo_sync: model::geojson::GeoSyncRequest::from_task_graph(data),
     })
 }
 
@@ -967,6 +968,7 @@ fn handle_response(
             old_filename,
             new_filename,
             cleanup_warning,
+            geo_sync,
             file_list,
         } => {
             if !editor.confirm_save(ticket) {
@@ -992,6 +994,10 @@ fn handle_response(
             apply_operation_file_list(browser, status, file_list);
             if let Some(warning) = cleanup_warning {
                 status.set(format!("文件已保存；警告：{warning}"));
+            }
+            // 任务图已经保存；地图点位的结果接在后面，同步失败时可直接再次保存重试。
+            if let Some(geo) = geo_sync.as_ref().and_then(|report| report.status_text()) {
+                status.set(format!("{}；{geo}", status.text));
             }
         }
 
