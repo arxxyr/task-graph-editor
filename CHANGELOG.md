@@ -6,6 +6,8 @@ GitHub Release 从本文件提取对应版本的记录。
 
 ## [未发布]
 
+## [0.12.0] - 2026-09-21
+
 ### 新增
 
 - 保存任务图后自动同步地图 GeoJSON：在同一工作区的 `map/<map_id>/geo_info/` 下找到 `source_task_id` 与当前任务一致的文件，按 `pose_context_key`（缺失时退回 `source_context_key`）把顶层位姿的底盘位置与姿态写入关联导航点。运行时以 GeoJSON 为准，示教后无需再手工修改地图文件。

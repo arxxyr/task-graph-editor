@@ -224,7 +224,7 @@ GitHub Release 只显示标签对应的条目，并附版本信息和下载说�
 本地预览和回归检查（Python 3.11+，仅使用标准库）：
 
 ```bash
-uv run --no-project python scripts/release_notes.py --tag v0.11.0
+uv run --no-project python scripts/release_notes.py --tag v0.12.0
 uv run --no-project python scripts/test_release_notes.py
 ```
 
@@ -240,8 +240,8 @@ Release。轻量标签、附注标签以及 `master` 历史提交上的标签均
 
 ```bash
 git switch master
-git tag v0.11.0
-git push github v0.11.0
+git tag v0.12.0
+git push github v0.12.0
 ```
 
 发布门禁的本地隔离测试：`python3 scripts/test_release_tag.py`，只创建临时 Git 仓库。
@@ -250,9 +250,9 @@ git push github v0.11.0
 
 | 平台 | 文件名 |
 |------|--------|
-| Linux x64 | `task-graph-editor-v0.11.0+{commit}-linux-x64.tar.gz` |
-| macOS ARM64 | `task-graph-editor-v0.11.0+{commit}-macos-arm64.zip`（应用包） |
-| Windows x64 | `task-graph-editor-v0.11.0+{commit}-windows-x64.zip` |
+| Linux x64 | `task-graph-editor-v0.12.0+{commit}-linux-x64.tar.gz` |
+| macOS ARM64 | `task-graph-editor-v0.12.0+{commit}-macos-arm64.zip`（应用包） |
+| Windows x64 | `task-graph-editor-v0.12.0+{commit}-windows-x64.zip` |
 
 ## 许可证
 
