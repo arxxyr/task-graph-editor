@@ -141,6 +141,9 @@ build:linux-x64:
     - mkdir -p package
     - cp target/x86_64-unknown-linux-gnu/release/task-graph-editor package/
     - echo -n "${FULL_VERSION}" > package/VERSION
+    # Wayland 下任务栏图标来自桌面入口，随包附带，安装方法见 README
+    - cp assets/icons/app-icon.png package/task-graph-editor.png
+    - cp assets/icons/task-graph-editor.desktop package/
     - cd package && tar czf "../${PACKAGE_NAME}.tar.gz" . && cd ..
   artifacts:
     paths:
@@ -175,6 +178,7 @@ build:macos-arm64:
       mkdir -p "package/${APP_NAME}/Contents/MacOS"
       mkdir -p "package/${APP_NAME}/Contents/Resources"
       cp target/aarch64-apple-darwin/release/task-graph-editor "package/${APP_NAME}/Contents/MacOS/task-graph-editor"
+      cp assets/icons/app-icon.icns "package/${APP_NAME}/Contents/Resources/app-icon.icns"
       cat > "package/${APP_NAME}/Contents/Info.plist" << PLIST_EOF
       <?xml version="1.0" encoding="UTF-8"?>
       <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -192,6 +196,8 @@ build:macos-arm64:
           <string>${VERSION}</string>
           <key>CFBundleExecutable</key>
           <string>task-graph-editor</string>
+          <key>CFBundleIconFile</key>
+          <string>app-icon</string>
           <key>CFBundlePackageType</key>
           <string>APPL</string>
           <key>NSHighResolutionCapable</key>

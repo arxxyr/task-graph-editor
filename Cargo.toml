@@ -64,6 +64,11 @@ tracing = "0.1"
 # 由 LogPlugin 的 filter 统一屏蔽（见 main.rs）。
 icu_provider = { version = "2.1", features = ["logging"] }
 
+# 窗口与任务栏图标随主题切换（Windows、X11）：Bevy 没有窗口图标接口，也不导出 winit 的 Icon。
+# 版本跟随 bevy_winit；关闭默认特性，平台后端仍由 Bevy 的 x11 / wayland 特性决定。
+# macOS 上窗口图标是空操作，但同一份代码在所有平台参与编译和测试。
+winit = { version = "0.30", default-features = false }
+
 # Windows ssh-agent：Pageant 有界消息调用与 OpenSSH 管道的可取消 Overlapped I/O。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -71,6 +76,19 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading",
     "Win32_System_Memory", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging",
 ] }
+
+# macOS 的 Dock 图标随主题切换：运行期替换 NSApplication 的图标。
+# 与 rfd、arboard 已引入的版本和特性一致，不增加新的 crate。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std", "NSApplication", "NSResponder", "NSImage",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
+# 把图标写进 exe 资源：资源管理器和固定到任务栏的快捷方式读取的是它，不是运行期设置的窗口图标。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 strip = true

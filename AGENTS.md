@@ -11,6 +11,7 @@
 ```
 task-graph-editor/
 ├─ Cargo.toml                  # 项目配置（Rust 2024 edition）
+├─ build.rs                    # 仅 Windows：把 assets/icons/app-icon.ico 写进 exe 资源
 ├─ CHANGELOG.md                # 从 0.8.2 开始的版本变更记录，自动提取到 Release 正文
 ├─ AGENTS.md                   # 开发指南（CLAUDE.md 为指向它的符号链接）
 ├─ .github/workflows/build.yml # GitHub Actions CI
@@ -35,6 +36,7 @@ task-graph-editor/
 │     │  └─ refresh.rs         # 继承文字、光标及控件派生颜色刷新
 │     ├─ theme_picker.rs       # 右上角主题菜单：固定四项，只更新资源与文字
 │     ├─ theme_preferences.rs  # 独立主题偏好的加载与原子保存
+│     ├─ app_icon.rs           # 窗口 / 任务栏 / Dock 图标随主题在深色版、浅色版之间切换
 │     ├─ fonts.rs              # 中文字体嵌入与全局覆盖
 │     ├─ widgets.rs            # 通用构件：卡片、折叠区块、表单行、数值/文本/密码输入
 │     ├─ password.rs           # 密码遮罩控件（Bevy 未提供，基于光标位置同步）
@@ -55,7 +57,9 @@ task-graph-editor/
 │     └─ screenshot.rs         # 截图：F12 手动 / TGE_SCREENSHOT 自动（CI 视觉回归）
 ├─ assets/fonts/               # 更纱黑体（SarasaTermSCNerd，编译时嵌入）
 ├─ assets/themes/palettes.json # 四套主题色板的唯一权威源，编译时嵌入
+├─ assets/icons/               # 应用图标产物（SVG / PNG / ICO / ICNS / 桌面入口），由脚本生成后提交
 └─ scripts/
+   ├─ generate_app_icons.py    # 应用图标的唯一来源：几何与配色定义，`uv run` 生成 assets/icons/
    ├─ build-release.sh         # 本地 Release 构建脚本
    ├─ deploy-remote.sh         # 远程部署脚本
    └─ test_deploy_remote.py    # 本地隔离的部署成功与失败注入测试
@@ -77,6 +81,8 @@ TGE_SCREENSHOT=/tmp/ui.png cargo run     # 启动后自动截一张再退出
 TGE_SCREENSHOT=/tmp/ui.png TGE_SCREENSHOT_TASK=<任务图副本> TGE_CONNECT_PANEL=collapsed cargo run
 # 运行时按 F12 也可随时截图到当前目录
 
+# 重新生成应用图标（修改 scripts/generate_app_icons.py 的几何或配色之后）
+uv run scripts/generate_app_icons.py
 
 # 排查问题：打开详细日志（SSH 连接参数、SFTP 路径展开、文件列表条数、界面重建时机）
 TGE_LOG=debug cargo run
@@ -482,6 +488,21 @@ shell 同样不会展开其中的 `~`。
   保存失败不逐帧重试；主目录不可得时禁用存储，不能回退工作目录。
   离线测试和截图夹具必须在插件装配前注入 `ThemePreferencesStore::disabled()`；
   持久化测试使用 `at_path` 指定隔离临时路径，不访问使用者配置。
+- **应用图标**：原创的蜘蛛徽标，几何与配色只在 `scripts/generate_app_icons.py` 里定义，`assets/icons/` 全是
+  它的产物（含供参考的 SVG），不要手工修改；小尺寸（≤48）使用加粗的腿并去掉蛛网。不要换成任何第三方
+  商标图案的拷贝——仓库和发布包都是公开的。
+  - 运行期随主题切换（`ui/app_icon.rs`）：`ThemeId::is_dark()` 为真用深色版，否则用浅色版；只在深浅发生
+    变化时重设。Bevy 0.19 没有窗口图标接口，经 `bevy::winit::WINIT_WINDOWS` 取底层窗口调用 winit；
+    窗口要过几帧才创建，未设置成功时不推进 `AppliedIcon`，下一帧重试（与「已渲染版本」同一个道理）。
+    图标和 Dock 只能在主线程设置，system 必须带 `NonSendMarker`。
+  - Windows 标题栏用 32px、任务栏用 256px 两张；X11 给 256px；macOS 的窗口图标在 winit 里是空操作，
+    改用 AppKit 的 `setApplicationIconImage` 换 Dock 图标（`objc2-app-kit`，版本和特性与 rfd / arboard
+    已引入的一致），从终端 `cargo run` 时也生效。Wayland 不允许应用设置窗口图标，只能靠桌面入口。
+  - winit 路径在所有平台参与编译和测试，只有 Windows 任务栏两行与 macOS Dock 部分按平台裁剪；
+    这样本机（macOS）就能类型检查 Linux 用到的代码。PNG 用 Bevy 已启用的解码器解码，不另引图像库。
+  - 静态图标统一用深色版（默认主题是石墨青）：macOS 应用包的 `app-icon.icns` + `CFBundleIconFile`，
+    Windows 由 `build.rs` 经 `winresource` 写进 exe 资源，Linux 压缩包附带 `.desktop` 与 PNG。
+    生成应用包的地方有四处（两份 CI、`build-release.sh`、`deploy.sh`），改打包内容时要同步修改。
 - **视觉体系**：尺寸常量集中在 `theme.rs`，构件样式集中在 `widgets.rs`，各视图按此对齐，不各自发明数值。
   - 圆角体系：卡片 `RADIUS = 12`，控件（按钮、输入、菜单）`RADIUS_SM = 8`，小件（徽章、折叠头）7，pill 全圆。
   - 间距 4 倍数网格：页面 padding 16–20，卡片 `PAD = 14`，区块 gap 12，行内 `PAD_SM = 8`。

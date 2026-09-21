@@ -110,6 +110,7 @@ if [[ "${TARGET}" == *"-apple-darwin"* ]]; then
     mkdir -p "${APP_DIR}/Contents/Resources"
 
     cp "${BINARY}" "${APP_DIR}/Contents/MacOS/task-graph-editor"
+    cp "${PROJECT_DIR}/assets/icons/app-icon.icns" "${APP_DIR}/Contents/Resources/app-icon.icns"
 
     cat > "${APP_DIR}/Contents/Info.plist" << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -128,6 +129,8 @@ if [[ "${TARGET}" == *"-apple-darwin"* ]]; then
     <string>${VERSION}</string>
     <key>CFBundleExecutable</key>
     <string>task-graph-editor</string>
+    <key>CFBundleIconFile</key>
+    <string>app-icon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>NSHighResolutionCapable</key>
@@ -148,6 +151,11 @@ else
     mkdir -p "${PACKAGE_DIR}"
     cp "${BINARY}" "${PACKAGE_DIR}/"
     echo -n "v${VERSION}" > "${PACKAGE_DIR}/VERSION"
+    if [[ "${TARGET}" != *"windows"* ]]; then
+        # Linux：Wayland 下任务栏图标来自桌面入口，随包附带，安装方法见 README
+        cp "${PROJECT_DIR}/assets/icons/app-icon.png" "${PACKAGE_DIR}/task-graph-editor.png"
+        cp "${PROJECT_DIR}/assets/icons/task-graph-editor.desktop" "${PACKAGE_DIR}/"
+    fi
 
     cd "${DIST_DIR}"
     if [[ "${TARGET}" == *"windows"* ]]; then

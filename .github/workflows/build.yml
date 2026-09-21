@@ -256,6 +256,9 @@ jobs:
           mkdir -p package
           cp target/${{ matrix.target }}/release/task-graph-editor package/
           echo "${{ steps.version.outputs.full_version }}" > package/VERSION
+          # Wayland 下任务栏图标来自桌面入口，随包附带，安装方法见 README
+          cp assets/icons/app-icon.png package/task-graph-editor.png
+          cp assets/icons/task-graph-editor.desktop package/
           cd package
           tar -czvf ../${{ steps.version.outputs.package_name }}.tar.gz .
           cd ..
@@ -269,6 +272,7 @@ jobs:
           mkdir -p "package/${APP_NAME}/Contents/Resources"
 
           cp "target/${{ matrix.target }}/release/task-graph-editor" "package/${APP_NAME}/Contents/MacOS/task-graph-editor"
+          cp assets/icons/app-icon.icns "package/${APP_NAME}/Contents/Resources/app-icon.icns"
 
           cat > "package/${APP_NAME}/Contents/Info.plist" << 'PLIST_EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -287,6 +291,8 @@ jobs:
               <string>PLACEHOLDER_VERSION</string>
               <key>CFBundleExecutable</key>
               <string>task-graph-editor</string>
+              <key>CFBundleIconFile</key>
+              <string>app-icon</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>NSHighResolutionCapable</key>

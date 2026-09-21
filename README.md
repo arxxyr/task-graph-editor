@@ -21,6 +21,7 @@
 - **保存保护** — 非法输入标红并阻止保存；切换文件、断开与关闭前保护未保存内容，保存期间的新修改继续标记为未保存；同目录原子提交，拒绝同名重命名覆盖
 - **UI 缩放** — Shift + `+`/`-` 或 Shift + 鼠标滚轮调整界面缩放（0.5x ~ 3.0x）
 - **四套主题** — 默认石墨青，另有暮砂金、暖纸橙、雾白靛；右上角选择后立即生效，并记住上次选择
+- **应用图标** — 原创蜘蛛徽标；macOS Dock、Windows 与 X11 任务栏图标随主题在深色版、浅色版之间切换
 - **中文界面** — 更纱黑体编译时嵌入，完整中文支持
 - **低功耗** — 无输入时不重绘，空闲 CPU 占用接近零；后台线程有响应时主动唤醒
 - **截图** — F12 随时截图，便于反馈界面问题
@@ -142,6 +143,30 @@ ROS2 取数另需远端的 ROS2 Humble 和机器人环境。
 默认使用石墨青；实际切换后将选择保存到 `~/.config/task-graph-editor/theme.json`，下次启动自动恢复。
 该文件与登录配置独立，启动不会主动写入；损坏文件保留原样。
 
+### 应用图标
+
+图标是本项目原创的蜘蛛徽标，分深色版（石墨青、暮砂金）和浅色版（暖纸橙、雾白靛），切换主题时一起更换：
+
+| 平台 | 随主题切换 | 静态图标（统一为深色版） |
+|------|------------|--------------------------|
+| macOS | Dock 图标；从终端 `cargo run` 时同样生效 | 应用包内的 `app-icon.icns` |
+| Windows | 标题栏与任务栏图标 | 写入 exe 资源，资源管理器和固定的快捷方式使用它 |
+| Linux X11 | 窗口与任务栏图标 | — |
+| Linux Wayland | 不支持，由桌面入口决定 | 压缩包内的 `task-graph-editor.desktop` 与 `task-graph-editor.png` |
+
+Wayland 不允许应用自行设置窗口图标，需要安装一次桌面入口（`Exec` 要求可执行文件在 `PATH` 中）：
+
+```bash
+install -Dm644 task-graph-editor.png ~/.local/share/icons/hicolor/512x512/apps/task-graph-editor.png
+install -Dm644 task-graph-editor.desktop ~/.local/share/applications/task-graph-editor.desktop
+```
+
+全部图标由 `scripts/generate_app_icons.py` 从同一份几何定义生成，修改后重新运行并提交 `assets/icons/`：
+
+```bash
+uv run scripts/generate_app_icons.py
+```
+
 ## 项目结构
 
 ```
@@ -160,6 +185,7 @@ src/
     │   └── refresh.rs # 继承文字、光标与控件派生颜色刷新
     ├── theme_picker.rs # 右上角主题选择菜单
     ├── theme_preferences.rs # 独立主题偏好的加载与原子保存
+    ├── app_icon.rs    # 窗口、任务栏与 Dock 图标随主题切换
     ├── fonts.rs       # 中文字体嵌入与覆盖
     ├── widgets.rs     # 卡片、折叠区块、表单行、各类输入控件
     ├── password.rs    # 密码遮罩控件

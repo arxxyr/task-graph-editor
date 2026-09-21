@@ -11,6 +11,7 @@ use crate::ssh_config::{self, SshHostEntry};
 use crate::worker::{BusyState, WorkerHandle};
 use binding::PoseTarget;
 
+pub mod app_icon;
 pub mod binding;
 pub mod connect;
 pub mod document_guard;
@@ -345,6 +346,6 @@ impl Plugin for EditorUiPlugin {
                 graph_edit::GraphEditPlugin,
                 document_guard::DocumentGuardPlugin,
             ))
-            .add_plugins(log_analysis::LogAnalysisPlugin);
+            .add_plugins((log_analysis::LogAnalysisPlugin, app_icon::AppIconPlugin));
     }
 }

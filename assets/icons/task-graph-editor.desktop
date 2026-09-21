@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=任务图编辑器
+Name[en]=Task Graph Editor
+Comment=通过 SSH 编辑机器人任务图
+Exec=task-graph-editor
+Icon=task-graph-editor
+Terminal=false
+Categories=Development;
+StartupWMClass=task-graph-editor

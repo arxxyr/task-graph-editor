@@ -79,6 +79,7 @@ if $IS_MACOS; then
     mkdir -p "$APP_DIR/Contents/MacOS"
     mkdir -p "$APP_DIR/Contents/Resources"
     cp "$BIN_DIR/$EXE_NAME" "$APP_DIR/Contents/MacOS/task-graph-editor"
+    cp "$ROOT_DIR/assets/icons/app-icon.icns" "$APP_DIR/Contents/Resources/app-icon.icns"
 
     cat > "$APP_DIR/Contents/Info.plist" << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -97,6 +98,8 @@ if $IS_MACOS; then
     <string>${VERSION}</string>
     <key>CFBundleExecutable</key>
     <string>task-graph-editor</string>
+    <key>CFBundleIconFile</key>
+    <string>app-icon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>NSHighResolutionCapable</key>
@@ -133,6 +136,11 @@ PLIST_EOF
 else
     # Linux / Windows: 裸二进制 + VERSION
     echo -n "v${VERSION}" > "$BIN_DIR/VERSION"
+    if ! $IS_WINDOWS; then
+        # Linux：Wayland 下任务栏图标来自桌面入口，随包附带，安装方法见 README
+        cp "$ROOT_DIR/assets/icons/app-icon.png" "$BIN_DIR/task-graph-editor.png"
+        cp "$ROOT_DIR/assets/icons/task-graph-editor.desktop" "$BIN_DIR/"
+    fi
     ZIP_NAME="task-graph-editor-v${VERSION}.zip"
     cd "$BIN_DIR"
     rm -f task-graph-editor-v*.zip
