@@ -290,30 +290,30 @@ fn action_bar(has_data: bool, connected: bool) -> Vec<BoxedScene> {
         return Vec::new();
     }
 
+    // 取数是示教时最频繁的操作，三个按钮直接摆在顶栏；收进下拉菜单每次都要多点一下。
+    // 文案压到三个字：默认 1280 宽度下要与保存按钮、文件名同处一行，见 `shell::sync_app_bar_layout`。
     let fetches = [
-        ("获取底盘位姿", AppAction::FetchChassisPose),
-        ("获取头部关节", AppAction::FetchHeadJoints),
-        ("获取腰部关节", AppAction::FetchWaistJoints),
+        ("取底盘", AppAction::FetchChassisPose),
+        ("取头部", AppAction::FetchHeadJoints),
+        ("取腰部", AppAction::FetchWaistJoints),
     ];
-    let entries = fetches
+    let mut items: Vec<BoxedScene> = fetches
         .into_iter()
         .map(|(label, action)| {
-            boxed(widgets::menu_action(
+            boxed(widgets::button_gated(
                 label,
-                ActionButton(action),
+                ButtonVariant::Normal,
                 ButtonGate::WhenIdleAndPose,
+                ActionButton(action),
             ))
         })
         .collect();
-    let items = vec![
-        boxed(widgets::action_menu("位姿取数", entries)),
-        boxed(widgets::button_gated(
-            "保存到远程",
-            ButtonVariant::Primary,
-            ButtonGate::WhenIdle,
-            ActionButton(AppAction::SaveToRemote),
-        )),
-    ];
+    items.push(boxed(widgets::button_gated(
+        "保存到远程",
+        ButtonVariant::Primary,
+        ButtonGate::WhenIdle,
+        ActionButton(AppAction::SaveToRemote),
+    )));
     items
 }
 
@@ -1237,8 +1237,46 @@ fn on_pose_card_click(
 /// 编辑器插件
 pub struct EditorPanelPlugin;
 
+/// 截图验收夹具：载入本地任务图快照，呈现「已连接、已加载文档」的界面，不连接远端。
+///
+/// `TGE_SCREENSHOT=<输出> TGE_SCREENSHOT_TASK=<任务图副本> cargo run`；内存里的文档没有真实来源，
+/// 会话也没有后台线程，保存等操作发不出去。
+fn load_screenshot_task(
+    path: std::path::PathBuf,
+) -> impl FnMut(ResMut<Session>, ResMut<Editor>, ResMut<StatusLine>) {
+    move |mut session, mut editor, mut status| {
+        let data = std::fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| crate::model::parse_task_graph(&text).map_err(|e| e.to_string()));
+        let data = match data {
+            Ok(data) => data,
+            Err(error) => {
+                status.set(format!("截图夹具载入失败: {error}"));
+                return;
+            }
+        };
+        session.is_connected = true;
+        session.target = Some(super::ConnectionTarget {
+            host: "fixture".into(),
+            port: 22,
+            username: "demo".into(),
+        });
+        let document = super::RemoteDocument {
+            connection_generation: session.connection_generation,
+            remote_dir: "/fixture/task_graphs".into(),
+            filename: format!("{}.json", data.task_id),
+        };
+        editor.load_remote(data, document);
+    }
+}
+
 impl Plugin for EditorPanelPlugin {
     fn build(&self, app: &mut App) {
+        if std::env::var_os("TGE_SCREENSHOT").is_some()
+            && let Some(path) = std::env::var_os("TGE_SCREENSHOT_TASK")
+        {
+            app.add_systems(Startup, load_screenshot_task(path.into()));
+        }
         app.init_resource::<RenderedEditor>()
             .init_resource::<InputValidation>()
             .add_observer(on_meta_edit)
@@ -1528,6 +1566,45 @@ mod tests {
         }
         for text in ["NaN", "inf", "-inf", "1e999", ""] {
             assert!(validate_number_text(text, NumberFormat::F64).is_err());
+        }
+    }
+
+    #[test]
+    fn 顶栏直接提供三个取数按钮和保存按钮且未就绪时不生成() {
+        assert!(action_bar(false, true).is_empty());
+        assert!(action_bar(true, false).is_empty());
+
+        let mut app = number_app();
+        let root = app
+            .world_mut()
+            .spawn_scene(bsn! { Node Children [{action_bar(true, true)}] })
+            .unwrap()
+            .id();
+        app.update();
+
+        // 按钮必须是操作组的直接子节点：包进下拉菜单就又变成两次点击了。
+        let children: Vec<Entity> = app.world().get::<Children>(root).unwrap().to_vec();
+        let buttons: Vec<(String, ButtonGate)> = children
+            .iter()
+            .map(|&entity| {
+                let action = app
+                    .world()
+                    .get::<ActionButton>(entity)
+                    .expect("应是动作按钮");
+                let gate = *app.world().get::<ButtonGate>(entity).unwrap();
+                (format!("{:?}", action.0), gate)
+            })
+            .collect();
+        let expected = [
+            ("FetchChassisPose", ButtonGate::WhenIdleAndPose),
+            ("FetchHeadJoints", ButtonGate::WhenIdleAndPose),
+            ("FetchWaistJoints", ButtonGate::WhenIdleAndPose),
+            ("SaveToRemote", ButtonGate::WhenIdle),
+        ];
+        assert_eq!(buttons.len(), expected.len());
+        for ((action, gate), (expected_action, expected_gate)) in buttons.iter().zip(expected) {
+            assert_eq!(action, expected_action);
+            assert!(*gate == expected_gate, "{action} 的可用条件不对");
         }
     }
 }

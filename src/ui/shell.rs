@@ -295,6 +295,8 @@ fn app_bar() -> impl Scene {
                             (
                                 Node {
                                     min_width: px(0),
+                                    // 宽窗口下不收缩：空间不够时让文件名被裁剪，而不是把按钮挤到第二行
+                                    flex_shrink: 0.0,
                                     flex_direction: FlexDirection::Row,
                                     flex_wrap: FlexWrap::Wrap,
                                     justify_content: JustifyContent::FlexEnd,
