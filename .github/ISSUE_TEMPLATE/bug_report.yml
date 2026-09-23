@@ -1,0 +1,69 @@
+name: "🐛 报告缺陷"
+description: "反馈任务图编辑器的错误、崩溃或与预期不符的行为"
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。填写前可先阅读[问题反馈说明](https://github.com/arxxyr/task-graph-editor/blob/master/docs/bug-report.md)，并搜索是否已有相同问题。请勿上传密码、私钥、令牌或未经脱敏的机器人日志、任务图和地图文件。
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      description: 发布包名中的版本号；自行编译时填写提交号。不清楚可填“未知”。
+      placeholder: "例如 v1.2.3 或提交号"
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: 操作系统
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - 其他
+    validations:
+      required: true
+  - type: input
+    id: system-version
+    attributes:
+      label: 系统版本
+      placeholder: "例如 macOS 15、Ubuntu 24.04 或 Windows 11"
+    validations:
+      required: false
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 实际现象
+      description: 写明看到的结果；如果有错误提示，请附上脱敏后的完整提示。
+      placeholder: "点击什么之后，界面或终端出现了什么？"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 如果无法稳定复现，请写明发生频率和最近一次发生时间。
+      placeholder: |
+        1. 打开应用并进入……
+        2. 选择……
+        3. 点击……
+        4. 观察到……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      placeholder: "你原本希望应用如何工作？"
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 截图、日志或补充信息
+      description: 可拖入截图；只粘贴与问题相关且已脱敏的日志片段。界面可按 F12 截图，状态栏“复制提示”可复制完整报错。
+    validations:
+      required: false

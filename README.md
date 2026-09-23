@@ -2,6 +2,8 @@
 
 基于 Rust + Bevy（BSN 场景 + Feathers 控件）的跨平台桌面应用，通过 SSH 远程编辑机器人任务图 JSON 文件中的 context 参数与执行流程。
 
+遇到问题？[直接提交 Bug](https://github.com/arxxyr/task-graph-editor/issues/new?template=bug_report.yml) · [查看填写说明](docs/bug-report.md) · [浏览已有问题](https://github.com/arxxyr/task-graph-editor/issues)
+
 ## 功能
 
 - **SSH 远程连接** — 支持密码和密钥认证，连接中可取消
