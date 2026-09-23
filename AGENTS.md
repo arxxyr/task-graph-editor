@@ -25,7 +25,7 @@ task-graph-editor/
 │  ├─ model/geojson.rs         # 地图 GeoJSON 导航点与底盘位姿的比对和原地数字替换（纯逻辑，带单测）
 │  ├─ ssh.rs                   # SSH/SFTP 封装：连接、认证（密码 / ssh-agent / 私钥）、文件操作、命令执行
 │  ├─ ssh/                     # 原子写入、agent 认证与连接取消
-│  ├─ ssh/geo_sync.rs          # 保存后查找并同步 `<工作区>/map/<map_id>/geo_info/*.geojson`
+│  ├─ ssh/geo_sync.rs          # 打开时读取、保存后同步 `<工作区>/map/<map_id>/geo_info/WS-01.geojson`
 │  ├─ ssh_config.rs            # ~/.ssh/config 解析：Host/Match/Include、首值生效、token 展开
 │  ├─ worker.rs                # 后台工作线程：所有 SSH/SFTP/ROS2 操作在此异步执行（与 GUI 框架解耦）
 │  └─ ui/
@@ -169,7 +169,13 @@ TaskGraphData (model.rs)          LoginConfig → ~/.config/task-graph-editor/lo
 **运行时以地图 GeoJSON 的导航点为准**，导航点按 `pose_context_key` 注入任务图 context。只改任务图
 而不同步 GeoJSON，示教结果不会生效，所以同步是保存流程的一部分，而不是单独的操作。
 
-- 位置由文档来源目录推出：`<工作区>/task_graphs` → `<工作区>/map/<map_id>/geo_info/*.geojson`。
+- 打开任务 JSON 时，后台只读加载同目录规则下的关联 GeoJSON，用地图的 x/y 和四元数覆盖顶层
+  位姿的底盘显示值；z、头部、腰部和其他 context 保留 JSON 值。原始 JSON 留作保存合并基线，
+  加载后的有效值作为编辑初始快照，不因自动读取地图而标记为用户未保存修改。
+  状态栏显示地图加载点位数；无关联点位时明确提示使用 JSON。读取失败、关联点损坏或同键多点
+  数值冲突时停止整个加载并保留当前文档，不能静默显示旧值；加载不写远端文件。
+- 位置由文档来源目录推出：`<工作区>/task_graphs` → `<工作区>/map/<map_id>/geo_info/WS-01.geojson`，
+  只处理这个固定文件，不扫描其他 GeoJSON。
   `map_id` 必须是单个路径段；目录经 `realpath` 后仍须位于地图根目录内，只认普通文件，不跟随符号链接。
   没有该目录是常态，静默跳过，保存提示保持原样。
 - 只处理 `properties.source_task_id == task_id` 且 `map_id`/`map_code`（若存在）一致的 FeatureCollection。

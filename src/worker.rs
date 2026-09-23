@@ -7,6 +7,13 @@ use std::time::{Duration, Instant};
 use crate::model::geojson::{GeoSyncReport, GeoSyncRequest};
 use crate::ssh::{AuthMethod, DirListing, SshCancellation, SshConfig, SshConnection};
 
+/// 已解析的任务图及其只读地图点位加载结果。
+#[derive(Debug)]
+pub struct LoadedTask {
+    pub data: crate::model::TaskGraphData,
+    pub geo_points: usize,
+}
+
 /// UI 唤醒回调：后台线程产生响应后调用，通知 UI 层尽快处理
 ///
 /// 与 GUI 框架解耦——Bevy 侧传入 winit 的 `EventLoopProxy` 唤醒，
@@ -138,7 +145,7 @@ pub enum WorkerResponse {
         ticket: DocumentReadTicket,
         remote_dir: String,
         filename: String,
-        result: Result<String, String>,
+        result: Result<Box<LoadedTask>, String>,
     },
     /// 保存完成
     FileSaved {
@@ -520,7 +527,13 @@ fn worker_loop(
                     }
                 };
                 let path = format!("{remote_dir}/{filename}");
-                let result = conn.read_file(&path).map_err(|e| e.to_string());
+                let result = (|| {
+                    let content = conn.read_file(&path).map_err(|e| e.to_string())?;
+                    let mut data = crate::model::parse_task_graph(&content)
+                        .map_err(|error| format!("解析失败：{error}"))?;
+                    let geo_points = conn.load_geojson_points(&remote_dir, &mut data)?;
+                    Ok(Box::new(LoadedTask { data, geo_points }))
+                })();
                 respond!(WorkerResponse::FileLoaded {
                     ticket,
                     remote_dir,

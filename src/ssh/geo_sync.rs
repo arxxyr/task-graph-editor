@@ -1,12 +1,15 @@
 //! 保存任务图后，把底盘位姿同步进地图 GeoJSON 的导航点。
 //!
-//! GeoJSON 位于 `<工作区>/map/<map_id>/geo_info/`，以当前登录用户经普通原子保存写回；
+//! GeoJSON 固定为 `<工作区>/map/<map_id>/geo_info/WS-01.geojson`，
+//! 以当前登录用户经普通原子保存写回；
 //! 目录或文件不属于当前用户时如实报告权限不足，不尝试提权。
 
 use std::path::Path;
 
 use super::{SshConnection, SshError};
 use crate::model::geojson::{GeoFilePlan, GeoSyncReport, GeoSyncRequest, plan_file_sync};
+
+const NAV_POINT_FILE: &str = "WS-01.geojson";
 
 /// 地图目录名来自任务图的 `map_id`，只能是单个路径段，不能借它越出地图目录。
 fn is_path_segment(name: &str) -> bool {
@@ -55,6 +58,46 @@ fn write_error(error: &SshError) -> String {
 }
 
 impl SshConnection {
+    /// 加载只读地图点位；目录不存在时保留 JSON，读取异常则拒绝静默回退。
+    pub fn load_geojson_points(
+        &self,
+        task_dir: &str,
+        data: &mut crate::model::TaskGraphData,
+    ) -> Result<usize, String> {
+        if GeoSyncRequest::from_task_graph(data).is_none() {
+            return Ok(0);
+        }
+        let Some(geo_dir) = self.resolve_geo_dir(task_dir, &data.map_id)? else {
+            return Ok(0);
+        };
+        let mut files = Vec::new();
+        for name in self.list_geojson_files(&geo_dir)? {
+            let text = self
+                .read_file(&format!("{geo_dir}/{name}"))
+                .map_err(|error| format!("{name}：地图读取失败：{error}"))?;
+            files.push((name, text));
+        }
+        crate::model::geojson::apply_geojson_points(data, &files)
+    }
+
+    fn resolve_geo_dir(&self, task_dir: &str, map_id: &str) -> Result<Option<String>, String> {
+        let Some((maps_root, geo_dir)) = geo_info_dir(task_dir, map_id) else {
+            return Ok(None);
+        };
+        let geo_dir = match self.canonical_dir(&geo_dir) {
+            Ok(directory) => directory,
+            Err(error) if is_missing(&error) => return Ok(None),
+            Err(error) => return Err(format!("无法访问 {geo_dir}: {error}")),
+        };
+        let maps_root = self
+            .canonical_dir(&maps_root)
+            .map_err(|error| format!("无法访问 {maps_root}: {error}"))?;
+        if !geo_dir.starts_with(&format!("{}/", maps_root.trim_end_matches('/'))) {
+            return Err(format!("{geo_dir} 不在地图目录 {maps_root} 内，已拒绝访问"));
+        }
+        Ok(Some(geo_dir))
+    }
+
     /// 把任务图的底盘位姿同步到同一工作区的地图 GeoJSON；任何失败都记入回执，不影响已完成的任务图保存。
     pub fn sync_geojson(&self, task_dir: &str, request: &GeoSyncRequest) -> GeoSyncReport {
         let mut report = GeoSyncReport::default();
@@ -76,21 +119,9 @@ impl SshConnection {
         request: &GeoSyncRequest,
         report: &mut GeoSyncReport,
     ) -> Result<(), String> {
-        let Some((maps_root, geo_dir)) = geo_info_dir(task_dir, &request.map_id) else {
-            tracing::debug!(task_dir, map_id = %request.map_id, "无法推出地图目录，跳过地图点位同步");
+        let Some(geo_dir) = self.resolve_geo_dir(task_dir, &request.map_id)? else {
             return Ok(());
         };
-        let geo_dir = match self.canonical_dir(&geo_dir) {
-            Ok(directory) => directory,
-            Err(error) if is_missing(&error) => return Ok(()),
-            Err(error) => return Err(format!("无法访问 {geo_dir}: {error}")),
-        };
-        let maps_root = self
-            .canonical_dir(&maps_root)
-            .map_err(|error| format!("无法访问 {maps_root}: {error}"))?;
-        if !geo_dir.starts_with(&format!("{}/", maps_root.trim_end_matches('/'))) {
-            return Err(format!("{geo_dir} 不在地图目录 {maps_root} 内，已拒绝写入"));
-        }
 
         for name in self.list_geojson_files(&geo_dir)? {
             let path = format!("{geo_dir}/{name}");
@@ -125,7 +156,7 @@ impl SshConnection {
         Ok(())
     }
 
-    /// 只认目录下的普通 `.geojson` 文件；符号链接不跟随。
+    /// 只认固定文件名的普通文件；符号链接不跟随。
     fn list_geojson_files(&self, geo_dir: &str) -> Result<Vec<String>, String> {
         let sftp = self.session.sftp().map_err(|error| error.to_string())?;
         let entries = match sftp.readdir(Path::new(geo_dir)) {
@@ -142,7 +173,7 @@ impl SshConnection {
             .into_iter()
             .filter(|(_, stat)| stat.is_file())
             .filter_map(|(path, _)| Some(path.file_name()?.to_str()?.to_owned()))
-            .filter(|name| name.ends_with(".geojson") && is_path_segment(name))
+            .filter(|name| name == NAV_POINT_FILE)
             .collect();
         names.sort();
         Ok(names)

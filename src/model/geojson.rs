@@ -14,6 +14,9 @@ use serde_json::value::RawValue;
 
 use super::{ContextValue, Pose, TaskGraphData};
 
+mod load;
+pub use load::apply_geojson_points;
+
 /// 一次同步的输入：任务图身份与全部顶层位姿字段的底盘位姿。
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeoSyncRequest {

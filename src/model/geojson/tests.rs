@@ -478,3 +478,130 @@ fn 真实地图点位与任务图一致且改动最小() {
     println!("位姿 {key} 的 x 改为 {x}：{changed_lines} 行发生变化");
     assert_eq!(text.lines().count(), content.lines().count());
 }
+
+fn loading_task() -> TaskGraphData {
+    let mut robot = serde_json::to_value(crate::model::RobotPose::default()).unwrap();
+    robot["chassis_pose"]["position"]["z"] = serde_json::json!(0.75);
+    robot["head_pose"]["position"]["x"] = serde_json::json!(8.0);
+    robot["vendor"] = serde_json::json!({"keep":true});
+    let value = serde_json::json!({
+        "map_id":"map-1", "task_id":"demo_task", "config":{"context":{
+            "pick_point":serde_json::to_string(&robot).unwrap(),
+            "origin_point":serde_json::to_string(&robot).unwrap(),
+            "speed":3, "other":"unchanged"
+        }}
+    });
+    parse_task_graph(&value.to_string()).unwrap()
+}
+
+#[test]
+fn 地图加载覆盖显示并保留其他分量和保存扩展字段() {
+    let mut data = loading_task();
+    let raw = data.raw_json.clone();
+    assert_eq!(
+        apply_geojson_points(&mut data, &[("map.geojson".into(), FIXTURE.into())]).unwrap(),
+        2
+    );
+    assert_eq!(data.raw_json, raw, "只读加载不能改原始合并基线");
+    let request = GeoSyncRequest::from_task_graph(&data).unwrap();
+    let loaded = request.chassis_pose("pick_point").unwrap();
+    assert_eq!(loaded.position.x, 1.5);
+    assert_eq!(loaded.position.y, 0.25);
+    assert_eq!(loaded.position.z, 0.75);
+    assert_eq!(loaded.orientation.z, 0.6);
+    assert_eq!(loaded.orientation.w, 0.8);
+    assert_eq!(
+        request.chassis_pose("origin_point").unwrap().position.x,
+        -1.0
+    );
+    let saved: serde_json::Value =
+        serde_json::from_str(&crate::model::serialize_task_graph(&data).unwrap()).unwrap();
+    let robot: serde_json::Value =
+        serde_json::from_str(saved["config"]["context"]["pick_point"].as_str().unwrap()).unwrap();
+    assert_eq!(robot["chassis_pose"]["position"]["x"], 1.5);
+    assert_eq!(robot["head_pose"]["position"]["x"], 8.0);
+    assert_eq!(robot["vendor"]["keep"], true);
+    assert_eq!(
+        saved["config"]["context"]["speed"],
+        raw["config"]["context"]["speed"]
+    );
+    assert_eq!(
+        linked(FIXTURE, &request).content,
+        None,
+        "未编辑直接保存不能把地图覆盖回旧值"
+    );
+}
+
+#[test]
+fn 地图加载遇到冲突或损坏保持全部原值() {
+    for bad in [
+        FIXTURE.replacen("1.5,", "9.5,", 1),
+        FIXTURE.replacen("1.5,", "null,", 1),
+        "{".into(),
+    ] {
+        let mut data = loading_task();
+        let before = GeoSyncRequest::from_task_graph(&data);
+        assert!(
+            apply_geojson_points(
+                &mut data,
+                &[
+                    ("a.geojson".into(), FIXTURE.into()),
+                    ("b.geojson".into(), bad)
+                ]
+            )
+            .is_err()
+        );
+        assert_eq!(GeoSyncRequest::from_task_graph(&data), before);
+    }
+}
+
+#[test]
+fn 地图加载跳过其他任务地图且相同副本不重复计数() {
+    let mut data = loading_task();
+    for unrelated in [
+        FIXTURE.replace("demo_task", "other"),
+        FIXTURE.replace("map-1", "other"),
+    ] {
+        assert_eq!(
+            apply_geojson_points(&mut data, &[("other.geojson".into(), unrelated)]).unwrap(),
+            0
+        );
+    }
+    assert_eq!(apply_geojson_points(&mut data, &[]).unwrap(), 0);
+    assert_eq!(
+        apply_geojson_points(
+            &mut data,
+            &[
+                ("a.geojson".into(), FIXTURE.into()),
+                ("b.geojson".into(), FIXTURE.into())
+            ]
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn 地图加载目标键不存在时不回退来源键() {
+    let mut data = loading_task();
+    let text = FIXTURE
+        .replace(
+            "\"pose_context_key\": \"pick_point\"",
+            "\"pose_context_key\": \"missing\"",
+        )
+        .replace(
+            "\"source_context_key\": \"legacy_point\"",
+            "\"source_context_key\": \"pick_point\"",
+        );
+    let original = GeoSyncRequest::from_task_graph(&data).unwrap();
+    assert_eq!(
+        apply_geojson_points(&mut data, &[("map.geojson".into(), text)]).unwrap(),
+        1
+    );
+    assert_eq!(
+        GeoSyncRequest::from_task_graph(&data)
+            .unwrap()
+            .chassis_pose("pick_point"),
+        original.chassis_pose("pick_point")
+    );
+}

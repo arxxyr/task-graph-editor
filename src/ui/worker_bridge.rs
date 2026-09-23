@@ -938,23 +938,23 @@ fn handle_response(
                 return;
             }
             match result {
-                Ok(content) => match model::parse_task_graph(&content) {
-                    Ok(data) => {
-                        editor.load_remote(
-                            data,
-                            RemoteDocument {
-                                connection_generation: session.connection_generation,
-                                remote_dir,
-                                filename: filename.clone(),
-                            },
-                        );
-                        status.set(format!("已加载: {filename}"));
-                    }
-                    Err(e) => {
-                        restore_document_selection(browser, editor);
-                        status.set(format!("解析失败: {e}；当前文档已保留"));
-                    }
-                },
+                Ok(loaded) => {
+                    let crate::worker::LoadedTask { data, geo_points } = *loaded;
+                    editor.load_remote(
+                        data,
+                        RemoteDocument {
+                            connection_generation: session.connection_generation,
+                            remote_dir,
+                            filename: filename.clone(),
+                        },
+                    );
+                    let source = if geo_points > 0 {
+                        format!("已从 GeoJSON 加载 {geo_points} 个底盘点位，其余参数保留 JSON 值")
+                    } else {
+                        "未找到关联 GeoJSON 点位，使用 JSON 值".into()
+                    };
+                    status.set(format!("已加载: {filename}；{source}"));
+                }
                 Err(e) => {
                     restore_document_selection(browser, editor);
                     status.set(format!("读取失败: {e}；当前文档已保留"));

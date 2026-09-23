@@ -768,7 +768,9 @@ fn 加载响应绑定实际目录和连接代次() {
             ticket,
             remote_dir: "/actual/home/graphs".into(),
             filename: "task.json".into(),
-            result: Ok(r#"{"map_id":"m","task_id":"task","config":{"context":{}}}"#.into()),
+            result: parsed_loaded(Ok(
+                r#"{"map_id":"m","task_id":"task","config":{"context":{}}}"#.into(),
+            )),
         },
         &mut session,
         &mut StatusLine::default(),
@@ -1267,6 +1269,19 @@ fn 真实文件位姿数组选择后使用真实底盘输出逐项回填往返()
     );
 }
 
+fn parsed_loaded(result: Result<String, String>) -> Result<Box<crate::worker::LoadedTask>, String> {
+    result.and_then(|content| {
+        model::parse_task_graph(&content)
+            .map(|data| {
+                Box::new(crate::worker::LoadedTask {
+                    data,
+                    geo_points: 0,
+                })
+            })
+            .map_err(|error| error.to_string())
+    })
+}
+
 fn loaded(
     ticket: crate::worker::DocumentReadTicket,
     result: Result<String, String>,
@@ -1275,7 +1290,7 @@ fn loaded(
         ticket,
         remote_dir: "/A".into(),
         filename: "next.json".into(),
-        result,
+        result: parsed_loaded(result),
     }
 }
 
