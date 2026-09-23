@@ -30,7 +30,37 @@ body:
     id: system-version
     attributes:
       label: 系统版本
+      description: 不清楚时可填“未知”。
       placeholder: "例如 macOS 15、Ubuntu 24.04 或 Windows 11"
+    validations:
+      required: true
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: 运行设备的 CPU 架构
+      options:
+        - arm64 / aarch64
+        - x86_64
+        - 其他或未知
+    validations:
+      required: true
+  - type: dropdown
+    id: run-method
+    attributes:
+      label: 应用运行方式
+      options:
+        - GitHub 发布包
+        - 自行编译的 Release 版本
+        - cargo run 开发版本
+        - 其他或未知
+    validations:
+      required: true
+  - type: textarea
+    id: runtime-environment
+    attributes:
+      label: 图形与远端运行环境（相关时填写）
+      description: 界面问题请说明 X11、Wayland、远程桌面或显卡信息；SSH、ROS2、地图问题请说明远端系统、ROS2 版本及相关服务。不要填写真实地址或凭据。
+      placeholder: "例如：Wayland + GNOME；远端 Ubuntu 22.04、ROS2 Humble。与问题无关可留空。"
     validations:
       required: false
   - type: textarea
